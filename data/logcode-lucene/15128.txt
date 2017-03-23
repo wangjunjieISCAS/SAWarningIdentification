@@ -1,0 +1,279 @@
+GitDiffStart: 3100c0517af44c5bd6d6892b89c8622011d09c8c | Fri Jul 22 10:26:58 2011 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 739fb1e..6060445 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -494,6 +494,10 @@ Optimizations
+   instance for merging and NRT readers, which enables directory impls
+   to separately tune IO flags for each.  (Varun Thacker, Simon
+   Willnauer, Mike McCandless)
++
++* LUCENE-3328: BooleanQuery now uses a specialized ConjunctionScorer if all
++  boolean clauses are required and instances of TermQuery. 
++  (Simon Willnauer, Robert Muir)
+   
+ Bug fixes
+ 
+diff --git a/lucene/src/java/org/apache/lucene/search/BooleanQuery.java b/lucene/src/java/org/apache/lucene/search/BooleanQuery.java
+index 983fb4a..902ae69 100644
+--- a/lucene/src/java/org/apache/lucene/search/BooleanQuery.java
++++ b/lucene/src/java/org/apache/lucene/search/BooleanQuery.java
+@@ -18,10 +18,14 @@ package org.apache.lucene.search;
+  */
+ 
+ import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.util.ToStringUtils;
+ import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.ConjunctionTermScorer.DocsAndFreqs;
++import org.apache.lucene.search.Similarity.ExactDocScorer;
++import org.apache.lucene.search.TermQuery.TermWeight;
+ 
+ import java.io.IOException;
+ import java.util.*;
+@@ -166,17 +170,24 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+     protected ArrayList<Weight> weights;
+     protected int maxCoord;  // num optional + num required
+     private final boolean disableCoord;
++    private final boolean termConjunction;
+ 
+     public BooleanWeight(IndexSearcher searcher, boolean disableCoord)
+       throws IOException {
+       this.similarityProvider = searcher.getSimilarityProvider();
+       this.disableCoord = disableCoord;
+       weights = new ArrayList<Weight>(clauses.size());
++      boolean termConjunction = clauses.isEmpty() || minNrShouldMatch != 0 ? false : true;
+       for (int i = 0 ; i < clauses.size(); i++) {
+         BooleanClause c = clauses.get(i);
+-        weights.add(c.getQuery().createWeight(searcher));
++        Weight w = c.getQuery().createWeight(searcher);
++        if (!(c.isRequired() && (w instanceof TermWeight))) {
++          termConjunction = false;
++        }
++        weights.add(w);
+         if (!c.isProhibited()) maxCoord++;
+       }
++      this.termConjunction = termConjunction;
+     }
+ 
+     @Override
+@@ -290,6 +301,10 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+     @Override
+     public Scorer scorer(AtomicReaderContext context, ScorerContext scorerContext)
+         throws IOException {
++      if (termConjunction) {
++        // specialized scorer for term conjunctions
++        return createConjunctionTermScorer(context);
++      }
+       List<Scorer> required = new ArrayList<Scorer>();
+       List<Scorer> prohibited = new ArrayList<Scorer>();
+       List<Scorer> optional = new ArrayList<Scorer>();
+@@ -328,6 +343,23 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+       // Return a BooleanScorer2
+       return new BooleanScorer2(this, disableCoord, minNrShouldMatch, required, prohibited, optional, maxCoord);
+     }
++
++    private Scorer createConjunctionTermScorer(AtomicReaderContext context)
++        throws IOException {
++      final DocsAndFreqs[] docsAndFreqs = new DocsAndFreqs[weights.size()];
++      for (int i = 0; i < docsAndFreqs.length; i++) {
++        final TermWeight weight = (TermWeight) weights.get(i);
++        final TermsEnum termsEnum = weight.getTermsEnum(context);
++        if (termsEnum == null) {
++          return null;
++        }
++        final ExactDocScorer docScorer = weight.createDocScorer(context);
++        docsAndFreqs[i] = new DocsAndFreqs(termsEnum.docs(
++            context.reader.getLiveDocs(), null), termsEnum.docFreq(), docScorer);
++      }
++      return new ConjunctionTermScorer(this, disableCoord ? 1.0f : coord(
++          docsAndFreqs.length, docsAndFreqs.length), docsAndFreqs);
++    }
+     
+     @Override
+     public boolean scoresDocsOutOfOrder() {
+diff --git a/lucene/src/java/org/apache/lucene/search/ConjunctionTermScorer.java b/lucene/src/java/org/apache/lucene/search/ConjunctionTermScorer.java
+new file mode 100644
+index 0000000..caf21e2
+--- /dev/null
++++ b/lucene/src/java/org/apache/lucene/search/ConjunctionTermScorer.java
+@@ -0,0 +1,110 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.search.Similarity.ExactDocScorer;
++import org.apache.lucene.util.ArrayUtil;
++import java.io.IOException;
++import java.util.Comparator;
++
++/** Scorer for conjunctions, sets of terms, all of which are required. */
++final class ConjunctionTermScorer extends Scorer {
++  private final float coord;
++  private int lastDoc = -1;
++  private final DocsAndFreqs[] docsAndFreqs;
++  private final DocsAndFreqs lead;
++
++  ConjunctionTermScorer(Weight weight, float coord,
++      DocsAndFreqs[] docsAndFreqs) throws IOException {
++    super(weight);
++    this.coord = coord;
++    this.docsAndFreqs = docsAndFreqs;
++    // Sort the array the first time to allow the least frequent DocsEnum to
++    // lead the matching.
++    ArrayUtil.mergeSort(docsAndFreqs, new Comparator<DocsAndFreqs>() {
++      public int compare(DocsAndFreqs o1, DocsAndFreqs o2) {
++        return o1.freq - o2.freq;
++      }
++    });
++
++    lead = docsAndFreqs[0]; // least frequent DocsEnum leads the intersection
++  }
++
++  private int doNext(int doc) throws IOException {
++    do {
++      if (lead.doc == DocsEnum.NO_MORE_DOCS) {
++        return NO_MORE_DOCS;
++      }
++      advanceHead: do {
++        for (int i = 1; i < docsAndFreqs.length; i++) {
++          if (docsAndFreqs[i].doc < doc) {
++            docsAndFreqs[i].doc = docsAndFreqs[i].docs.advance(doc);
++          }
++          if (docsAndFreqs[i].doc > doc) {
++            // DocsEnum beyond the current doc - break and advance lead
++            break advanceHead;
++          }
++        }
++        // success - all DocsEnums are on the same doc
++        return doc;
++      } while (true);
++      // advance head for next iteration
++      doc = lead.doc = lead.docs.nextDoc();  
++    } while (true);
++  }
++
++  @Override
++  public int advance(int target) throws IOException {
++    lead.doc = lead.docs.advance(target);
++    return lastDoc = doNext(lead.doc);
++  }
++
++  @Override
++  public int docID() {
++    return lastDoc;
++  }
++
++  @Override
++  public int nextDoc() throws IOException {
++    lead.doc = lead.docs.nextDoc();
++    return lastDoc = doNext(lead.doc);
++  }
++
++  @Override
++  public float score() throws IOException {
++    float sum = 0.0f;
++    for (DocsAndFreqs docs : docsAndFreqs) {
++      sum += docs.docScorer.score(lastDoc, docs.docs.freq());
++    }
++    return sum * coord;
++  }
++
++  static final class DocsAndFreqs {
++    final DocsEnum docs;
++    final int freq;
++    final ExactDocScorer docScorer;
++    int doc = -1;
++
++    DocsAndFreqs(DocsEnum docs, int freq, ExactDocScorer docScorer) {
++      this.docs = docs;
++      this.freq = freq;
++      this.docScorer = docScorer;
++    }
++  }
++}
+diff --git a/lucene/src/java/org/apache/lucene/search/TermQuery.java b/lucene/src/java/org/apache/lucene/search/TermQuery.java
+index 936b0bf..aecd866 100644
+--- a/lucene/src/java/org/apache/lucene/search/TermQuery.java
++++ b/lucene/src/java/org/apache/lucene/search/TermQuery.java
+@@ -24,6 +24,7 @@ import org.apache.lucene.index.DocsEnum;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.TermState;
+ import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+ import org.apache.lucene.index.IndexReader.ReaderContext;
+ import org.apache.lucene.index.Term;
+@@ -41,7 +42,7 @@ public class TermQuery extends Query {
+   private int docFreq;
+   private transient TermContext perReaderTermState;
+ 
+-  private class TermWeight extends Weight {
++  final class TermWeight extends Weight {
+     private final Similarity similarity;
+     private final Similarity.Stats stats;
+     private transient TermContext termStates;
+@@ -72,17 +73,38 @@ public class TermQuery extends Query {
+ 
+     @Override
+     public Scorer scorer(AtomicReaderContext context, ScorerContext scorerContext) throws IOException {
+-      final String field = term.field();
+-      final IndexReader reader = context.reader;
+       assert termStates.topReaderContext == ReaderUtil.getTopLevelContext(context) : "The top-reader used to create Weight (" + termStates.topReaderContext + ") is not the same as the current reader's top-reader (" + ReaderUtil.getTopLevelContext(context);
++      final TermsEnum termsEnum = getTermsEnum(context);
++      if (termsEnum == null) {
++        return null;
++      }
++      // TODO should we reuse the DocsEnum here? 
++      final DocsEnum docs = termsEnum.docs(context.reader.getLiveDocs(), null);
++      assert docs != null;
++      return new TermScorer(this, docs, createDocScorer(context));
++    }
++    
++    /**
++     * Creates an {@link ExactDocScorer} for this {@link TermWeight}*/
++    ExactDocScorer createDocScorer(AtomicReaderContext context)
++        throws IOException {
++      return similarity.exactDocScorer(stats, term.field(), context);
++    }
++    
++    /**
++     * Returns a {@link TermsEnum} positioned at this weights Term or null if
++     * the term does not exist in the given context
++     */
++    TermsEnum getTermsEnum(AtomicReaderContext context) throws IOException {
+       final TermState state = termStates.get(context.ord);
+       if (state == null) { // term is not present in that reader
+-        assert termNotInReader(reader, field, term.bytes()) : "no termstate found but term exists in reader";
++        assert termNotInReader(context.reader, term.field(), term.bytes()) : "no termstate found but term exists in reader";
+         return null;
+       }
+-      final DocsEnum docs = reader.termDocsEnum(reader.getLiveDocs(), field, term.bytes(), state);
+-      assert docs != null;
+-      return new TermScorer(this, docs, similarity.exactDocScorer(stats, field, context));
++      final TermsEnum termsEnum = context.reader.terms(term.field())
++          .getThreadTermsEnum();
++      termsEnum.seekExact(term.bytes(), state);
++      return termsEnum;
+     }
+     
+     private boolean termNotInReader(IndexReader reader, String field, BytesRef bytes) throws IOException {
+

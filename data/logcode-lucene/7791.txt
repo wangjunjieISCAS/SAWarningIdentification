@@ -1,0 +1,168 @@
+GitDiffStart: 4312f3d71ab9bd52094111ff4eec075017f14bf7 | Mon Oct 7 20:28:35 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index d33f857..6f668c9 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -103,6 +103,9 @@ Bug Fixes
+   to a new reader and closing the original one.  (Shai Erera, Mike
+   McCandless)
+ 
++* LUCENE-5262: Fixed file handle leaks when multiple attempts to open an 
++  NRT reader hit exceptions. (Shai Erera)
++
+ API Changes:
+ 
+ * LUCENE-5222: Add SortField.needsScores(). Previously it was not possible
+diff --git a/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java b/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java
+index 4f01df4..f3c8a7e 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java
++++ b/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java
+@@ -264,9 +264,8 @@ class ReadersAndLiveDocs { // TODO (DVU_RENAME) to ReaderAndUpdates
+   }
+ 
+   /**
+-   * Returns a ref to a clone.  NOTE: this clone is not
+-   * enrolled in the pool, so you should simply close()
+-   * it when you're done (ie, do not call release()).
++   * Returns a ref to a clone. NOTE: you should decRef() the reader when you're
++   * dont (ie do not call close()).
+    */
+   public synchronized SegmentReader getReadOnlyClone(IOContext context) throws IOException {
+     getReader(true, context).decRef(); // make sure we enroll a new reader if there are field updates
+diff --git a/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java b/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+index 710a49c..c187649 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
++++ b/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+@@ -82,10 +82,9 @@ final class StandardDirectoryReader extends DirectoryReader {
+ 
+     final SegmentInfos segmentInfos = infos.clone();
+     int infosUpto = 0;
+-    for (int i=0;i<numSegments;i++) {
+-      IOException prior = null;
+-      boolean success = false;
+-      try {
++    boolean success = false;
++    try {
++      for (int i = 0; i < numSegments; i++) {
+         // NOTE: important that we use infos not
+         // segmentInfos here, so that we are passing the
+         // actual instance of SegmentInfoPerCommit in
+@@ -106,17 +105,24 @@ final class StandardDirectoryReader extends DirectoryReader {
+         } finally {
+           writer.readerPool.release(rld);
+         }
+-        success = true;
+-      } catch(IOException ex) {
+-        prior = ex;
+-      } finally {
+-        if (!success) {
+-          IOUtils.closeWhileHandlingException(prior, readers);
++      }
++      StandardDirectoryReader result = new StandardDirectoryReader(dir,
++          readers.toArray(new SegmentReader[readers.size()]), writer,
++          segmentInfos, applyAllDeletes);
++      success = true;
++      return result;
++    } finally {
++      if (!success) {
++        for (SegmentReader r : readers) {
++          try {
++            r.decRef();
++          } catch (Throwable th) {
++            // ignore any exception that is thrown here to not mask any original
++            // exception. 
++          }
+         }
+       }
+     }
+-    return new StandardDirectoryReader(dir, readers.toArray(new SegmentReader[readers.size()]),
+-      writer, segmentInfos, applyAllDeletes);
+   }
+ 
+   /** This constructor is only used for {@link #doOpenIfChanged(SegmentInfos)} */
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
+index 64841cd..7fcdeee 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
+@@ -28,7 +28,6 @@ import java.util.concurrent.atomic.AtomicInteger;
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+-import org.apache.lucene.document.TextField;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+@@ -43,6 +42,7 @@ import org.apache.lucene.util.InfoStream;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.lucene.util._TestUtil;
++import org.junit.Test;
+ 
+ public class TestIndexWriterReader extends LuceneTestCase {
+   
+@@ -1041,4 +1041,64 @@ public class TestIndexWriterReader extends LuceneTestCase {
+     w.close();
+     d.close();
+   }
++  
++  private static final class FakeIOException extends IOException {
++    public FakeIOException() {}
++  }
++  
++  @Test
++  public void testNRTOpenExceptions() throws Exception {
++    // LUCENE-5262: test that several failed attempts to obtain an NRT reader
++    // don't leak file handles.
++    MockDirectoryWrapper dir = newMockDirectory();
++    final AtomicBoolean shouldFail = new AtomicBoolean();
++    dir.failOn(new MockDirectoryWrapper.Failure() {
++      @Override
++      public void eval(MockDirectoryWrapper dir) throws IOException {
++        StackTraceElement[] trace = new Exception().getStackTrace();
++        if (shouldFail.get()) {
++          for (int i = 0; i < trace.length; i++) {
++            if ("getReadOnlyClone".equals(trace[i].getMethodName())) {
++              if (VERBOSE) {
++                System.out.println("TEST: now fail; exc:");
++                new Throwable().printStackTrace(System.out);
++              }
++              shouldFail.set(false);
++              throw new FakeIOException();
++            }
++          }
++        }
++      }
++    });
++    
++    IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    conf.setMergePolicy(NoMergePolicy.COMPOUND_FILES); // prevent merges from getting in the way
++    IndexWriter writer = new IndexWriter(dir, conf);
++    
++    // create a segment and open an NRT reader
++    writer.addDocument(new Document());
++    writer.getReader().close();
++    
++    // add a new document so a new NRT reader is required
++    writer.addDocument(new Document());
++
++    // try to obtain an NRT reader twice: first time it fails and closes all the
++    // other NRT readers. second time it fails, but also fails to close the
++    // other NRT reader, since it is already marked closed!
++    for (int i = 0; i < 2; i++) {
++      shouldFail.set(true);
++      try {
++        writer.getReader().close();
++      } catch (FakeIOException e) {
++        // expected
++        if (VERBOSE) {
++          System.out.println("hit expected fake IOE");
++        }
++      }
++    }
++    
++    writer.close();
++    dir.close();
++  }
++
+ }
+

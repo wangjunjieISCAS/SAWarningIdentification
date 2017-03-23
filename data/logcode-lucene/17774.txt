@@ -1,0 +1,280 @@
+GitDiffStart: 653c7c160b64b62d6283a8872a88cebef9bd994c | Tue Jun 22 19:00:55 2010 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 6b9f793..5398f22 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -209,6 +209,11 @@ Optimizations
+   JMX.  The default root name is "solr" followed by the core name.
+   (Constantijn Visinescu, hossman)
+ 
++* SOLR-1968: speed up initial filter cache population for facet.method=enum and
++  also big terms for multi-valued facet.method=fc.  The resulting speedup
++  for the first facet request is anywhere from 30% to 32x, depending on how many
++  terms are in the field and how many documents match per term.  (yonik) 
++
+ Bug Fixes
+ ----------------------
+ 
+diff --git a/solr/src/java/org/apache/solr/request/SimpleFacets.java b/solr/src/java/org/apache/solr/request/SimpleFacets.java
+index d1f219f..14bd8ea 100644
+--- a/solr/src/java/org/apache/solr/request/SimpleFacets.java
++++ b/solr/src/java/org/apache/solr/request/SimpleFacets.java
+@@ -577,7 +577,7 @@ public class SimpleFacets {
+     Fields fields = MultiFields.getFields(r);
+     Terms terms = fields==null ? null : fields.terms(field);
+     TermsEnum termsEnum = null;
+-
++    SolrIndexSearcher.DocsEnumState deState = null;
+     BytesRef term = null;
+     if (terms != null) {
+       termsEnum = terms.iterator();
+@@ -621,7 +621,17 @@ public class SimpleFacets {
+             spare.reset();
+             ByteUtils.UTF8toUTF16(term, spare);
+             Term t = template.createTerm(spare.toString());
+-            c = searcher.numDocs(new TermQuery(t), docs);
++
++            if (deState==null) {
++              deState = new SolrIndexSearcher.DocsEnumState();
++              deState.deletedDocs = MultiFields.getDeletedDocs(r);
++              deState.termsEnum = termsEnum;
++              deState.reuse = docsEnum;
++            }
++
++            c = searcher.numDocs(new TermQuery(t), docs, deState);
++
++            docsEnum = deState.reuse;
+           } else {
+             // iterate over TermDocs to calculate the intersection
+ 
+diff --git a/solr/src/java/org/apache/solr/request/UnInvertedField.java b/solr/src/java/org/apache/solr/request/UnInvertedField.java
+index 1c21eb1..f4f9d1d 100755
+--- a/solr/src/java/org/apache/solr/request/UnInvertedField.java
++++ b/solr/src/java/org/apache/solr/request/UnInvertedField.java
+@@ -228,6 +228,8 @@ public class UnInvertedField {
+     // values.  This requires going over the field first to find the most
+     // frequent terms ahead of time.
+ 
++    SolrIndexSearcher.DocsEnumState deState = null;
++
+     for (;;) {
+       BytesRef t = te.term();
+       if (t==null) break;
+@@ -249,7 +251,14 @@ public class UnInvertedField {
+         topTerm.termNum = termNum;
+         bigTerms.put(topTerm.termNum, topTerm);
+ 
+-        DocSet set = searcher.getDocSet(new TermQuery(new Term(ti.field, topTerm.term.utf8ToString())));
++        if (deState == null) {
++          deState = new SolrIndexSearcher.DocsEnumState();
++          deState.termsEnum = te.tenum;
++          deState.reuse = te.docsEnum;
++        }
++        DocSet set = searcher.getDocSet(new TermQuery(new Term(ti.field, topTerm.term.utf8ToString())), deState);
++        te.docsEnum = deState.reuse;
++
+         maxTermCounts[termNum] = set.size();
+ 
+         te.next();
+@@ -258,12 +267,12 @@ public class UnInvertedField {
+ 
+       termsInverted++;
+ 
+-      DocsEnum td = te.getDocsEnum();
++      DocsEnum docsEnum = te.getDocsEnum();
+ 
+-      DocsEnum.BulkReadResult bulkResult = td.getBulkResult();
++      DocsEnum.BulkReadResult bulkResult = docsEnum.getBulkResult();
+ 
+       for(;;) {
+-        int n = td.read();
++        int n = docsEnum.read();
+         if (n <= 0) break;
+ 
+         maxTermCounts[termNum] += n;
+@@ -889,6 +898,7 @@ class NumberedTermsEnum extends TermsEnum {
+   protected int pos=-1;
+   protected BytesRef termText;
+   protected DocsEnum docsEnum;
++  protected Bits deletedDocs;
+ 
+ 
+   NumberedTermsEnum(IndexReader reader, TermIndex tindex) throws IOException {
+@@ -902,6 +912,7 @@ class NumberedTermsEnum extends TermsEnum {
+     this.tindex = tindex;
+     this.pos = pos;
+     Terms terms = MultiFields.getTerms(reader, tindex.field);
++    deletedDocs = MultiFields.getDeletedDocs(reader);
+     if (terms != null) {
+       tenum = terms.iterator();
+       tenum.seek(termValue);
+@@ -915,7 +926,7 @@ class NumberedTermsEnum extends TermsEnum {
+   }
+ 
+   public DocsEnum getDocsEnum() throws IOException {
+-    docsEnum = tenum.docs(MultiFields.getDeletedDocs(reader), docsEnum);
++    docsEnum = tenum.docs(deletedDocs, docsEnum);
+     return docsEnum;
+   }
+ 
+diff --git a/solr/src/java/org/apache/solr/search/SolrIndexSearcher.java b/solr/src/java/org/apache/solr/search/SolrIndexSearcher.java
+index 910f921..cda252e 100644
+--- a/solr/src/java/org/apache/solr/search/SolrIndexSearcher.java
++++ b/solr/src/java/org/apache/solr/search/SolrIndexSearcher.java
+@@ -554,6 +554,32 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+     return answer;
+   }
+ 
++  /** lucene.internal */
++  public DocSet getDocSet(Query query, DocsEnumState deState) throws IOException {
++    // Get the absolute value (positive version) of this query.  If we
++    // get back the same reference, we know it's positive.
++    Query absQ = QueryUtils.getAbs(query);
++    boolean positive = query==absQ;
++
++    if (filterCache != null) {
++      DocSet absAnswer = (DocSet)filterCache.get(absQ);
++      if (absAnswer!=null) {
++        if (positive) return absAnswer;
++        else return getPositiveDocSet(matchAllDocsQuery).andNot(absAnswer);
++      }
++    }
++
++    DocSet absAnswer = getDocSetNC(absQ, null, deState);
++    DocSet answer = positive ? absAnswer : getPositiveDocSet(matchAllDocsQuery, deState).andNot(absAnswer);
++
++    if (filterCache != null) {
++      // cache negative queries as positive
++      filterCache.put(absQ, absAnswer);
++    }
++
++    return answer;
++  }
++
+   // only handle positive (non negative) queries
+   DocSet getPositiveDocSet(Query q) throws IOException {
+     DocSet answer;
+@@ -566,6 +592,17 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+     return answer;
+   }
+ 
++  // only handle positive (non negative) queries
++  DocSet getPositiveDocSet(Query q, DocsEnumState deState) throws IOException {
++    DocSet answer;
++    if (filterCache != null) {
++      answer = (DocSet)filterCache.get(q);
++      if (answer!=null) return answer;
++    }
++    answer = getDocSetNC(q,null,deState);
++    if (filterCache != null) filterCache.put(q,answer);
++    return answer;
++  }
+ 
+   private static Query matchAllDocsQuery = new MatchAllDocsQuery();
+ 
+@@ -624,6 +661,83 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+   }
+ 
+   // query must be positive
++  protected DocSet getDocSetNC(Query query, DocSet filter, DocsEnumState deState) throws IOException {
++    if (filter != null) return getDocSetNC(query, filter, null);
++
++    int smallSetSize = maxDoc()>>6;
++    int largestPossible = deState.termsEnum.docFreq();
++
++    int[] docs = new int[Math.min(smallSetSize, largestPossible)];
++    int upto = 0;
++    int bitsSet = 0;
++    OpenBitSet obs = null;
++
++    DocsEnum docsEnum = deState.termsEnum.docs(deState.deletedDocs, deState.reuse);
++    if (deState.reuse == null) {
++      deState.reuse = docsEnum;
++    }
++
++    if (docsEnum instanceof MultiDocsEnum) {
++      MultiDocsEnum.EnumWithSlice[] subs = ((MultiDocsEnum)docsEnum).getSubs();
++      int numSubs = ((MultiDocsEnum)docsEnum).getNumSubs();
++      for (int subindex = 0; subindex<numSubs; subindex++) {
++        MultiDocsEnum.EnumWithSlice sub = subs[subindex];
++        if (sub.docsEnum == null) continue;
++        DocsEnum.BulkReadResult bulk = sub.docsEnum.getBulkResult();
++        int base = sub.slice.start;
++
++        for (;;) {
++          int nDocs = sub.docsEnum.read();
++          if (nDocs == 0) break;
++          int[] docArr = bulk.docs.ints;
++          int end = bulk.docs.offset + nDocs;
++          if (upto + nDocs > docs.length) {
++            if (obs == null) obs = new OpenBitSet(maxDoc());
++            for (int i=bulk.docs.offset; i<end; i++) {
++              obs.fastSet(docArr[i]+base);
++            }
++            bitsSet += nDocs;
++          } else {
++            for (int i=bulk.docs.offset; i<end; i++) {
++              docs[upto++] = docArr[i]+base;
++            }
++          }
++        }
++      }
++    } else {
++      DocsEnum.BulkReadResult bulk = docsEnum.getBulkResult();
++      for (;;) {
++        int nDocs = docsEnum.read();
++        if (nDocs == 0) break;
++        int[] docArr = bulk.docs.ints;
++        int end = bulk.docs.offset + nDocs;
++
++        if (upto + nDocs > docs.length) {
++          if (obs == null) obs = new OpenBitSet(maxDoc());
++          for (int i=bulk.docs.offset; i<end; i++) {
++            obs.fastSet(docArr[i]);
++          }
++          bitsSet += nDocs;
++        } else {
++          for (int i=bulk.docs.offset; i<end; i++) {
++            docs[upto++] = docArr[i];
++          }
++        }
++      }
++    }
++
++    if (obs != null) {
++      for (int i=0; i<upto; i++) {
++        obs.fastSet(docs[i]);  
++      }
++      bitsSet += upto;
++      return new BitDocSet(obs, bitsSet);
++    }
++
++    return new SortedIntDocSet(docs, upto);
++  }
++
++  // query must be positive
+   protected DocSet getDocSetNC(Query query, DocSet filter) throws IOException {
+     DocSetCollector collector = new DocSetCollector(maxDoc()>>6, maxDoc());
+ 
+@@ -1436,6 +1550,20 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+     return a==absQ ? b.intersectionSize(positiveA) : b.andNotSize(positiveA);
+   }
+ 
++  /** @lucene.internal */
++  public int numDocs(Query a, DocSet b, DocsEnumState deState) throws IOException {
++    // Negative query if absolute value different from original
++    Query absQ = QueryUtils.getAbs(a);
++    DocSet positiveA = getPositiveDocSet(absQ, deState);
++    return a==absQ ? b.intersectionSize(positiveA) : b.andNotSize(positiveA);
++  }
++
++  public static class DocsEnumState {
++    public TermsEnum termsEnum;
++    public Bits deletedDocs;
++    public DocsEnum reuse;
++  }
++
+    /**
+    * Returns the number of documents that match both <code>a</code> and <code>b</code>.
+    * <p>
+

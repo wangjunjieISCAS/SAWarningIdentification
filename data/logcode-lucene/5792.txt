@@ -1,0 +1,1619 @@
+GitDiffStart: dcb6f15e7f767cbe538e503c700e3769e66a3677 | Sun Jul 20 11:36:03 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 6624bf7..e526295 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -111,6 +111,13 @@ New Features
+ 
+ * LUCENE-5826: Support proper hunspell case handling, LANG, KEEPCASE, NEEDAFFIX,
+   and ONLYINCOMPOUND flags.  (Robert Muir)
++
++* LUCENE-5815: Add TermAutomatonQuery, a proximity query allowing you
++  to create an arbitrary automaton, using terms on the transitions,
++  expressing which sequence of sequential terms (including a special
++  "any" term) are allowed.  This is a generalization of
++  MultiPhraseQuery and span queries, and enables "correct" (including
++  position) length search-time graph synonyms.  (Mike McCandless)
+   
+ API Changes
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java b/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
+index 78e096b..b498f25 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java
+@@ -533,8 +533,7 @@ public class Automaton {
+       } else {
+         b.append(" [shape=circle,label=\"" + state + "\"]\n");
+       }
+-      int numTransitions = getNumTransitions(state);
+-      initTransition(state, t);
++      int numTransitions = initTransition(state, t);
+       //System.out.println("toDot: state " + state + " has " + numTransitions + " transitions; t.nextTrans=" + t.transitionUpto);
+       for(int i=0;i<numTransitions;i++) {
+         getNextTransition(t);
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonQuery.java b/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonQuery.java
+new file mode 100644
+index 0000000..6c24bde
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonQuery.java
+@@ -0,0 +1,403 @@
++package org.apache.lucene.search;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.DocsAndPositionsEnum;
++import org.apache.lucene.index.IndexReaderContext;
++import org.apache.lucene.index.ReaderUtil;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.index.TermContext;
++import org.apache.lucene.index.TermState;
++import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.search.similarities.Similarity;
++import org.apache.lucene.search.spans.SpanNearQuery;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.Operations;
++import org.apache.lucene.util.automaton.Transition;
++
++// TODO
++//    - compare perf to PhraseQuery exact and sloppy
++//    - optimize: find terms that are in fact MUST (because all paths
++//      through the A include that term)
++//    - if we ever store posLength in the index, it would be easy[ish]
++//      to take it into account here
++
++/** A proximity query that lets you express an automaton, whose
++ *  transitions are terms, to match documents.  This is a generalization
++ *  of other proximity queries like  {@link PhraseQuery}, {@link
++ *  MultiPhraseQuery} and {@link SpanNearQuery}.  It is likely
++ *  slow, since it visits any document having any of the terms (i.e. it
++ *  acts like a disjunction, not a conjunction like {@link
++ *  PhraseQuery}), and then it must merge-sort all positions within each
++ *  document to test whether/how many times the automaton matches.
++ *
++ *  <p>After creating the query, use {@link #createState}, {@link
++ *  #setAccept}, {@link #addTransition} and {@link #addAnyTransition} to
++ *  build up the automaton.  Once you are done, call {@link #finish} and
++ *  then execute the query.
++ *
++ *  <p>This code is very new and likely has exciting bugs!
++ *
++ *  @lucene.experimental */
++
++public class TermAutomatonQuery extends Query {
++  private final String field;
++  private final Automaton.Builder builder;
++  Automaton det;
++  private final Map<BytesRef,Integer> termToID = new HashMap<>();
++  private final Map<Integer,BytesRef> idToTerm = new HashMap<>();
++  private int anyTermID = -1;
++
++  public TermAutomatonQuery(String field) {
++    this.field = field;
++    this.builder = new Automaton.Builder();
++  }
++
++  /** Returns a new state; state 0 is always the initial state. */
++  public int createState() {
++    return builder.createState();
++  }
++
++  /** Marks the specified state as accept or not. */
++  public void setAccept(int state, boolean accept) {
++    builder.setAccept(state, accept);
++  }
++
++  /** Adds a transition to the automaton. */
++  public void addTransition(int source, int dest, String term) {
++    addTransition(source, dest, new BytesRef(term));
++  }
++
++  /** Adds a transition to the automaton. */
++  public void addTransition(int source, int dest, BytesRef term) {
++    if (term == null) {
++      throw new NullPointerException("term should not be null");
++    }
++    builder.addTransition(source, dest, getTermID(term));
++  }
++
++  /** Adds a transition matching any term. */
++  public void addAnyTransition(int source, int dest) {
++    builder.addTransition(source, dest, getTermID(null));
++  }
++
++  /** Call this once you are done adding states/transitions. */
++  public void finish() {
++    Automaton automaton = builder.finish();
++
++    // System.out.println("before det:\n" + automaton.toDot());
++
++    Transition t = new Transition();
++
++    // TODO: should we add "eps back to initial node" for all states,
++    // and det that?  then we don't need to revisit initial node at
++    // every position?  but automaton could blow up?  And, this makes it
++    // harder to skip useless positions at search time?
++
++    if (anyTermID != -1) {
++
++      // Make sure there are no leading or trailing ANY:
++      int count = automaton.initTransition(0, t);
++      for(int i=0;i<count;i++) {
++        automaton.getNextTransition(t);
++        if (anyTermID >= t.min && anyTermID <= t.max) {
++          throw new IllegalStateException("automaton cannot lead with an ANY transition");
++        }
++      }
++
++      int numStates = automaton.getNumStates();
++      for(int i=0;i<numStates;i++) {
++        count = automaton.initTransition(i, t);
++        for(int j=0;j<count;j++) {
++          automaton.getNextTransition(t);
++          if (automaton.isAccept(t.dest) && anyTermID >= t.min && anyTermID <= t.max) {
++            throw new IllegalStateException("automaton cannot end with an ANY transition");
++          }
++        }
++      }
++
++      int termCount = termToID.size();
++
++      // We have to carefully translate these transitions so automaton
++      // realizes they also match all other terms:
++      Automaton newAutomaton = new Automaton();
++      for(int i=0;i<numStates;i++) {
++        newAutomaton.createState();
++        newAutomaton.setAccept(i, automaton.isAccept(i));
++      }
++
++      for(int i=0;i<numStates;i++) {
++        count = automaton.initTransition(i, t);
++        for(int j=0;j<count;j++) {
++          automaton.getNextTransition(t);
++          int min, max;
++          if (t.min <= anyTermID && anyTermID <= t.max) {
++            // Match any term
++            min = 0;
++            max = termCount-1;
++          } else {
++            min = t.min;
++            max = t.max;
++          }
++          newAutomaton.addTransition(t.source, t.dest, min, max);
++        }
++      }
++      newAutomaton.finishState();
++      automaton = newAutomaton;
++    }
++
++    det = Operations.removeDeadStates(Operations.determinize(automaton));
++  }
++
++  @Override
++  public Weight createWeight(IndexSearcher searcher) throws IOException {
++    IndexReaderContext context = searcher.getTopReaderContext();
++    Map<Integer,TermContext> termStates = new HashMap<>();
++
++    for (Map.Entry<BytesRef,Integer> ent : termToID.entrySet()) {
++      if (ent.getKey() != null) {
++        termStates.put(ent.getValue(), TermContext.build(context, new Term(field, ent.getKey())));
++      }
++    }
++
++    return new TermAutomatonWeight(det, searcher, termStates);
++  }
++
++  @Override
++  public void extractTerms(Set<Term> terms) {
++    for(BytesRef text : termToID.keySet()) {
++      if (text != null) {
++        terms.add(new Term(field, text));
++      }
++    }
++  }
++
++  @Override
++  public String toString(String field) {
++    // TODO: what really am I supposed to do with the incoming field...
++    StringBuilder sb = new StringBuilder();
++    sb.append("TermAutomatonQuery(field=");
++    sb.append(this.field);
++    if (det != null) {
++      sb.append(" numStates=");
++      sb.append(det.getNumStates());
++    }
++    sb.append(')');
++    return sb.toString();
++  }
++
++  private int getTermID(BytesRef term) {
++    Integer id = termToID.get(term);
++    if (id == null) {
++      id = termToID.size();
++      if (term != null) {
++        term = BytesRef.deepCopyOf(term);
++      }
++      termToID.put(term, id);
++      idToTerm.put(id, term);
++      if (term == null) {
++        anyTermID = id;
++      }
++    }
++
++    return id;
++  }
++
++  /** Returns true iff <code>o</code> is equal to this. */
++  @Override
++  public boolean equals(Object o) {
++    if (!(o instanceof TermAutomatonQuery)) {
++      return false;
++    }
++    TermAutomatonQuery other = (TermAutomatonQuery) o;
++
++    if (det == null) {
++      throw new IllegalStateException("please call finish first");
++    }
++    if (other.det == null) {
++      throw new IllegalStateException("please call other.finish first");
++    }
++
++    // NOTE: not quite correct, because if terms were added in different
++    // order in each query but the language is the same, we return false:
++    return (this.getBoost() == other.getBoost())
++      && this.termToID.equals(other.termToID) &&
++      Operations.sameLanguage(det, other.det);
++  }
++
++  /** Returns a hash code value for this object.  This is very costly! */
++  @Override
++  public int hashCode() {
++    if (det == null) {
++      throw new IllegalStateException("please call finish first");
++    }
++    return Float.floatToIntBits(getBoost()) ^ termToID.hashCode() + det.toDot().hashCode();
++  }
++
++  /** Returns the dot (graphviz) representation of this automaton.
++   *  This is extremely useful for visualizing the automaton. */
++  public String toDot() {
++
++    // TODO: refactor & share with Automaton.toDot!
++
++    StringBuilder b = new StringBuilder();
++    b.append("digraph Automaton {\n");
++    b.append("  rankdir = LR\n");
++    final int numStates = det.getNumStates();
++    if (numStates > 0) {
++      b.append("  initial [shape=plaintext,label=\"0\"]\n");
++      b.append("  initial -> 0\n");
++    }
++
++    Transition t = new Transition();
++    for(int state=0;state<numStates;state++) {
++      b.append("  ");
++      b.append(state);
++      if (det.isAccept(state)) {
++        b.append(" [shape=doublecircle,label=\"" + state + "\"]\n");
++      } else {
++        b.append(" [shape=circle,label=\"" + state + "\"]\n");
++      }
++      int numTransitions = det.initTransition(state, t);
++      for(int i=0;i<numTransitions;i++) {
++        det.getNextTransition(t);
++        assert t.max >= t.min;
++        for(int j=t.min;j<=t.max;j++) {
++          b.append("  ");
++          b.append(state);
++          b.append(" -> ");
++          b.append(t.dest);
++          b.append(" [label=\"");
++          if (j == anyTermID) {
++            b.append('*');
++          } else {
++            b.append(idToTerm.get(j).utf8ToString());
++          }
++          b.append("\"]\n");
++        }
++      }
++    }
++    b.append('}');
++    return b.toString();
++  }
++
++  // TODO: should we impl rewrite to return BooleanQuery of PhraseQuery,
++  // when 1) automaton is finite, 2) doesn't use ANY transition, 3) is
++  // "small enough"?
++
++  static class EnumAndScorer {
++    public final int termID;
++    public final DocsAndPositionsEnum posEnum;
++
++    // How many positions left in the current document:
++    public int posLeft;
++
++    // Current position
++    public int pos;
++
++    public EnumAndScorer(int termID, DocsAndPositionsEnum posEnum) {
++      this.termID = termID;
++      this.posEnum = posEnum;
++    }
++  }
++
++  final class TermAutomatonWeight extends Weight {
++    private final IndexSearcher searcher;
++    final Automaton automaton;
++    private final Map<Integer,TermContext> termStates;
++    private final Similarity.SimWeight stats;
++    private final Similarity similarity;
++
++    public TermAutomatonWeight(Automaton automaton, IndexSearcher searcher, Map<Integer,TermContext> termStates) throws IOException {
++      this.automaton = automaton;
++      this.searcher = searcher;
++      this.termStates = termStates;
++      this.similarity = searcher.getSimilarity();
++      List<TermStatistics> allTermStats = new ArrayList<>();
++      for(Map.Entry<Integer,BytesRef> ent : idToTerm.entrySet()) {
++        Integer termID = ent.getKey();
++        if (ent.getValue() != null) {
++          allTermStats.add(searcher.termStatistics(new Term(field, ent.getValue()), termStates.get(termID)));
++        }
++      }
++
++      stats = similarity.computeWeight(getBoost(),
++                                       searcher.collectionStatistics(field),
++                                       allTermStats.toArray(new TermStatistics[allTermStats.size()]));
++    }
++
++    @Override
++    public String toString() {
++      return "weight(" + TermAutomatonQuery.this + ")";
++    }
++
++    @Override
++    public Query getQuery() {
++      return TermAutomatonQuery.this;
++    }
++
++    @Override
++    public float getValueForNormalization() {
++      return stats.getValueForNormalization();
++    }
++
++    @Override
++    public void normalize(float queryNorm, float topLevelBoost) {
++      stats.normalize(queryNorm, topLevelBoost);
++    }
++
++    @Override
++    public Scorer scorer(AtomicReaderContext context, Bits acceptDocs) throws IOException {
++
++      // Initialize the enums; null for a given slot means that term didn't appear in this reader
++      EnumAndScorer[] enums = new EnumAndScorer[idToTerm.size()];
++
++      for(Map.Entry<Integer,TermContext> ent : termStates.entrySet()) {
++        TermContext termContext = ent.getValue();
++        assert termContext.topReaderContext == ReaderUtil.getTopLevelContext(context) : "The top-reader used to create Weight (" + termContext.topReaderContext + ") is not the same as the current reader's top-reader (" + ReaderUtil.getTopLevelContext(context);
++        BytesRef term = idToTerm.get(ent.getKey());
++        TermState state = termContext.get(context.ord);
++        if (state != null) {
++
++          TermsEnum termsEnum = context.reader().terms(field).iterator(null);
++          termsEnum.seekExact(term, state);
++          enums[ent.getKey()] = new EnumAndScorer(ent.getKey(),
++                                                  termsEnum.docsAndPositions(acceptDocs, null, 0));
++        }
++      }
++
++      return new TermAutomatonScorer(this, enums, anyTermID, idToTerm, similarity.simScorer(stats, context));
++    }
++    
++    @Override
++    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
++      // TODO
++      return null;
++    }
++  }
++}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java b/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java
+new file mode 100644
+index 0000000..b862869
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/TermAutomatonScorer.java
+@@ -0,0 +1,365 @@
++package org.apache.lucene.search;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Map;
++
++import org.apache.lucene.index.AtomicReader;
++import org.apache.lucene.search.TermAutomatonQuery.EnumAndScorer;
++import org.apache.lucene.search.TermAutomatonQuery.TermAutomatonWeight;
++import org.apache.lucene.search.similarities.Similarity;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.PriorityQueue;
++import org.apache.lucene.util.RamUsageEstimator;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.RunAutomaton;
++
++class TermAutomatonScorer extends Scorer {
++  private final EnumAndScorer[] subs;
++  private final EnumAndScorer[] subsOnDoc;
++  private final PriorityQueue<EnumAndScorer> docIDQueue;
++  private final PriorityQueue<EnumAndScorer> posQueue;
++  private final RunAutomaton runAutomaton;
++  private final Map<Integer,BytesRef> idToTerm;
++
++  // We reuse this array to check for matches starting from an initial
++  // position; we increase posShift every time we move to a new possible
++  // start:
++  private PosState[] positions;
++  int posShift;
++
++  // This is -1 if wildcard (null) terms were not used, else it's the id
++  // of the wildcard term:
++  private final int anyTermID;
++  private final Similarity.SimScorer docScorer;
++
++  private int numSubsOnDoc;
++
++  private final long cost;
++
++  private int docID = -1;
++  private int freq;
++
++  public TermAutomatonScorer(TermAutomatonWeight weight, EnumAndScorer[] subs, int anyTermID, Map<Integer,BytesRef> idToTerm, Similarity.SimScorer docScorer) throws IOException {
++    super(weight);
++    //System.out.println("  automaton:\n" + weight.automaton.toDot());
++    this.runAutomaton = new TermRunAutomaton(weight.automaton, subs.length);
++    this.docScorer = docScorer;
++    this.idToTerm = idToTerm;
++    this.subs = subs;
++    this.docIDQueue = new DocIDQueue(subs.length);
++    this.posQueue = new PositionQueue(subs.length);
++    this.anyTermID = anyTermID;
++    this.subsOnDoc = new EnumAndScorer[subs.length];
++    this.positions = new PosState[4];
++    for(int i=0;i<this.positions.length;i++) {
++      this.positions[i] = new PosState();
++    }
++    long cost = 0;
++
++    // Init docIDQueue:
++    for(EnumAndScorer sub : subs) {
++      if (sub != null) {
++        cost += sub.posEnum.cost();
++
++        if (sub.posEnum.nextDoc() != NO_MORE_DOCS) {
++          sub.posLeft = sub.posEnum.freq()-1;
++          sub.pos = sub.posEnum.nextPosition();
++        }
++          
++        docIDQueue.add(sub);
++      }
++    }
++    this.cost = cost;
++  }
++
++  /** Sorts by docID so we can quickly pull out all scorers that are on
++   *  the same (lowest) docID. */
++  private static class DocIDQueue extends PriorityQueue<EnumAndScorer> {
++    public DocIDQueue(int maxSize) {
++      super(maxSize, false);
++    }
++
++    @Override
++    protected boolean lessThan(EnumAndScorer a, EnumAndScorer b) {
++      return a.posEnum.docID() < b.posEnum.docID();
++    }
++  }
++
++  /** Sorts by position so we can visit all scorers on one doc, by
++   *  position. */
++  private static class PositionQueue extends PriorityQueue<EnumAndScorer> {
++    public PositionQueue(int maxSize) {
++      super(maxSize, false);
++    }
++
++    @Override
++    protected boolean lessThan(EnumAndScorer a, EnumAndScorer b) {
++      return a.pos < b.pos;
++    }
++  }
++
++  /** Pops all enums positioned on the current (minimum) doc */
++  private void popCurrentDoc() {
++    assert numSubsOnDoc == 0;
++    assert docIDQueue.size() > 0;
++    subsOnDoc[numSubsOnDoc++] = docIDQueue.pop();
++    docID = subsOnDoc[0].posEnum.docID();
++    while (docIDQueue.size() > 0 && docIDQueue.top().posEnum.docID() == docID) {
++      subsOnDoc[numSubsOnDoc++] = docIDQueue.pop();
++    }
++  }
++
++  /** Pushes all previously pop'd enums back into the docIDQueue */
++  private void pushCurrentDoc() {
++    for(int i=0;i<numSubsOnDoc;i++) {
++      docIDQueue.add(subsOnDoc[i]);
++    }
++    numSubsOnDoc = 0;
++  }
++
++  @Override
++  public int nextDoc() throws IOException {
++    for(int i=0;i<numSubsOnDoc;i++) {
++      EnumAndScorer sub = subsOnDoc[i];
++      if (sub.posEnum.nextDoc() != NO_MORE_DOCS) {
++        sub.posLeft = sub.posEnum.freq()-1;
++        sub.pos = sub.posEnum.nextPosition();
++      }
++    }
++    return doNext();
++  }
++
++  @Override
++  public int advance(int target) throws IOException {
++    for(int i=0;i<numSubsOnDoc;i++) {
++      EnumAndScorer sub = subsOnDoc[i];
++      if (sub.posEnum.advance(target) != NO_MORE_DOCS) {
++        sub.posLeft = sub.posEnum.freq()-1;
++        sub.pos = sub.posEnum.nextPosition();
++      }
++    }
++
++    return doNext();
++  }
++
++  private int doNext() throws IOException {
++    while (true) {
++      //System.out.println("  doNext: cycle");
++      pushCurrentDoc();
++      popCurrentDoc();
++      //System.out.println("    docID=" + docID);
++      if (docID == NO_MORE_DOCS) {
++        return docID;
++      }
++      countMatches();
++      if (freq > 0) {
++        return docID;
++      }
++      for(int i=0;i<numSubsOnDoc;i++) {
++        EnumAndScorer sub = subsOnDoc[i];
++        if (sub.posEnum.nextDoc() != NO_MORE_DOCS) {
++          sub.posLeft = sub.posEnum.freq()-1;
++          sub.pos = sub.posEnum.nextPosition();
++        }
++      }
++    }
++  }
++
++  private PosState getPosition(int pos) {
++    return positions[pos-posShift];
++  }
++
++  private void shift(int pos) {
++    int limit = pos-posShift;
++    for(int i=0;i<limit;i++) {
++      positions[i].count = 0;
++    }
++    posShift = pos;
++  }
++
++  private void countMatches() throws IOException {
++    freq = 0;
++    for(int i=0;i<numSubsOnDoc;i++) {
++      posQueue.add(subsOnDoc[i]);
++    }
++    // System.out.println("\ncountMatches: " + numSubsOnDoc + " terms in doc=" + docID + " anyTermID=" + anyTermID + " id=" + reader.document(docID).get("id"));
++    // System.out.println("\ncountMatches: " + numSubsOnDoc + " terms in doc=" + docID + " anyTermID=" + anyTermID);
++
++    int lastPos = -1;
++
++    posShift = -1;
++
++    while (posQueue.size() != 0) {
++      EnumAndScorer sub = posQueue.pop();
++
++      // This is a graph intersection, and pos is the state this token
++      // leaves from.  Until index stores posLength (which we could
++      // stuff into a payload using a simple TokenFilter), this token
++      // always transitions from state=pos to state=pos+1:
++      final int pos = sub.pos;
++
++      if (posShift == -1) {
++        posShift = pos;
++      }
++
++      if (pos+1-posShift >= positions.length) {
++        PosState[] newPositions = new PosState[ArrayUtil.oversize(pos+1-posShift, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
++        System.arraycopy(positions, 0, newPositions, 0, positions.length);
++        for(int i=positions.length;i<newPositions.length;i++) {
++          newPositions[i] = new PosState();
++        }
++        positions = newPositions;
++      }
++
++      // System.out.println("  term=" + idToTerm.get(sub.termID).utf8ToString() + " pos=" + pos + " (count=" + getPosition(pos).count + " lastPos=" + lastPos + ") posQueue.size=" + posQueue.size() + " posShift=" + posShift);
++
++      PosState posState;
++      PosState nextPosState;
++
++      // Maybe advance ANY matches:
++      if (lastPos != -1) {
++        if (anyTermID != -1) {
++          int startLastPos = lastPos;
++          while (lastPos < pos) {
++            posState = getPosition(lastPos);
++            if (posState.count == 0 && lastPos > startLastPos) {
++              // Petered out...
++              lastPos = pos;
++              break;
++            }
++            // System.out.println("  iter lastPos=" + lastPos + " count=" + posState.count);
++
++            nextPosState = getPosition(lastPos+1);
++
++            // Advance all states from lastPos -> pos, if they had an any arc:
++            for(int i=0;i<posState.count;i++) {
++              int state = runAutomaton.step(posState.states[i], anyTermID);
++              if (state != -1) {
++                // System.out.println("    add pos=" + (lastPos+1) + " state=" + state);
++                nextPosState.add(state);
++              }
++            }
++
++            lastPos++;
++          }
++        }
++      }
++
++      posState = getPosition(pos);
++      nextPosState = getPosition(pos+1);
++
++      // If there are no pending matches at neither this position or the
++      // next position, then it's safe to shift back to positions[0]:
++      if (posState.count == 0 && nextPosState.count == 0) {
++        shift(pos);
++        posState = getPosition(pos);
++        nextPosState = getPosition(pos+1);
++      }
++
++      // Match current token:
++      for(int i=0;i<posState.count;i++) {
++        // System.out.println("    check cur state=" + posState.states[i]);
++        int state = runAutomaton.step(posState.states[i], sub.termID);
++        if (state != -1) {
++          // System.out.println("      --> " + state);
++          nextPosState.add(state);
++          if (runAutomaton.isAccept(state)) {
++            // System.out.println("      *** (1)");
++            freq++;
++          }
++        }
++      }
++
++      // Also consider starting a new match from this position:
++      int state = runAutomaton.step(0, sub.termID);
++      if (state != -1) {
++        // System.out.println("  add init state=" + state);
++        nextPosState.add(state);
++        if (runAutomaton.isAccept(state)) {
++          // System.out.println("      *** (2)");
++          freq++;
++        }
++      }
++
++      if (sub.posLeft > 0) {
++        // Put this sub back into the posQueue:
++        sub.pos = sub.posEnum.nextPosition();
++        sub.posLeft--;
++        posQueue.add(sub);
++      }
++
++      lastPos = pos;
++    }
++
++    int limit = lastPos+1-posShift;
++    // reset
++    for(int i=0;i<=limit;i++) {
++      positions[i].count = 0;
++    }
++  }
++
++  @Override
++  public String toString() {
++    return "TermAutomatonScorer(" + weight + ")";
++  }
++
++  @Override
++  public int freq() {
++    return freq;
++  }
++
++  @Override
++  public int docID() {
++    return docID;
++  }
++
++  @Override
++  public float score() {
++    // TODO: we could probably do better here, e.g. look @ freqs of actual terms involved in this doc and score differently
++    return docScorer.score(docID, freq);
++  }
++
++  @Override
++  public long cost() {
++    return cost;
++  }
++
++  static class TermRunAutomaton extends RunAutomaton {
++    public TermRunAutomaton(Automaton a, int termCount) {
++      super(a, termCount, true);
++    }
++  }
++
++  private static class PosState {
++    // Which automaton states we are in at this position
++    int[] states = new int[2];
++
++    // How many states
++    int count;
++
++    public void add(int state) {
++      if (states.length == count) {
++        states = ArrayUtil.grow(states);
++      }
++      states[count++] = state;
++    }
++  }
++}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/TokenStreamToTermAutomatonQuery.java b/lucene/sandbox/src/java/org/apache/lucene/search/TokenStreamToTermAutomatonQuery.java
+new file mode 100644
+index 0000000..406ee32
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/TokenStreamToTermAutomatonQuery.java
+@@ -0,0 +1,118 @@
++package org.apache.lucene.search;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.RollingBuffer;
++import org.apache.lucene.util.automaton.Automaton;
++
++/** Consumes a TokenStream and creates an {@link TermAutomatonQuery}
++ *  where the transition labels are tokens from the {@link
++ *  TermToBytesRefAttribute}.
++ *
++ *  <p>This code is very new and likely has exciting bugs!
++ *
++ *  @lucene.experimental */
++public class TokenStreamToTermAutomatonQuery {
++
++  private boolean preservePositionIncrements;
++
++  /** Sole constructor. */
++  public TokenStreamToTermAutomatonQuery() {
++    this.preservePositionIncrements = true;
++  }
++
++  /** Whether to generate holes in the automaton for missing positions, <code>true</code> by default. */
++  public void setPreservePositionIncrements(boolean enablePositionIncrements) {
++    this.preservePositionIncrements = enablePositionIncrements;
++  }
++
++  /** Pulls the graph (including {@link
++   *  PositionLengthAttribute}) from the provided {@link
++   *  TokenStream}, and creates the corresponding
++   *  automaton where arcs are bytes (or Unicode code points 
++   *  if unicodeArcs = true) from each term. */
++  public TermAutomatonQuery toQuery(String field, TokenStream in) throws IOException {
++
++    final TermToBytesRefAttribute termBytesAtt = in.addAttribute(TermToBytesRefAttribute.class);
++    final PositionIncrementAttribute posIncAtt = in.addAttribute(PositionIncrementAttribute.class);
++    final PositionLengthAttribute posLengthAtt = in.addAttribute(PositionLengthAttribute.class);
++    final OffsetAttribute offsetAtt = in.addAttribute(OffsetAttribute.class);
++
++    final BytesRef term = termBytesAtt.getBytesRef();
++
++    in.reset();
++
++    TermAutomatonQuery query = new TermAutomatonQuery(field);
++
++    int pos = -1;
++    int lastPos = 0;
++    int maxOffset = 0;
++    int maxPos = -1;
++    int state = -1;
++    while (in.incrementToken()) {
++      int posInc = posIncAtt.getPositionIncrement();
++      if (preservePositionIncrements == false && posInc > 1) {
++        posInc = 1;
++      }
++      assert pos > -1 || posInc > 0;
++
++      if (posInc > 1) {
++        throw new IllegalArgumentException("cannot handle holes; to accept any term, use '*' term");
++      }
++
++      if (posInc > 0) {
++        // New node:
++        pos += posInc;
++      }
++
++      int endPos = pos + posLengthAtt.getPositionLength();
++      while (state < endPos) {
++        state = query.createState();
++      }
++
++      termBytesAtt.fillBytesRef();
++      //System.out.println(pos + "-" + endPos + ": " + term.utf8ToString() + ": posInc=" + posInc);
++      if (term.length == 1 && term.bytes[term.offset] == (byte) '*') {
++        query.addAnyTransition(pos, endPos);
++      } else {
++        query.addTransition(pos, endPos, term);
++      }
++
++      maxOffset = Math.max(maxOffset, offsetAtt.endOffset());
++      maxPos = Math.max(maxPos, endPos);
++    }
++
++    in.end();
++
++    // TODO: look at endOffset?  ts2a did...
++
++    // TODO: this (setting "last" state as the only accept state) may be too simplistic?
++    query.setAccept(state, true);
++    query.finish();
++
++    return query;
++  }
++}
+diff --git a/lucene/sandbox/src/java/org/apache/lucene/search/package.html b/lucene/sandbox/src/java/org/apache/lucene/search/package.html
+new file mode 100644
+index 0000000..d787e1c
+--- /dev/null
++++ b/lucene/sandbox/src/java/org/apache/lucene/search/package.html
+@@ -0,0 +1,25 @@
++<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++<html>
++<head>
++   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
++</head>
++<body>
++This package contains a single proximity query, TermAutomatonQuery.
++</body>
++</html>
+diff --git a/lucene/sandbox/src/test/org/apache/lucene/search/TestTermAutomatonQuery.java b/lucene/sandbox/src/test/org/apache/lucene/search/TestTermAutomatonQuery.java
+new file mode 100644
+index 0000000..364487b
+--- /dev/null
++++ b/lucene/sandbox/src/test/org/apache/lucene/search/TestTermAutomatonQuery.java
+@@ -0,0 +1,644 @@
++package org.apache.lucene.search;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Random;
++import java.util.Set;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.CannedTokenStream;
++import org.apache.lucene.analysis.MockTokenFilter;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.analysis.Token;
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.StoredField;
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.TestUtil;
++import org.apache.lucene.util.automaton.Automata;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.Operations;
++import org.apache.lucene.util.automaton.Transition;
++
++public class TestTermAutomatonQuery extends LuceneTestCase {
++  // "comes * sun"
++  public void testBasic1() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    // matches
++    doc.add(newTextField("field", "here comes the sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    // doesn't match
++    doc.add(newTextField("field", "here comes the other sun", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    q.addTransition(init, s1, "comes");
++    int s2 = q.createState();
++    q.addAnyTransition(s1, s2);
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(s2, s3, "sun");
++    q.finish();
++
++    assertEquals(1, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  // "comes * (sun|moon)"
++  public void testBasicSynonym() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "here comes the sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "here comes the moon", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    q.addTransition(init, s1, "comes");
++    int s2 = q.createState();
++    q.addAnyTransition(s1, s2);
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(s2, s3, "sun");
++    q.addTransition(s2, s3, "moon");
++    q.finish();
++
++    assertEquals(2, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  // "comes sun" or "comes * sun"
++  public void testBasicSlop() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "here comes the sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "here comes sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "here comes the other sun", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    q.addTransition(init, s1, "comes");
++    int s2 = q.createState();
++    q.addAnyTransition(s1, s2);
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(s1, s3, "sun");
++    q.addTransition(s2, s3, "sun");
++    q.finish();
++
++    assertEquals(2, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  // Verify posLength is "respected" at query time: index "speedy wifi
++  // network", search on "fast wi fi network" using (simulated!)
++  // query-time syn filter to add "wifi" over "wi fi" with posLength=2.
++  // To make this real we need a version of TS2A that operates on whole
++  // terms, not characters.
++  public void testPosLengthAtQueryTimeMock() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "speedy wifi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "speedy wi fi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "fast wifi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "fast wi fi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    // doesn't match:
++    doc = new Document();
++    doc.add(newTextField("field", "slow wi fi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    q.addTransition(init, s1, "fast");
++    q.addTransition(init, s1, "speedy");
++    int s2 = q.createState();
++    int s3 = q.createState();
++    q.addTransition(s1, s2, "wi");
++    q.addTransition(s1, s3, "wifi");
++    q.addTransition(s2, s3, "fi");
++    int s4 = q.createState();
++    q.addTransition(s3, s4, "network");
++    q.setAccept(s4, true);
++    q.finish();
++
++    // System.out.println("DOT:\n" + q.toDot());
++    
++    assertEquals(4, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testPosLengthAtQueryTimeTrueish() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "speedy wifi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "speedy wi fi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "fast wifi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "fast wi fi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    // doesn't match:
++    doc = new Document();
++    doc.add(newTextField("field", "slow wi fi network", Field.Store.NO));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TokenStream ts = new CannedTokenStream(new Token[] {
++        token("fast", 1, 1),
++        token("speedy", 0, 1),
++        token("wi", 1, 1),
++        token("wifi", 0, 2),
++        token("fi", 1, 1),
++        token("network", 1, 1)
++      });
++
++    TermAutomatonQuery q = new TokenStreamToTermAutomatonQuery().toQuery("field", ts);
++    // System.out.println("DOT: " + q.toDot());
++    assertEquals(4, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testFreq() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    // matches freq == 3
++    doc.add(newTextField("field", "here comes the sun foo bar here comes another sun here comes shiny sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    // doesn't match
++    doc.add(newTextField("field", "here comes the other sun", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    q.addTransition(init, s1, "comes");
++    int s2 = q.createState();
++    q.addAnyTransition(s1, s2);
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(s2, s3, "sun");
++    q.finish();
++
++    s.search(q, new SimpleCollector() {
++        private Scorer scorer;
++
++        @Override
++        public boolean acceptsDocsOutOfOrder() {
++          return false;
++        }
++
++        @Override
++        public void setScorer(Scorer scorer) {
++          assert scorer instanceof TermAutomatonScorer;
++          this.scorer = scorer;
++        }
++
++        @Override
++        public void collect(int docID) throws IOException {
++          assertEquals(3, scorer.freq());
++        }
++      });
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testSegsMissingTerms() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "here comes the sun", Field.Store.NO));
++    w.addDocument(doc);
++    w.commit();
++
++    doc = new Document();
++    doc.add(newTextField("field", "here comes the moon", Field.Store.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int init = q.createState();
++    int s1 = q.createState();
++    q.addTransition(init, s1, "comes");
++    int s2 = q.createState();
++    q.addAnyTransition(s1, s2);
++    int s3 = q.createState();
++    q.setAccept(s3, true);
++    q.addTransition(s2, s3, "sun");
++    q.addTransition(s2, s3, "moon");
++    q.finish();
++
++    assertEquals(2, s.search(q, 1).totalHits);
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  public void testInvalidLeadWithAny() throws Exception {
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int s0 = q.createState();
++    int s1 = q.createState();
++    int s2 = q.createState();
++    q.setAccept(s2, true);
++    q.addAnyTransition(s0, s1);
++    q.addTransition(s1, s2, "b");
++    try {
++      q.finish();
++      fail("did not hit expected exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++  }
++
++  public void testInvalidTrailWithAny() throws Exception {
++    TermAutomatonQuery q = new TermAutomatonQuery("field");
++    int s0 = q.createState();
++    int s1 = q.createState();
++    int s2 = q.createState();
++    q.setAccept(s2, true);
++    q.addTransition(s0, s1, "b");
++    q.addAnyTransition(s1, s2);
++    try {
++      q.finish();
++      fail("did not hit expected exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++  }
++  
++  public void testAnyFromTokenStream() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    Document doc = new Document();
++    doc.add(newTextField("field", "here comes the sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "here comes the moon", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newTextField("field", "here comes sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    // Should not match:
++    doc = new Document();
++    doc.add(newTextField("field", "here comes the other sun", Field.Store.NO));
++    w.addDocument(doc);
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    TokenStream ts = new CannedTokenStream(new Token[] {
++        token("comes", 1, 1),
++        token("comes", 0, 2),
++        token("*", 1, 1),
++        token("sun", 1, 1),
++        token("moon", 0, 1)
++      });
++
++    TermAutomatonQuery q = new TokenStreamToTermAutomatonQuery().toQuery("field", ts);
++    // System.out.println("DOT: " + q.toDot());
++    assertEquals(3, s.search(q, 1).totalHits);
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  private static Token token(String term, int posInc, int posLength) {
++    final Token t = new Token(term, 0, term.length());
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++
++  private static class RandomSynonymFilter extends TokenFilter {
++    private boolean synNext;
++    private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
++    private final PositionIncrementAttribute posIncAtt = addAttribute(PositionIncrementAttribute.class);
++
++    public RandomSynonymFilter(TokenFilter in) {
++      super(in);
++    }
++
++    @Override
++    public boolean incrementToken() throws IOException {
++      if (synNext) {
++        clearAttributes();
++        posIncAtt.setPositionIncrement(0);
++        termAtt.append(""+((char) 97 + random().nextInt(3)));
++        synNext = false;
++        return true;
++      }
++
++      if (input.incrementToken()) {
++        if (random().nextInt(10) == 8) {
++          synNext = true;
++        }
++        return true;
++      } else {
++        return false;
++      }
++    }
++
++    @Override
++    public void reset() throws IOException {
++      super.reset();
++      synNext = false;
++    }
++  }
++
++  public void testRandom() throws Exception {
++    int numDocs = atLeast(100);
++    Directory dir = newDirectory();
++
++    // Adds occassional random synonyms:
++    Analyzer analyzer = new Analyzer() {
++        @Override
++        public TokenStreamComponents createComponents(String fieldName) {
++          MockTokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, true, 100);
++          tokenizer.setEnableChecks(true);
++          TokenFilter filt = new MockTokenFilter(tokenizer, MockTokenFilter.EMPTY_STOPSET);
++          filt = new RandomSynonymFilter(filt);
++          return new TokenStreamComponents(tokenizer, filt);
++        }
++      };
++
++    IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer);
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, iwc);
++
++    for(int i=0;i<numDocs;i++) {
++      Document doc = new Document();
++      int numTokens = atLeast(10);
++
++      StringBuilder sb = new StringBuilder();
++      for(int j=0;j<numTokens;j++) {
++        sb.append(' ');
++        sb.append((char) (97 + random().nextInt(3)));
++      }
++      String contents = sb.toString();
++      doc.add(newTextField("field", contents, Field.Store.NO));
++      doc.add(new StoredField("id", ""+i));
++      if (VERBOSE) {
++        System.out.println("  doc " + i + " -> " + contents);
++      }
++      w.addDocument(doc);
++    }
++
++    IndexReader r = w.getReader();
++    IndexSearcher s = newSearcher(r);
++
++    // Used to match ANY using MultiPhraseQuery:
++    Term[] allTerms = new Term[] {new Term("field", "a"),
++                                  new Term("field", "b"),
++                                  new Term("field", "c")};
++    int numIters = atLeast(1000);
++    for(int iter=0;iter<numIters;iter++) {
++
++      // Build the (finite, no any transitions) TermAutomatonQuery and
++      // also the "equivalent" BooleanQuery and make sure they match the
++      // same docs:
++      BooleanQuery bq = new BooleanQuery();
++      int count = TestUtil.nextInt(random(), 1, 5);
++      Set<BytesRef> strings = new HashSet<>();
++      for(int i=0;i<count;i++) {
++        StringBuilder sb = new StringBuilder();
++        int numTokens = TestUtil.nextInt(random(), 1, 5);
++        for(int j=0;j<numTokens;j++) {
++          if (j > 0 && j < numTokens-1 && random().nextInt(5) == 3) {
++            sb.append('*');
++          } else {
++            sb.append((char) (97 + random().nextInt(3)));
++          }
++        }
++        String string = sb.toString();
++        MultiPhraseQuery mpq = new MultiPhraseQuery();
++        for(int j=0;j<string.length();j++) {
++          if (string.charAt(j) == '*') {
++            mpq.add(allTerms);
++          } else {
++            mpq.add(new Term("field", ""+string.charAt(j)));
++          }
++        }
++        bq.add(mpq, BooleanClause.Occur.SHOULD);
++        strings.add(new BytesRef(string));
++      }
++
++      List<BytesRef> stringsList = new ArrayList<>(strings);
++      Collections.sort(stringsList);
++
++      Automaton a = Automata.makeStringUnion(stringsList);
++
++      // Translate automaton to query:
++    
++      TermAutomatonQuery q = new TermAutomatonQuery("field");
++      int numStates = a.getNumStates();
++      for(int i=0;i<numStates;i++) {
++        q.createState();
++        q.setAccept(i, a.isAccept(i));
++      }
++
++      Transition t = new Transition();
++      for(int i=0;i<numStates;i++) {
++        int transCount = a.initTransition(i, t);
++        for(int j=0;j<transCount;j++) {
++          a.getNextTransition(t);
++          for(int label=t.min;label<=t.max;label++) {
++            if ((char) label == '*') {
++              q.addAnyTransition(t.source, t.dest);
++            } else {
++              q.addTransition(t.source, t.dest, ""+(char) label);
++            }
++          }
++        }
++      }
++      q.finish();
++
++      if (VERBOSE) {
++        System.out.println("TEST: iter=" + iter);
++        for(BytesRef string : stringsList) {
++          System.out.println("  string: " + string.utf8ToString());
++        }
++        System.out.println(q.toDot());
++      }
++      
++      Filter filter;
++      if (random().nextInt(5) == 1) {
++        filter = new RandomFilter(random().nextLong(), random().nextFloat());
++      } else {
++        filter = null;
++      }
++
++      TopDocs hits1 = s.search(q, filter, numDocs);
++      TopDocs hits2 = s.search(bq, filter, numDocs);
++      Set<String> hits1Docs = toDocIDs(s, hits1);
++      Set<String> hits2Docs = toDocIDs(s, hits2);
++
++      try {
++        assertEquals(hits2.totalHits, hits1.totalHits);
++        assertEquals(hits2Docs, hits1Docs);
++      } catch (AssertionError ae) {
++        System.out.println("FAILED:");
++        for(String id : hits1Docs) {
++          if (hits2Docs.contains(id) == false) {
++            System.out.println(String.format(Locale.ROOT, "  id=%3s matched but should not have", id));
++          }
++        }
++        for(String id : hits2Docs) {
++          if (hits1Docs.contains(id) == false) {
++            System.out.println(String.format(Locale.ROOT, "  id=%3s did not match but should have", id));
++          }
++        }
++        throw ae;
++      }
++    }
++
++    w.close();
++    r.close();
++    dir.close();
++  }
++
++  private Set<String> toDocIDs(IndexSearcher s, TopDocs hits) throws IOException {
++    Set<String> result = new HashSet<>();
++    for(ScoreDoc hit : hits.scoreDocs) {
++      result.add(s.doc(hit.doc).get("id"));
++    }
++    return result;
++  }
++
++  private static class RandomFilter extends Filter {
++    private final long seed;
++    private float density;
++
++    // density should be 0.0 ... 1.0
++    public RandomFilter(long seed, float density) {
++      this.seed = seed;
++      this.density = density;
++    }
++
++    @Override
++    public DocIdSet getDocIdSet(AtomicReaderContext context, Bits acceptDocs) throws IOException {
++      int maxDoc = context.reader().maxDoc();
++      FixedBitSet bits = new FixedBitSet(maxDoc);
++      Random random = new Random(seed ^ context.docBase);
++      for(int docID=0;docID<maxDoc;docID++) {
++        if (random.nextFloat() <= density && (acceptDocs == null || acceptDocs.get(docID))) {
++          bits.set(docID);
++          //System.out.println("  acc id=" + idSource.getInt(docID) + " docID=" + docID);
++        }
++      }
++
++      return bits;
++    }
++  }
++}
+

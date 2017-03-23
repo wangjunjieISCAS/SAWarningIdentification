@@ -1,0 +1,213 @@
+GitDiffStart: 55426d50702f2fb80e4c9cbd325dedbd5bb3ed4d | Mon Feb 24 05:43:23 2014 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 1f16cdf..92640c6 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -89,6 +89,13 @@ Bug Fixes
+ * SOLR-5647: The lib paths in example-schemaless will now load correctly.
+   (Paul Westin via Shawn Heisey)
+ 
++Optimizations
++----------------------
++* SOLR-1880: Distributed Search skips GET_FIELDS stage if EXECUTE_QUERY
++  stage gets all fields. Requests with fl=id or fl=id,score are now single-pass.
++  (Shawn Smith, Vitaliy Zhovtyuk, shalin)
++
++
+ Other Changes
+ ---------------------
+ 
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java b/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java
+index 485268d..43f3841 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java
+@@ -625,7 +625,7 @@ public class QueryComponent extends SearchComponent
+       return ResponseBuilder.STAGE_GET_FIELDS;
+     }
+     if (rb.stage < ResponseBuilder.STAGE_GET_FIELDS) return ResponseBuilder.STAGE_GET_FIELDS;
+-    if (rb.stage == ResponseBuilder.STAGE_GET_FIELDS) {
++    if (rb.stage == ResponseBuilder.STAGE_GET_FIELDS && !rb.onePassDistributedQuery) {
+       createRetrieveDocs(rb);
+       return ResponseBuilder.STAGE_DONE;
+     }
+@@ -742,6 +742,17 @@ public class QueryComponent extends SearchComponent
+     ShardRequest sreq = new ShardRequest();
+     sreq.purpose = ShardRequest.PURPOSE_GET_TOP_IDS;
+ 
++    String keyFieldName = rb.req.getSchema().getUniqueKeyField().getName();
++
++    // one-pass algorithm if only id and score fields are requested, but not if fl=score since that's the same as fl=*,score
++    ReturnFields fields = rb.rsp.getReturnFields();
++
++    if(fields != null && fields.wantsField(keyFieldName)
++        && fields.getRequestedFieldNames() != null && Arrays.asList(keyFieldName, "score").containsAll(fields.getRequestedFieldNames())) {
++      sreq.purpose |= ShardRequest.PURPOSE_GET_FIELDS;
++      rb.onePassDistributedQuery = true;
++    }
++
+     sreq.params = new ModifiableSolrParams(rb.req.getParams());
+     // TODO: base on current params or original params?
+ 
+@@ -772,9 +783,9 @@ public class QueryComponent extends SearchComponent
+     sreq.params.set(ResponseBuilder.FIELD_SORT_VALUES,"true");
+ 
+     if ( (rb.getFieldFlags() & SolrIndexSearcher.GET_SCORES)!=0 || rb.getSortSpec().includesScore()) {
+-      sreq.params.set(CommonParams.FL, rb.req.getSchema().getUniqueKeyField().getName() + ",score");
++      sreq.params.set(CommonParams.FL, keyFieldName + ",score");
+     } else {
+-      sreq.params.set(CommonParams.FL, rb.req.getSchema().getUniqueKeyField().getName());      
++      sreq.params.set(CommonParams.FL, keyFieldName);
+     }
+ 
+     rb.addRequest(this, sreq);
+@@ -1105,24 +1116,24 @@ public class QueryComponent extends SearchComponent
+     if ((sreq.purpose & ShardRequest.PURPOSE_GET_FIELDS) != 0) {
+       boolean returnScores = (rb.getFieldFlags() & SolrIndexSearcher.GET_SCORES) != 0;
+ 
+-      assert(sreq.responses.size() == 1);
+-      ShardResponse srsp = sreq.responses.get(0);
+-      SolrDocumentList docs = (SolrDocumentList)srsp.getSolrResponse().getResponse().get("response");
+-
+       String keyFieldName = rb.req.getSchema().getUniqueKeyField().getName();
+       boolean removeKeyField = !rb.rsp.getReturnFields().wantsField(keyFieldName);
+ 
+-      for (SolrDocument doc : docs) {
+-        Object id = doc.getFieldValue(keyFieldName);
+-        ShardDoc sdoc = rb.resultIds.get(id.toString());
+-        if (sdoc != null) {
+-          if (returnScores && sdoc.score != null) {
++      for (ShardResponse srsp : sreq.responses) {
++        SolrDocumentList docs = (SolrDocumentList) srsp.getSolrResponse().getResponse().get("response");
++
++        for (SolrDocument doc : docs) {
++          Object id = doc.getFieldValue(keyFieldName);
++          ShardDoc sdoc = rb.resultIds.get(id.toString());
++          if (sdoc != null) {
++            if (returnScores && sdoc.score != null) {
+               doc.setField("score", sdoc.score);
++            }
++            if (removeKeyField) {
++              doc.removeFields(keyFieldName);
++            }
++            rb._responseDocs.set(sdoc.positionInResponse, doc);
+           }
+-          if(removeKeyField) {
+-            doc.removeFields(keyFieldName);
+-          }
+-          rb._responseDocs.set(sdoc.positionInResponse, doc);
+         }
+       }
+     }
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java b/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java
+index 4c1f617..3d1e52e 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java
+@@ -157,6 +157,7 @@ public class ResponseBuilder
+   // returned sequence.
+   // Only valid after STAGE_EXECUTE_QUERY has completed.
+ 
++  public boolean onePassDistributedQuery;
+ 
+   public FacetComponent.FacetInfo _facetInfo;
+   /* private... components that don't own these shouldn't use them */
+diff --git a/solr/core/src/test/org/apache/solr/handler/component/DistributedQueryComponentOptimizationTest.java b/solr/core/src/test/org/apache/solr/handler/component/DistributedQueryComponentOptimizationTest.java
+new file mode 100644
+index 0000000..a2f9691
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/handler/component/DistributedQueryComponentOptimizationTest.java
+@@ -0,0 +1,79 @@
++package org.apache.solr.handler.component;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.solr.BaseDistributedSearchTestCase;
++import org.apache.solr.client.solrj.response.QueryResponse;
++import org.junit.BeforeClass;
++
++import java.nio.ByteBuffer;
++
++/**
++ * Test for QueryComponent's distributed querying optimization.
++ * If the "fl" param is just "id" or just "id,score", all document data to return is already fetched by STAGE_EXECUTE_QUERY.
++ * The second STAGE_GET_FIELDS query is completely unnecessary.
++ * Eliminating that 2nd HTTP request can make a big difference in overall performance.
++ *
++ * @see QueryComponent
++ */
++public class DistributedQueryComponentOptimizationTest extends BaseDistributedSearchTestCase {
++
++  public DistributedQueryComponentOptimizationTest() {
++    fixShardCount = true;
++    shardCount = 3;
++    stress = 0;
++  }
++
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    initCore("solrconfig.xml", "schema-custom-field.xml");
++  }
++
++  @Override
++  public void doTest() throws Exception {
++    del("*:*");
++
++    index(id, "1", "text", "a", "payload", ByteBuffer.wrap(new byte[] { 0x12, 0x62, 0x15 }),                     //  2
++          // quick check to prove "*" dynamicField hasn't been broken by somebody mucking with schema
++          "asdfasdf_field_should_match_catchall_dynamic_field_adsfasdf", "value");
++    index(id, "2", "text", "b", "payload", ByteBuffer.wrap(new byte[] { 0x25, 0x21, 0x16 }));                    //  5
++    index(id, "3", "text", "a", "payload", ByteBuffer.wrap(new byte[] { 0x35, 0x32, 0x58 }));                    //  8
++    index(id, "4", "text", "b", "payload", ByteBuffer.wrap(new byte[] { 0x25, 0x21, 0x15 }));                    //  4
++    index(id, "5", "text", "a", "payload", ByteBuffer.wrap(new byte[] { 0x35, 0x35, 0x10, 0x00 }));              //  9
++    index(id, "6", "text", "c", "payload", ByteBuffer.wrap(new byte[] { 0x1a, 0x2b, 0x3c, 0x00, 0x00, 0x03 }));  //  3
++    index(id, "7", "text", "c", "payload", ByteBuffer.wrap(new byte[] { 0x00, 0x3c, 0x73 }));                    //  1
++    index(id, "8", "text", "c", "payload", ByteBuffer.wrap(new byte[] { 0x59, 0x2d, 0x4d }));                    // 11
++    index(id, "9", "text", "a", "payload", ByteBuffer.wrap(new byte[] { 0x39, 0x79, 0x7a }));                    // 10
++    index(id, "10", "text", "b", "payload", ByteBuffer.wrap(new byte[] { 0x31, 0x39, 0x7c }));                   //  6
++    index(id, "11", "text", "d", "payload", ByteBuffer.wrap(new byte[] { (byte)0xff, (byte)0xaf, (byte)0x9c })); // 13
++    index(id, "12", "text", "d", "payload", ByteBuffer.wrap(new byte[] { 0x34, (byte)0xdd, 0x4d }));             //  7
++    index(id, "13", "text", "d", "payload", ByteBuffer.wrap(new byte[] { (byte)0x80, 0x11, 0x33 }));             // 12
++    commit();
++
++    handle.put("QTime", SKIPVAL);
++
++    QueryResponse rsp;
++    rsp = query("q", "*:*", "fl", "id,score", "sort", "payload asc", "rows", "20");
++    assertFieldValues(rsp.getResults(), id, 7, 1, 6, 4, 2, 10, 12, 3, 5, 9, 8, 13, 11);
++    rsp = query("q", "*:*", "fl", "id,score", "sort", "payload desc", "rows", "20");
++    assertFieldValues(rsp.getResults(), id, 11, 13, 8, 9, 5, 3, 12, 10, 2, 4, 6, 1, 7);
++    // works with just fl=id as well
++    rsp = query("q", "*:*", "fl", "id", "sort", "payload desc", "rows", "20");
++    assertFieldValues(rsp.getResults(), id, 11, 13, 8, 9, 5, 3, 12, 10, 2, 4, 6, 1, 7);
++  }
++}
+diff --git a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpSolrServer.java b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpSolrServer.java
+index 023146a..eb70701 100644
+--- a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpSolrServer.java
++++ b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpSolrServer.java
+@@ -482,7 +482,9 @@ public class HttpSolrServer extends SolrServer {
+           NamedList err = (NamedList) rsp.get("error");
+           if (err != null) {
+             reason = (String) err.get("msg");
+-            // TODO? get the trace?
++            if(reason == null) {
++              reason = (String) err.get("trace");
++            }
+           }
+         } catch (Exception ex) {}
+         if (reason == null) {
+

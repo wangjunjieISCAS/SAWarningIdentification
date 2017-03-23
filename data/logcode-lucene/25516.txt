@@ -1,0 +1,2282 @@
+GitDiffStart: 169fac073f7a4b45ae10a9162da7a459e04a40e3 | Mon Jan 13 23:50:34 2003 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 5cde412..19ef764 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -104,6 +104,45 @@ $Id$
+  21. Added getFields(String) and getValues(String) methods.
+      (Rasik Pandey via otis)
+ 
++ 22. Revised internal search APIs.  Changes include:
++
++       a. Queries are no longer modified during a search.  This makes
++       it possible, e.g., to reuse the same query instance with
++       multiple indexes from multiple threads.
++
++       b. Term-expanding queries (e.g. PrefixQuery, WildcardQuery,
++       etc.)  now work correctly with MultiSearcher, fixing bugs 12619
++       and 12667.
++
++       c. Boosting BooleanQuery's now works, and is supported by the
++       query parser (problem reported by Lee Mallabone).  Thus a query
++       like "(+foo +bar)^2 +baz" is now supported and equivalent to
++       "(+foo^2 +bar^2) +baz".
++
++       d. New method: Query.rewrite(IndexReader).  This permits a
++       query to re-write itself as an alternate, more primitive query.
++       Most of the term-expanding query classes (PrefixQuery,
++       WildcardQuery, etc.) are now implemented using this method.
++
++       e. New method: Searchable.explain(Query q, int doc).  This
++       returns an Explanation instance that describes how a particular
++       document is scored against a query.  An explanation can be
++       displayed as either plain text, with the toString() method, or
++       as HTML, with the toHtml() method.  Note that computing an
++       explanation is as expensive as executing the query over the
++       entire index.  This is intended to be used in developing
++       Similarity implementations, and, for good performance, should
++       not be displayed with every hit.
++
++       f. Scorer and Weight are public, not package protected.  It now
++       possible for someone to write a Scorer implementation that is
++       not in the org.apache.lucene.search package.  This is still
++       fairly advanced programming, and I don't expect anyone to do
++       this anytime soon, but at least now it is possible.
++
++     Caution: These are extensive changes and they have not yet been
++     tested extensively.  Bug reports are appreciated.
++
+ 
+   Contributed by Rasik Pandey on 2002-10-09
+ 1.2 RC6
+diff --git a/default.properties b/default.properties
+index 7b08e25..bac388b 100644
+--- a/default.properties
++++ b/default.properties
+@@ -10,7 +10,7 @@ Name=Lucene
+ version=1.3-dev1
+ year=2000-2002
+ final.name=${name}-${version}
+-debug=off
++debug=on
+ 
+ project.name = site
+ docs.src =  ./xdocs
+diff --git a/src/java/org/apache/lucene/index/Term.java b/src/java/org/apache/lucene/index/Term.java
+index 684be11..9c155ef 100644
+--- a/src/java/org/apache/lucene/index/Term.java
++++ b/src/java/org/apache/lucene/index/Term.java
+@@ -116,9 +116,7 @@ public final class Term implements java.io.Serializable {
+     text = txt;
+   }
+ 
+-  public final String toString() {
+-    return "Term<" + field + ":" + text + ">";
+-  }
++  public final String toString() { return field + ":" + text; }
+   
+   private void readObject(java.io.ObjectInputStream in) 
+     throws java.io.IOException, ClassNotFoundException
+diff --git a/src/java/org/apache/lucene/queryParser/QueryParser.jj b/src/java/org/apache/lucene/queryParser/QueryParser.jj
+index 098a0c8..f1d6448 100644
+--- a/src/java/org/apache/lucene/queryParser/QueryParser.jj
++++ b/src/java/org/apache/lucene/queryParser/QueryParser.jj
+@@ -433,7 +433,7 @@ Query Query(String field) :
+ 
+ Query Clause(String field) : {
+   Query q;
+-  Token fieldToken=null;
++  Token fieldToken=null, boost=null;
+ }
+ {
+   [
+@@ -443,9 +443,17 @@ Query Clause(String field) : {
+ 
+   (
+    q=Term(field)
+-   | <LPAREN> q=Query(field) <RPAREN>
++   | <LPAREN> q=Query(field) <RPAREN> (<CARAT> boost=<NUMBER>)?
++
+   )
+     {
++      if (boost != null) {
++      	float f = (float)1.0;
++	try {
++	  f = Float.valueOf(boost.image).floatValue();
++          q.setBoost(f);
++	} catch (Exception ignored) { }
++      }
+       return q;
+     }
+ }
+diff --git a/src/java/org/apache/lucene/search/BooleanClause.java b/src/java/org/apache/lucene/search/BooleanClause.java
+index e8337ed..a33d1f8 100644
+--- a/src/java/org/apache/lucene/search/BooleanClause.java
++++ b/src/java/org/apache/lucene/search/BooleanClause.java
+@@ -72,4 +72,20 @@ public class BooleanClause implements java.io.Serializable {
+     required = r;
+     prohibited = p;
+   }
++
++  /** Returns true iff <code>o</code> is equal to this. */
++  public boolean equals(Object o) {
++    if (!(o instanceof BooleanClause))
++      return false;
++    BooleanClause other = (BooleanClause)o;
++    return this.query.equals(other.query)
++      && (this.required == other.required)
++      && (this.prohibited == other.prohibited);
++  }
++
++  /** Returns a hash code value for this object.*/
++  public int hashCode() {
++    return query.hashCode() ^ (this.required?1:0) ^ (this.prohibited?2:0);
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/BooleanQuery.java b/src/java/org/apache/lucene/search/BooleanQuery.java
+index 5d22626..ffc1679 100644
+--- a/src/java/org/apache/lucene/search/BooleanQuery.java
++++ b/src/java/org/apache/lucene/search/BooleanQuery.java
+@@ -88,60 +88,95 @@ public class BooleanQuery extends Query {
+     clauses.addElement(clause);
+   }
+ 
+-  void prepare(IndexReader reader) {
+-    for (int i = 0 ; i < clauses.size(); i++) {
+-      BooleanClause c = (BooleanClause)clauses.elementAt(i);
+-      c.query.prepare(reader);
+-    }
++  /** Returns the set of clauses in this query. */
++  public BooleanClause[] getClauses() {
++    return (BooleanClause[])clauses.toArray(new BooleanClause[0]);
+   }
+ 
+-  float sumOfSquaredWeights(Searcher searcher)
+-       throws IOException {
+-    float sum = 0.0f;
+-
+-    for (int i = 0 ; i < clauses.size(); i++) {
+-      BooleanClause c = (BooleanClause)clauses.elementAt(i);
+-      if (!c.prohibited)
+-	sum += c.query.sumOfSquaredWeights(searcher); // sum sub-query weights
++  private class BooleanWeight implements Weight {
++    private Searcher searcher;
++    private float norm;
++    private Vector weights = new Vector();
++
++    public BooleanWeight(Searcher searcher) {
++      this.searcher = searcher;
++      for (int i = 0 ; i < clauses.size(); i++) {
++        BooleanClause c = (BooleanClause)clauses.elementAt(i);
++        weights.add(c.query.createWeight(searcher));
++      }
+     }
+ 
+-    return sum;
+-  }
+-
+-  void normalize(float norm) {
+-    for (int i = 0 ; i < clauses.size(); i++) {
+-      BooleanClause c = (BooleanClause)clauses.elementAt(i);
+-      if (!c.prohibited)
+-	c.query.normalize(norm);
++    public Query getQuery() { return BooleanQuery.this; }
++    public float getValue() { return getBoost(); }
++
++    public float sumOfSquaredWeights() throws IOException {
++      float sum = 0.0f;
++      for (int i = 0 ; i < weights.size(); i++) {
++        BooleanClause c = (BooleanClause)clauses.elementAt(i);
++        Weight w = (Weight)weights.elementAt(i);
++        if (!c.prohibited)
++          sum += w.sumOfSquaredWeights();         // sum sub weights
++      }
++      
++      sum *= getBoost() * getBoost();             // boost each sub-weight
++
++      return sum ;
+     }
+-  }
+ 
+-  Scorer scorer(IndexReader reader, Similarity similarity)
+-       throws IOException {
+ 
+-    if (clauses.size() == 1) {			  // optimize 1-term queries
+-      BooleanClause c = (BooleanClause)clauses.elementAt(0);
+-      if (!c.prohibited)			  // just return term scorer
+-	return c.query.scorer(reader, similarity);
++    public void normalize(float norm) {
++      norm *= getBoost();                         // incorporate boost
++      for (int i = 0 ; i < weights.size(); i++) {
++        BooleanClause c = (BooleanClause)clauses.elementAt(i);
++        Weight w = (Weight)weights.elementAt(i);
++        if (!c.prohibited)
++          w.normalize(norm);
++      }
+     }
+ 
+-    BooleanScorer result = new BooleanScorer(similarity);
++    public Scorer scorer(IndexReader reader) throws IOException {
++      if (weights.size() == 1) {                  // optimize 1-clause queries
++        BooleanClause c = (BooleanClause)clauses.elementAt(0);
++        Weight w = (Weight)weights.elementAt(0);
++        if (!c.prohibited)			  // just return clause scorer
++          return w.scorer(reader);
++      }
++
++      BooleanScorer result = new BooleanScorer(searcher.getSimilarity());
++
++      for (int i = 0 ; i < weights.size(); i++) {
++        BooleanClause c = (BooleanClause)clauses.elementAt(0);
++        Weight w = (Weight)weights.elementAt(i);
++        Scorer subScorer = w.scorer(reader);
++        if (subScorer != null)
++          result.add(subScorer, c.required, c.prohibited);
++        else if (c.required)
++          return null;
++      }
++
++      return result;
++    }
+ 
+-    for (int i = 0 ; i < clauses.size(); i++) {
+-      BooleanClause c = (BooleanClause)clauses.elementAt(i);
+-      Scorer subScorer = c.query.scorer(reader, similarity);
+-      if (subScorer != null)
+-	result.add(subScorer, c.required, c.prohibited);
+-      else if (c.required)
+-	return null;
++    public Explanation explain() throws IOException {
++      Explanation result = new Explanation();
++      result.setDescription("boost(" + getQuery() + ")");
++      result.setValue(getBoost());
++      return result;
+     }
+ 
+-    return result;
++  }
++
++  protected Weight createWeight(Searcher searcher) {
++    return new BooleanWeight(searcher);
+   }
+ 
+   /** Prints a user-readable version of this query. */
+   public String toString(String field) {
+     StringBuffer buffer = new StringBuffer();
++    if (getBoost() > 1.0) {
++      buffer.append("(");
++    }
++
+     for (int i = 0 ; i < clauses.size(); i++) {
+       BooleanClause c = (BooleanClause)clauses.elementAt(i);
+       if (c.prohibited)
+@@ -160,7 +195,27 @@ public class BooleanQuery extends Query {
+       if (i != clauses.size()-1)
+ 	buffer.append(" ");
+     }
++
++    if (getBoost() > 1.0) {
++      buffer.append(")^");
++      buffer.append(getBoost());
++    }
++
+     return buffer.toString();
+   }
+ 
++  /** Returns true iff <code>o</code> is equal to this. */
++  public boolean equals(Object o) {
++    if (!(o instanceof BooleanQuery))
++      return false;
++    BooleanQuery other = (BooleanQuery)o;
++    return (this.getBoost() == other.getBoost())
++      &&  this.clauses.equals(other.clauses);
++  }
++
++  /** Returns a hash code value for this object.*/
++  public int hashCode() {
++    return Float.floatToIntBits(getBoost()) ^ clauses.hashCode();
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/BooleanScorer.java b/src/java/org/apache/lucene/search/BooleanScorer.java
+index 7cf416b..cd696b6 100644
+--- a/src/java/org/apache/lucene/search/BooleanScorer.java
++++ b/src/java/org/apache/lucene/search/BooleanScorer.java
+@@ -117,10 +117,11 @@ final class BooleanScorer extends Scorer {
+   private final void computeCoordFactors() throws IOException {
+     coordFactors = new float[maxCoord];
+     for (int i = 0; i < maxCoord; i++)
+-      coordFactors[i] = getSimilarity().coord(i, maxCoord);
++      coordFactors[i] = getSimilarity().coord(i, maxCoord-1);
+   }
+ 
+-  final void score(HitCollector results, int maxDoc) throws IOException {
++  public final void score(HitCollector results, int maxDoc)
++    throws IOException {
+     if (coordFactors == null)
+       computeCoordFactors();
+ 
+@@ -205,4 +206,43 @@ final class BooleanScorer extends Scorer {
+       }
+     }
+   }
++
++  public Explanation explain(int doc) throws IOException {
++    Explanation sumExpl = new Explanation();
++    sumExpl.setDescription("sum of:");
++    int coord = 0;
++    float sum = 0.0f;
++    for (SubScorer s = scorers; s != null; s = s.next) {
++      Explanation e = s.scorer.explain(doc);
++      if (e.getValue() > 0) {
++        if (!s.prohibited) {
++          sumExpl.addDetail(e);
++          sum += e.getValue();
++          coord++;
++        } else {
++          return new Explanation(0.0f, "match prohibited");
++        }
++      } else if (s.required) {
++        return new Explanation(0.0f, "match required");
++      }
++    }
++    sumExpl.setValue(sum);
++
++    if (coord == 1)                               // only one clause matched
++      sumExpl = sumExpl.getDetails()[0];          // eliminate wrapper
++
++    float coordFactor = getSimilarity().coord(coord, maxCoord-1);
++    if (coordFactor == 1.0f)                      // coord is no-op
++      return sumExpl;                             // eliminate wrapper
++    else {
++      Explanation result = new Explanation();
++      result.setDescription("product of:");
++      result.addDetail(sumExpl);
++      result.addDetail(new Explanation(coordFactor,
++                                       "coord("+coord+"/"+(maxCoord-1)+")"));
++      result.setValue(sum*coordFactor);
++      return result;
++    }
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/ExactPhraseScorer.java b/src/java/org/apache/lucene/search/ExactPhraseScorer.java
+index c33c5c5..32f941d 100644
+--- a/src/java/org/apache/lucene/search/ExactPhraseScorer.java
++++ b/src/java/org/apache/lucene/search/ExactPhraseScorer.java
+@@ -61,9 +61,9 @@ import org.apache.lucene.index.*;
+ 
+ final class ExactPhraseScorer extends PhraseScorer {
+ 
+-  ExactPhraseScorer(TermPositions[] tps, Similarity similarity,
+-                    byte[] norms, float weight) throws IOException {
+-    super(tps, similarity, norms, weight);
++  ExactPhraseScorer(Weight weight, TermPositions[] tps, Similarity similarity,
++                    byte[] norms) throws IOException {
++    super(weight, tps, similarity, norms);
+   }
+ 
+   protected final float phraseFreq() throws IOException {
+diff --git a/src/java/org/apache/lucene/search/Explanation.java b/src/java/org/apache/lucene/search/Explanation.java
+new file mode 100644
+index 0000000..e96020c
+--- /dev/null
++++ b/src/java/org/apache/lucene/search/Explanation.java
+@@ -0,0 +1,145 @@
++package org.apache.lucene.search;
++
++/* ====================================================================
++ * The Apache Software License, Version 1.1
++ *
++ * Copyright (c) 2003 The Apache Software Foundation.  All rights
++ * reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * 3. The end-user documentation included with the redistribution,
++ *    if any, must include the following acknowledgment:
++ *       "This product includes software developed by the
++ *        Apache Software Foundation (http://www.apache.org/)."
++ *    Alternately, this acknowledgment may appear in the software itself,
++ *    if and wherever such third-party acknowledgments normally appear.
++ *
++ * 4. The names "Apache" and "Apache Software Foundation" and
++ *    "Apache Lucene" must not be used to endorse or promote products
++ *    derived from this software without prior written permission. For
++ *    written permission, please contact apache@apache.org.
++ *
++ * 5. Products derived from this software may not be called "Apache",
++ *    "Apache Lucene", nor may "Apache" appear in their name, without
++ *    prior written permission of the Apache Software Foundation.
++ *
++ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED.  IN NO EVENT SHALL THE APACHE SOFTWARE FOUNDATION OR
++ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
++ * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
++ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
++ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ * ====================================================================
++ *
++ * This software consists of voluntary contributions made by many
++ * individuals on behalf of the Apache Software Foundation.  For more
++ * information on the Apache Software Foundation, please see
++ * <http://www.apache.org/>.
++ */
++
++import java.util.ArrayList;
++
++/** Expert: Describes the score computation for document and query. */
++public class Explanation implements java.io.Serializable {
++  private float value;                            // the value of this node
++  private String description;                     // what it represents
++  private ArrayList details;                      // sub-explanations
++
++  public Explanation() {}
++
++  public Explanation(float value, String description) {
++    this.value = value;
++    this.description = description;
++  }
++
++  /** The value assigned to this explanation node. */
++  public float getValue() { return value; }
++  /** Sets the value assigned to this explanation node. */
++  public void setValue(float value) { this.value = value; }
++
++  /** A description of this explanation node. */
++  public String getDescription() { return description; }
++  /** Sets the description of this explanation node. */
++  public void setDescription(String description) {
++    this.description = description;
++  }
++
++  /** The sub-nodes of this explanation node. */
++  public Explanation[] getDetails() {
++    if (details == null)
++      return null;
++    return (Explanation[])details.toArray(new Explanation[0]);
++  }
++
++  /** Adds a sub-node to this explanation node. */
++  public void addDetail(Explanation detail) {
++    if (details == null)
++      details = new ArrayList();
++    details.add(detail);
++  }
++
++  /** Render an explanation as HTML. */
++  public String toString() {
++    return toString(0);
++  }
++  private String toString(int depth) {
++    StringBuffer buffer = new StringBuffer();
++    for (int i = 0; i < depth; i++) {
++      buffer.append("  ");
++    }
++    buffer.append(getValue());
++    buffer.append(" = ");
++    buffer.append(getDescription());
++    buffer.append("\n");
++
++    Explanation[] details = getDetails();
++    if (details != null) {
++      for (int i = 0 ; i < details.length; i++) {
++        buffer.append(details[i].toString(depth+1));
++      }
++    }
++
++    return buffer.toString();
++  }
++
++
++  /** Render an explanation as HTML. */
++  public String toHtml() {
++    StringBuffer buffer = new StringBuffer();
++    buffer.append("<ul>\n");
++
++    buffer.append("<li>");
++    buffer.append(getValue());
++    buffer.append(" = ");
++    buffer.append(getDescription());
++    buffer.append("</li>\n");
++
++    Explanation[] details = getDetails();
++    if (details != null) {
++      for (int i = 0 ; i < details.length; i++) {
++        buffer.append(details[i].toHtml());
++      }
++    }
++
++    buffer.append("</ul>\n");
++
++    return buffer.toString();
++  }
++}
+diff --git a/src/java/org/apache/lucene/search/FuzzyQuery.java b/src/java/org/apache/lucene/search/FuzzyQuery.java
+index afb4bf3..96dbb1f 100644
+--- a/src/java/org/apache/lucene/search/FuzzyQuery.java
++++ b/src/java/org/apache/lucene/search/FuzzyQuery.java
+@@ -60,20 +60,15 @@ import java.io.IOException;
+ 
+ /** Implements the fuzzy search query */
+ public final class FuzzyQuery extends MultiTermQuery {
+-    private Term fuzzyTerm;
++  public FuzzyQuery(Term term) {
++    super(term);
++  }
+     
+-    public FuzzyQuery(Term term) {
+-        super(term);
+-        fuzzyTerm = term;
+-    }
++  protected FilteredTermEnum getEnum(IndexReader reader) throws IOException {
++    return new FuzzyTermEnum(reader, getTerm());
++  }
+     
+-    final void prepare(IndexReader reader) {
+-        try {
+-            setEnum(new FuzzyTermEnum(reader, fuzzyTerm));
+-        } catch (IOException e) {}
+-    }
+-    
+-    public String toString(String field) {
+-        return super.toString(field) + '~';
+-    }
++  public String toString(String field) {
++    return super.toString(field) + '~';
++  }
+ }
+diff --git a/src/java/org/apache/lucene/search/Hits.java b/src/java/org/apache/lucene/search/Hits.java
+index 1588e72..207e29a 100644
+--- a/src/java/org/apache/lucene/search/Hits.java
++++ b/src/java/org/apache/lucene/search/Hits.java
+@@ -93,8 +93,8 @@ public final class Hits {
+     ScoreDoc[] scoreDocs = topDocs.scoreDocs;
+ 
+     float scoreNorm = 1.0f;
+-    if (length > 0 && scoreDocs[0].score > 1.0f)
+-      scoreNorm = 1.0f / scoreDocs[0].score;
++//     if (length > 0 && scoreDocs[0].score > 1.0f)
++//       scoreNorm = 1.0f / scoreDocs[0].score;
+ 
+     int end = scoreDocs.length < length ? scoreDocs.length : length;
+     for (int i = hitDocs.size(); i < end; i++)
+diff --git a/src/java/org/apache/lucene/search/IndexSearcher.java b/src/java/org/apache/lucene/search/IndexSearcher.java
+index b688604..0a712be 100644
+--- a/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -122,7 +122,7 @@ public class IndexSearcher extends Searcher implements Searchable {
+    */
+   public TopDocs search(Query query, Filter filter, final int nDocs)
+        throws IOException {
+-    Scorer scorer = Query.scorer(query, this, reader);
++    Scorer scorer = query.weight(this).scorer(reader);
+     if (scorer == null)
+       return new TopDocs(0, new ScoreDoc[0]);
+ 
+@@ -181,10 +181,25 @@ public class IndexSearcher extends Searcher implements Searchable {
+ 	};
+     }
+ 
+-    Scorer scorer = Query.scorer(query, this, reader);
++    Scorer scorer = query.weight(this).scorer(reader);
+     if (scorer == null)
+       return;
+     scorer.score(collector, reader.maxDoc());
+   }
+ 
++  /** */
++  public Query rewrite(Query original) throws IOException {
++    Query query = original;
++    for (Query rewrittenQuery = query.rewrite(reader); rewrittenQuery != query;
++         rewrittenQuery = query.rewrite(reader)) {
++      query = rewrittenQuery;
++    }
++    return query;
++  }
++
++  /** */
++  public Explanation explain(Query query, int doc) throws IOException {
++    return query.weight(this).scorer(reader).explain(doc);
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/MultiSearcher.java b/src/java/org/apache/lucene/search/MultiSearcher.java
+index 2fab695..5000832 100644
+--- a/src/java/org/apache/lucene/search/MultiSearcher.java
++++ b/src/java/org/apache/lucene/search/MultiSearcher.java
+@@ -203,4 +203,21 @@ public class MultiSearcher extends Searcher implements Searchable {
+ 
+     }
+   }
++  
++  /** */
++  public Query rewrite(Query original) throws IOException {
++    Query[] queries = new Query[searchables.length];
++    for (int i = 0; i < searchables.length; i++) {
++      queries[i] = searchables[i].rewrite(original);
++    }
++    return original.combine(queries);
++  }
++
++
++  /** */
++  public Explanation explain(Query query, int doc) throws IOException {
++    int i = subSearcher(doc);			  // find searcher index
++    return searchables[i].explain(query,doc-starts[i]); // dispatch to searcher
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/MultiTermQuery.java b/src/java/org/apache/lucene/search/MultiTermQuery.java
+index 351deeb..2acb27e 100644
+--- a/src/java/org/apache/lucene/search/MultiTermQuery.java
++++ b/src/java/org/apache/lucene/search/MultiTermQuery.java
+@@ -73,81 +73,55 @@ import org.apache.lucene.index.TermEnum;
+  * <code>MultiTermQuery</code> to provide {@link WildcardTermEnum} and
+  * {@link FuzzyTermEnum}, respectively.
+  */
+-public class MultiTermQuery extends Query {
++public abstract class MultiTermQuery extends Query {
+     private Term term;
+-    private FilteredTermEnum enum;
+-    private BooleanQuery query;
+-    
+-    /** Enable or disable lucene style toString(field) format */
+-    private static boolean LUCENE_STYLE_TOSTRING = false;
+     
+     /** Constructs a query for terms matching <code>term</code>. */
+     public MultiTermQuery(Term term) {
+         this.term = term;
+     }
+     
+-    /** Set the TermEnum to be used */
+-    protected void setEnum(FilteredTermEnum enum) {
+-        this.enum = enum;
+-    }
+-    
+-    final float sumOfSquaredWeights(Searcher searcher) throws IOException {
+-        return getQuery().sumOfSquaredWeights(searcher);
+-    }
+-    
+-    final void normalize(float norm) {
+-        try {
+-            getQuery().normalize(norm);
+-        } catch (IOException e) {
+-            throw new RuntimeException(e.toString());
+-        }
+-    }
++    /** Returns the pattern term. */
++    public Term getTerm() { return term; }
++
++    /** Construct the enumeration to be used, expanding the pattern term. */
++    protected abstract FilteredTermEnum getEnum(IndexReader reader)
++      throws IOException;
+     
+-    final Scorer scorer(IndexReader reader, Similarity similarity)
+-      throws IOException {
+-      return getQuery().scorer(reader, similarity);
++    public Query rewrite(IndexReader reader) throws IOException {
++      FilteredTermEnum enum = getEnum(reader);
++      BooleanQuery query = new BooleanQuery();
++      try {
++        do {
++          Term t = enum.term();
++          if (t != null) {
++            TermQuery tq = new TermQuery(t);      // found a match
++            tq.setBoost(getBoost() * enum.difference()); // set the boost
++            query.add(tq, false, false);          // add to query
++          }
++        } while (enum.next());
++      } finally {
++        enum.close();
++      }
++      return query;
+     }
+     
+-    private final BooleanQuery getQuery() throws IOException {
+-        if (query == null) {
+-            BooleanQuery q = new BooleanQuery();
+-            try {
+-                do {
+-                    Term t = enum.term();
+-                    if (t != null) {
+-                        TermQuery tq = new TermQuery(t);	// found a match
+-                        tq.setBoost(boost * enum.difference()); // set the boost
+-                        q.add(tq, false, false);		// add to q
+-                    }
+-                } while (enum.next());
+-            } finally {
+-                enum.close();
+-            }
+-            query = q;
+-        }
+-        return query;
++    public Query combine(Query[] queries) {
++      return Query.mergeBooleanQueries(queries);
+     }
+-    
++
++
+     /** Prints a user-readable version of this query. */
+     public String toString(String field) {
+-        if (!LUCENE_STYLE_TOSTRING) {
+-            Query q = null;
+-            try {
+-                q = getQuery();
+-            } catch (Exception e) {}
+-            if (q != null) {
+-                return "(" + q.toString(field) + ")";
+-            }
+-        }
+         StringBuffer buffer = new StringBuffer();
+         if (!term.field().equals(field)) {
+             buffer.append(term.field());
+             buffer.append(":");
+         }
+         buffer.append(term.text());
+-        if (boost != 1.0f) {
++        if (getBoost() != 1.0f) {
+             buffer.append("^");
+-            buffer.append(Float.toString(boost));
++            buffer.append(Float.toString(getBoost()));
+         }
+         return buffer.toString();
+     }
+diff --git a/src/java/org/apache/lucene/search/PhrasePrefixQuery.java b/src/java/org/apache/lucene/search/PhrasePrefixQuery.java
+index 36a8553..d765823 100644
+--- a/src/java/org/apache/lucene/search/PhrasePrefixQuery.java
++++ b/src/java/org/apache/lucene/search/PhrasePrefixQuery.java
+@@ -62,6 +62,7 @@ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.MultipleTermPositions;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermPositions;
++import org.apache.lucene.index.TermDocs;
+ import org.apache.lucene.search.Query;
+ 
+ /**
+@@ -75,180 +76,177 @@ import org.apache.lucene.search.Query;
+  * @author Anders Nielsen
+  * @version 1.0
+  */
+-public class PhrasePrefixQuery
+-    extends Query
+-{
+-    private String _field;
+-    private ArrayList _termArrays = new ArrayList();
+-
+-    private float _idf = 0.0f;
+-    private float _weight = 0.0f;
+-
+-    private int _slop = 0;
+-
+-    /**
+-     * Creates a new <code>PhrasePrefixQuery</code> instance.
+-     *
+-     */
+-    public PhrasePrefixQuery()
+-    {
++public class PhrasePrefixQuery extends Query {
++  private String field;
++  private ArrayList termArrays = new ArrayList();
++
++  private float idf = 0.0f;
++  private float weight = 0.0f;
++
++  private int slop = 0;
++
++  /* Sets the phrase slop for this query.
++   * @see PhraseQuery#setSlop(int)
++   */
++  public void setSlop(int s) { slop = s; }
++
++  /* Sets the phrase slop for this query.
++   * @see PhraseQuery#getSlop()
++   */
++  public int getSlop() { return slop; }
++
++  /* Add a single term at the next position in the phrase.
++   * @see PhraseQuery#add(Term)
++   */
++  public void add(Term term) { add(new Term[]{term}); }
++
++  /* Add multiple terms at the next position in the phrase.  Any of the terms
++   * may match.
++   *
++   * @see PhraseQuery#add(Term)
++   */
++  public void add(Term[] terms) {
++    if (termArrays.size() == 0)
++      field = terms[0].field();
++    
++    for (int i=0; i<terms.length; i++) {
++      if (terms[i].field() != field) {
++        throw new IllegalArgumentException
++          ("All phrase terms must be in the same field (" + field + "): "
++           + terms[i]);
++      }
+     }
+ 
+-    /**
+-     * Describe <code>setSlop</code> method here.
+-     *
+-     * @param s an <code>int</code> value
+-     */
+-    public void setSlop(int s)
+-    {
+-	_slop = s;
+-    }
++    termArrays.add(terms);
++  }
++
++  private class PhrasePrefixWeight implements Weight {
++    private Searcher searcher;
++    private float value;
++    private float idf;
++    private float queryNorm;
+ 
+-    /**
+-     * Describe <code>getSlop</code> method here.
+-     *
+-     * @return an <code>int</code> value
+-     */
+-    public int getSlop()
+-    {
+-	return _slop;
++    public PhrasePrefixWeight(Searcher searcher) {
++      this.searcher = searcher;
+     }
+ 
+-    /**
+-     * Describe <code>add</code> method here.
+-     *
+-     * @param term a <code>Term</code> value
+-     */
+-    public void add(Term term)
+-    {
+-	add(new Term[]{term});
++    public Query getQuery() { return PhrasePrefixQuery.this; }
++    public float getValue() { return value; }
++
++    public float sumOfSquaredWeights() throws IOException {
++      Iterator i = termArrays.iterator();
++      while (i.hasNext()) {
++        Term[] terms = (Term[])i.next();
++        for (int j=0; j<terms.length; j++)
++          idf += searcher.getSimilarity().idf(terms[j], searcher);
++      }
++
++      value = idf * getBoost();
++      return value * value;
+     }
+ 
+-    /**
+-     * Describe <code>add</code> method here.
+-     *
+-     * @param terms a <code>Term[]</code> value
+-     */
+-    public void add(Term[] terms)
+-    {
+-	if (_termArrays.size() == 0)
+-	    _field = terms[0].field();
+-
+-      	for (int i=0; i<terms.length; i++)
+-	{
+-	    if (terms[i].field() != _field)
+-	    {
+-		throw new IllegalArgumentException(
+-		    "All phrase terms must be in the same field (" + _field + "): "
+-		    + terms[i]);
+-	    }
+-	}
+-
+-	_termArrays.add(terms);
++    public void normalize(float norm) {
++      queryNorm = norm;
++      queryNorm *= idf;                           // factor from document
++      value *= queryNorm;                         // normalize for query
+     }
+ 
+-    Scorer scorer(IndexReader reader, Similarity similarity)
+-	throws IOException
+-    {
+-    	if (_termArrays.size() == 0)  // optimize zero-term case
+-	    return null;
+-
+-	if (_termArrays.size() == 1)  // optimize one-term case
+-	{
+-	    Term[] terms = (Term[])_termArrays.get(0);
+-
+-	    BooleanQuery boq = new BooleanQuery();
+-	    for (int i=0; i<terms.length; i++)
+-		boq.add(new TermQuery(terms[i]), false, false);
+-
+-	    return boq.scorer(reader, similarity);
+-    	}
+-
+-    	TermPositions[] tps = new TermPositions[_termArrays.size()];
+-	for (int i=0; i<tps.length; i++)
+-	{
+-	    Term[] terms = (Term[])_termArrays.get(i);
+-
+-	    TermPositions p;
+-	    if (terms.length > 1)
+-		p = new MultipleTermPositions(reader, terms);
+-	    else
+-		p = reader.termPositions(terms[0]);
+-
+-	    if (p == null)
+-		return null;
+-
+-	    tps[i] = p;
+-	}
+-
+-	if (_slop == 0)
+-	    return new ExactPhraseScorer(tps, similarity,
+-                                         reader.norms(_field), _weight);
+-	else
+-	    return new SloppyPhraseScorer(tps, similarity, _slop,
+-                                          reader.norms(_field), _weight);
++    public Scorer scorer(IndexReader reader) throws IOException {
++      if (termArrays.size() == 0)                  // optimize zero-term case
++        return null;
++    
++      if (termArrays.size() == 1) {                // optimize one-term case
++        Term[] terms = (Term[])termArrays.get(0);
++      
++        BooleanScorer bos = new BooleanScorer(searcher.getSimilarity());
++        for (int i=0; i<terms.length; i++) {
++          TermDocs docs = reader.termDocs(terms[i]);
++          if (docs != null)
++            bos.add(new TermScorer(this, docs, searcher.getSimilarity(),
++                                   reader.norms(field)), false, false);
++        }
++      
++        return bos;
++      }
++
++      TermPositions[] tps = new TermPositions[termArrays.size()];
++      for (int i=0; i<tps.length; i++) {
++        Term[] terms = (Term[])termArrays.get(i);
++      
++        TermPositions p;
++        if (terms.length > 1)
++          p = new MultipleTermPositions(reader, terms);
++        else
++          p = reader.termPositions(terms[0]);
++      
++        if (p == null)
++          return null;
++      
++        tps[i] = p;
++      }
++    
++      if (slop == 0)
++        return new ExactPhraseScorer(this, tps, searcher.getSimilarity(),
++                                     reader.norms(field));
++      else
++        return new SloppyPhraseScorer(this, tps, searcher.getSimilarity(),
++                                      slop, reader.norms(field));
++    }
++    
++    public Explanation explain() throws IOException {
++      Query q = getQuery();
++
++      Explanation result = new Explanation();
++      result.setDescription("weight(" + getQuery() + "), product of:");
++
++      Explanation boostExpl = new Explanation(getBoost(), "boost");
++      if (getBoost() != 1.0f)
++        result.addDetail(boostExpl);
++      
++      Explanation idfExpl = new Explanation(idf, "idf");
++      result.addDetail(idfExpl);
++      
++      Explanation normExpl = new Explanation(queryNorm, "queryNorm");
++      result.addDetail(normExpl);
++
++      result.setValue(boostExpl.getValue() *
++                      idfExpl.getValue() *
++                      normExpl.getValue());
++
++      return result;
++    }
++  }
++
++  protected Weight createWeight(Searcher searcher) {
++    return new PhrasePrefixWeight(searcher);
++  }
++
++  /** Prints a user-readable version of this query. */
++  public final String toString(String f) {
++    StringBuffer buffer = new StringBuffer();
++    if (!field.equals(f)) {
++      buffer.append(field);
++      buffer.append(":");
+     }
+ 
+-    float sumOfSquaredWeights(Searcher searcher)
+-	throws IOException
+-    {
+-	Iterator i = _termArrays.iterator();
+-	while (i.hasNext())
+-	{
+-	    Term[] terms = (Term[])i.next();
+-	    for (int j=0; j<terms.length; j++)
+-		_idf += searcher.getSimilarity().idf(terms[j], searcher);
+-	}
+-
+-	_weight = _idf * boost;
+-	return _weight * _weight;
++    buffer.append("\"");
++    Iterator i = termArrays.iterator();
++    while (i.hasNext()) {
++      Term[] terms = (Term[])i.next();
++      buffer.append(terms[0].text() + (terms.length > 0 ? "*" : ""));
+     }
++    buffer.append("\"");
+ 
+-    void normalize(float norm)
+-    {
+-	_weight *= norm;
+-	_weight *= _idf;
++    if (slop != 0) {
++      buffer.append("~");
++      buffer.append(slop);
+     }
+ 
+-    /**
+-     * Describe <code>toString</code> method here.
+-     *
+-     * This method assumes that the first term in a array of terms is the
+-     * prefix for the whole array. That might not necessarily be so.
+-     *
+-     * @param f a <code>String</code> value
+-     * @return a <code>String</code> value
+-     */
+-    public final String toString(String f)
+-    {
+-	StringBuffer buffer = new StringBuffer();
+-	if (!_field.equals(f))
+-	{
+-	    buffer.append(_field);
+-	    buffer.append(":");
+-	}
+-
+-	buffer.append("\"");
+-	Iterator i = _termArrays.iterator();
+-	while (i.hasNext())
+-	{
+-	    Term[] terms = (Term[])i.next();
+-	    buffer.append(terms[0].text() + (terms.length > 0 ? "*" : ""));
+-	}
+-	buffer.append("\"");
+-
+-	if (_slop != 0)
+-	{
+-	    buffer.append("~");
+-	    buffer.append(_slop);
+-	}
+-
+-	if (boost != 1.0f)
+-	{
+-	    buffer.append("^");
+-	    buffer.append(Float.toString(boost));
+-	}
+-
+-	return buffer.toString();
++    if (getBoost() != 1.0f) {
++      buffer.append("^");
++      buffer.append(Float.toString(getBoost()));
+     }
++
++    return buffer.toString();
++  }
+ }
+diff --git a/src/java/org/apache/lucene/search/PhraseQuery.java b/src/java/org/apache/lucene/search/PhraseQuery.java
+index 9ac6e08..7fb1611 100644
+--- a/src/java/org/apache/lucene/search/PhraseQuery.java
++++ b/src/java/org/apache/lucene/search/PhraseQuery.java
+@@ -68,15 +68,10 @@ import org.apache.lucene.index.IndexReader;
+ public class PhraseQuery extends Query {
+   private String field;
+   private Vector terms = new Vector();
+-  private float idf = 0.0f;
+-  private float weight = 0.0f;
+-
+   private int slop = 0;
+ 
+-
+   /** Constructs an empty phrase query. */
+-  public PhraseQuery() {
+-  }
++  public PhraseQuery() {}
+ 
+   /** Sets the number of other words permitted between words in query phrase.
+     If zero, then this is an exact phrase search.  For larger values this works
+@@ -107,48 +102,103 @@ public class PhraseQuery extends Query {
+     terms.addElement(term);
+   }
+ 
+-  final float sumOfSquaredWeights(Searcher searcher) throws IOException {
+-    idf = searcher.getSimilarity().idf(terms, searcher);
+-    weight = idf * boost;
+-    return weight * weight;			  // square term weights
++  /** Returns the set of terms in this phrase. */
++  public Term[] getTerms() {
++    return (Term[])terms.toArray(new Term[0]);
+   }
+ 
+-  final void normalize(float norm) {
+-    weight *= norm;				  // normalize for query
+-    weight *= idf;				  // factor from document
+-  }
++  private class PhraseWeight implements Weight {
++    private Searcher searcher;
++    private float value;
++    private float idf;
++    private float queryNorm;
+ 
+-  final Scorer scorer(IndexReader reader, Similarity similarity)
+-    throws IOException {
+-    if (terms.size() == 0)			  // optimize zero-term case
+-      return null;
+-    if (terms.size() == 1) {			  // optimize one-term case
+-      Term term = (Term)terms.elementAt(0);
+-      TermDocs docs = reader.termDocs(term);
+-      if (docs == null)
+-	return null;
+-      return new TermScorer(docs, similarity,
+-                            reader.norms(term.field()), weight);
++    public PhraseWeight(Searcher searcher) {
++      this.searcher = searcher;
+     }
+ 
+-    TermPositions[] tps = new TermPositions[terms.size()];
+-    for (int i = 0; i < terms.size(); i++) {
+-      TermPositions p = reader.termPositions((Term)terms.elementAt(i));
+-      if (p == null)
+-	return null;
+-      tps[i] = p;
++    public Query getQuery() { return PhraseQuery.this; }
++    public float getValue() { return value; }
++
++    public float sumOfSquaredWeights() throws IOException {
++      idf = searcher.getSimilarity().idf(terms, searcher);
++      value = idf * getBoost();
++      return value * value;			  // square term weights
++    }
++
++    public void normalize(float norm) {
++      queryNorm = norm;
++      queryNorm *= idf;                           // factor from document
++      value *= queryNorm;                         // normalize for query
++    }
++
++    public Scorer scorer(IndexReader reader) throws IOException {
++      if (terms.size() == 0)			  // optimize zero-term case
++        return null;
++      if (terms.size() == 1) {			  // optimize one-term case
++        Term term = (Term)terms.elementAt(0);
++        TermDocs docs = reader.termDocs(term);
++        if (docs == null)
++          return null;
++        return new TermScorer(this, docs, searcher.getSimilarity(),
++                              reader.norms(term.field()));
++      }
++
++      TermPositions[] tps = new TermPositions[terms.size()];
++      for (int i = 0; i < terms.size(); i++) {
++        TermPositions p = reader.termPositions((Term)terms.elementAt(i));
++        if (p == null)
++          return null;
++        tps[i] = p;
++      }
++
++      if (slop == 0)				  // optimize exact case
++        return new ExactPhraseScorer(this, tps, searcher.getSimilarity(),
++                                     reader.norms(field));
++      else
++        return
++          new SloppyPhraseScorer(this, tps, searcher.getSimilarity(), slop,
++                                 reader.norms(field));
++      
+     }
+ 
+-    if (slop == 0)				  // optimize exact case
+-      return new ExactPhraseScorer(tps, similarity,
+-                                   reader.norms(field), weight);
+-    else
+-      return
+-	new SloppyPhraseScorer(tps, similarity, slop,
+-                               reader.norms(field), weight);
++    public Explanation explain() throws IOException {
++      Query q = getQuery();
++
++      Explanation result = new Explanation();
++      result.setDescription("weight(" + getQuery() + "), product of:");
++
++      Explanation boostExpl = new Explanation(getBoost(), "boost");
++      if (getBoost() != 1.0f)
++        result.addDetail(boostExpl);
++      
++      StringBuffer docFreqs = new StringBuffer();
++      for (int i = 0; i < terms.size(); i++) {
++        if (i != 0) docFreqs.append(" ");
++        docFreqs.append(((Term)terms.elementAt(i)).text());
++        docFreqs.append("=");
++        docFreqs.append(searcher.docFreq((Term)terms.elementAt(i)));
++      }
++      Explanation idfExpl =
++        new Explanation(idf, "idf(" + field + ": " + docFreqs + ")");
++      result.addDetail(idfExpl);
++      
++      Explanation normExpl = new Explanation(queryNorm, "queryNorm");
++      result.addDetail(normExpl);
++
++      result.setValue(boostExpl.getValue() *
++                      idfExpl.getValue() *
++                      normExpl.getValue());
++
++      return result;
++    }
++  }
+ 
++  protected Weight createWeight(Searcher searcher) {
++    return new PhraseWeight(searcher);
+   }
+ 
++
+   /** Prints a user-readable version of this query. */
+   public String toString(String f) {
+     StringBuffer buffer = new StringBuffer();
+@@ -170,11 +220,29 @@ public class PhraseQuery extends Query {
+       buffer.append(slop);
+     }
+ 
+-    if (boost != 1.0f) {
++    if (getBoost() != 1.0f) {
+       buffer.append("^");
+-      buffer.append(Float.toString(boost));
++      buffer.append(Float.toString(getBoost()));
+     }
+ 
+     return buffer.toString();
+   }
++
++  /** Returns true iff <code>o</code> is equal to this. */
++  public boolean equals(Object o) {
++    if (!(o instanceof PhraseQuery))
++      return false;
++    PhraseQuery other = (PhraseQuery)o;
++    return (this.getBoost() == other.getBoost())
++      && (this.slop == other.slop)
++      &&  this.terms.equals(other.terms);
++  }
++
++  /** Returns a hash code value for this object.*/
++  public int hashCode() {
++    return Float.floatToIntBits(getBoost())
++      ^ Float.floatToIntBits(slop)
++      ^ terms.hashCode();
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/PhraseScorer.java b/src/java/org/apache/lucene/search/PhraseScorer.java
+index 853ed72..2bd5ee5 100644
+--- a/src/java/org/apache/lucene/search/PhraseScorer.java
++++ b/src/java/org/apache/lucene/search/PhraseScorer.java
+@@ -60,17 +60,21 @@ import org.apache.lucene.util.*;
+ import org.apache.lucene.index.*;
+ 
+ abstract class PhraseScorer extends Scorer {
++  private Weight weight;
+   protected byte[] norms;
+-  protected float weight;
++  protected float value;
+ 
+   protected PhraseQueue pq;
+   protected PhrasePositions first, last;
+ 
+-  PhraseScorer(TermPositions[] tps, Similarity similarity,
+-               byte[] norms, float weight) throws IOException {
++  private float freq;
++
++  PhraseScorer(Weight weight, TermPositions[] tps, Similarity similarity,
++               byte[] norms) throws IOException {
+     super(similarity);
+     this.norms = norms;
+     this.weight = weight;
++    this.value = weight.getValue();
+ 
+     // use PQ to build a sorted list of PhrasePositions
+     pq = new PhraseQueue(tps.length);
+@@ -79,7 +83,7 @@ abstract class PhraseScorer extends Scorer {
+     pqToList();
+   }
+ 
+-  final void score(HitCollector results, int end) throws IOException {
++  public final void score(HitCollector results, int end) throws IOException {
+     Similarity similarity = getSimilarity();
+     while (last.doc < end) {			  // find doc w/ all the terms
+       while (first.doc < last.doc) {		  // scan forward in first
+@@ -92,10 +96,10 @@ abstract class PhraseScorer extends Scorer {
+       }
+ 
+       // found doc with all terms
+-      float freq = phraseFreq();		  // check for phrase
++      freq = phraseFreq();                        // check for phrase
+ 
+       if (freq > 0.0) {
+-	float score = similarity.tf(freq)*weight; // compute score
++	float score = similarity.tf(freq)*value;  // compute score
+ 	score *= Similarity.decodeNorm(norms[first.doc]); // normalize
+ 	results.collect(first.doc, score);	  // add to results
+       }
+@@ -124,4 +128,37 @@ abstract class PhraseScorer extends Scorer {
+     first = first.next;
+     last.next = null;
+   }
++
++  public Explanation explain(final int doc) throws IOException {
++    Explanation result = new Explanation();
++    PhraseQuery query = (PhraseQuery)weight.getQuery();
++
++    result.setDescription("phraseScore(" + query + "), product of:");
++    
++    Explanation weightExplanation = weight.explain();
++    result.addDetail(weightExplanation);
++
++    Explanation tfExplanation = new Explanation();
++    score(new HitCollector() {
++        public final void collect(int d, float score) {}
++      }, doc+1);
++
++    float phraseFreq = (first.doc == doc) ? freq : 0.0f;
++    tfExplanation.setValue(getSimilarity().tf(phraseFreq));
++    tfExplanation.setDescription("tf(phraseFreq=" + phraseFreq + ")");
++    result.addDetail(tfExplanation);
++    
++    Explanation normExplanation = new Explanation();
++    normExplanation.setValue(Similarity.decodeNorm(norms[doc]));
++    String field = query.getTerms()[0].field();
++    normExplanation.setDescription("norm(field="+field + ", doc="+doc + ")");
++    result.addDetail(normExplanation);
++
++    result.setValue(weightExplanation.getValue() *
++                    tfExplanation.getValue() *
++                    normExplanation.getValue());
++    
++    return result;
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/PrefixQuery.java b/src/java/org/apache/lucene/search/PrefixQuery.java
+index cc5f63d..b8a6c66 100644
+--- a/src/java/org/apache/lucene/search/PrefixQuery.java
++++ b/src/java/org/apache/lucene/search/PrefixQuery.java
+@@ -63,63 +63,39 @@ import org.apache.lucene.index.IndexReader;
+ /** A Query that matches documents containing terms with a specified prefix. */
+ public class PrefixQuery extends Query {
+   private Term prefix;
+-  private IndexReader reader;
+-  private BooleanQuery query;
+ 
+   /** Constructs a query for terms starting with <code>prefix</code>. */
+   public PrefixQuery(Term prefix) {
+     this.prefix = prefix;
+-    this.reader = reader;
+   }
+ 
+-  final void prepare(IndexReader reader) {
+-    this.query = null;
+-    this.reader = reader;
+-  }
+-
+-  final float sumOfSquaredWeights(Searcher searcher)
+-    throws IOException {
+-    return getQuery().sumOfSquaredWeights(searcher);
+-  }
+-
+-  void normalize(float norm) {
++  public Query rewrite(IndexReader reader) throws IOException {
++    BooleanQuery query = new BooleanQuery();
++    TermEnum enum = reader.terms(prefix);
+     try {
+-      getQuery().normalize(norm);
+-    } catch (IOException e) {
+-      throw new RuntimeException(e.toString());
++      String prefixText = prefix.text();
++      String prefixField = prefix.field();
++      do {
++        Term term = enum.term();
++        if (term != null &&
++            term.text().startsWith(prefixText) &&
++            term.field() == prefixField) {
++          TermQuery tq = new TermQuery(term);	  // found a match
++          tq.setBoost(getBoost());                // set the boost
++          query.add(tq, false, false);		  // add to query
++          //System.out.println("added " + term);
++        } else {
++          break;
++        }
++      } while (enum.next());
++    } finally {
++      enum.close();
+     }
++    return query;
+   }
+ 
+-  Scorer scorer(IndexReader reader, Similarity similarity) throws IOException {
+-    return getQuery().scorer(reader, similarity);
+-  }
+-
+-  private BooleanQuery getQuery() throws IOException {
+-    if (query == null) {
+-      BooleanQuery q = new BooleanQuery();
+-      TermEnum enum = reader.terms(prefix);
+-      try {
+-	String prefixText = prefix.text();
+-	String prefixField = prefix.field();
+-	do {
+-	  Term term = enum.term();
+-	  if (term != null &&
+-	      term.text().startsWith(prefixText) &&
+-	      term.field() == prefixField) {
+-	    TermQuery tq = new TermQuery(term);	  // found a match
+-	    tq.setBoost(boost);			  // set the boost
+-	    q.add(tq, false, false);		  // add to q
+-	    //System.out.println("added " + term);
+-	  } else {
+-	    break;
+-	  }
+-	} while (enum.next());
+-      } finally {
+-	enum.close();
+-      }
+-      query = q;
+-    }
+-    return query;
++  public Query combine(Query[] queries) {
++    return Query.mergeBooleanQueries(queries);
+   }
+ 
+   /** Prints a user-readable version of this query. */
+@@ -131,9 +107,9 @@ public class PrefixQuery extends Query {
+     }
+     buffer.append(prefix.text());
+     buffer.append('*');
+-    if (boost != 1.0f) {
++    if (getBoost() != 1.0f) {
+       buffer.append("^");
+-      buffer.append(Float.toString(boost));
++      buffer.append(Float.toString(getBoost()));
+     }
+     return buffer.toString();
+   }
+diff --git a/src/java/org/apache/lucene/search/Query.java b/src/java/org/apache/lucene/search/Query.java
+index b3b8472..ed8cc46 100644
+--- a/src/java/org/apache/lucene/search/Query.java
++++ b/src/java/org/apache/lucene/search/Query.java
+@@ -55,8 +55,10 @@ package org.apache.lucene.search;
+  */
+ 
+ import java.io.IOException;
+-import java.util.Hashtable;
+-import org.apache.lucene.document.Document;
++
++import java.util.HashSet;
++import java.util.Iterator;
++
+ import org.apache.lucene.index.IndexReader;
+ 
+ /** The abstract base class for queries.
+@@ -76,52 +78,93 @@ import org.apache.lucene.index.IndexReader;
+     <li>{@link org.apache.lucene.queryParser.QueryParser QueryParser}
+     </ul>
+ */
+-public abstract class Query implements java.io.Serializable
+-{
+-    // query boost factor
+-    protected float boost = 1.0f;
+-
+-    // query weighting
+-    abstract float sumOfSquaredWeights(Searcher searcher) throws IOException;
+-    abstract void normalize(float norm);
+-
+-    // query evaluation
+-    abstract Scorer scorer(IndexReader reader, Similarity similarity)
+-      throws IOException;
+-
+-    void prepare(IndexReader reader) {}
+-
+-    static Scorer scorer(Query query, Searcher searcher, IndexReader reader)
+-      throws IOException {
+-      Similarity similarity = searcher.getSimilarity();
+-      query.prepare(reader);
+-      float sum = query.sumOfSquaredWeights(searcher);
+-      float norm = similarity.queryNorm(sum);
+-      query.normalize(norm);
+-      return query.scorer(reader, similarity);
++public abstract class Query implements java.io.Serializable {
++  private float boost = 1.0f;                     // query boost factor
++
++  /** Sets the boost for this query clause to <code>b</code>.  Documents
++   * matching this clause will (in addition to the normal weightings) have
++   * their score multiplied by <code>b</code>.
++   */
++  public void setBoost(float b) { boost = b; }
++
++  /** Gets the boost for this clause.  Documents matching
++   * this clause will (in addition to the normal weightings) have their score
++   * multiplied by <code>b</code>.   The boost is 1.0 by default.
++   */
++  public float getBoost() { return boost; }
++
++  /** Prints a query to a string, with <code>field</code> as the default field
++   * for terms.  <p>The representation used is one that is readable by {@link
++   * org.apache.lucene.queryParser.QueryParser QueryParser} (although, if the
++   * query was created by the parser, the printed representation may not be
++   * exactly what was parsed).
++   */
++  public abstract String toString(String field);
++
++  /** Prints a query to a string. */
++  public String toString() {
++    return toString("");
++  }
++
++  /** Expert: Constructs an appropriate Weight implementation for this query.
++   *
++   * <p>Only implemented by primitive queries, which re-write to themselves.
++   */
++  protected Weight createWeight(Searcher searcher) {
++    throw new UnsupportedOperationException();
++  }
++  
++  /** Expert: Constructs an initializes a Weight for a top-level query. */
++  public Weight weight(Searcher searcher)
++    throws IOException {
++    Query query = searcher.rewrite(this);
++    Weight weight = query.createWeight(searcher);
++    float sum = weight.sumOfSquaredWeights();
++    float norm = searcher.getSimilarity().queryNorm(sum);
++    weight.normalize(norm);
++    return weight;
++  }
++
++  /** Expert: called to re-write queries into primitive queries.
++   *
++   * <p>Only implemented by derived queries, with no {@link
++   * #createWeight(Searcher)} implementatation..
++   */
++  public Query rewrite(IndexReader reader) throws IOException {
++    return this;
++  }
++
++  /** Expert: called when re-writing queries under MultiSearcher.
++   *
++   * <p>Only implemented by derived queries, with no {@link
++   * #createWeight(Searcher)} implementatation..
++   */
++  public Query combine(Query[] queries) {
++    throw new UnsupportedOperationException();
++  }
++
++
++  /** Expert: merges the clauses of a set of BooleanQuery's into a single
++   * BooleanQuery.
++   *
++   *<p>A utility for use by {@link #combine(Query[])} implementations.
++   */
++  public static Query mergeBooleanQueries(Query[] queries) {
++    HashSet allClauses = new HashSet();
++    for (int i = 0; i < queries.length; i++) {
++      BooleanClause[] clauses = ((BooleanQuery)queries[i]).getClauses();
++      for (int j = 0; j < clauses.length; j++) {
++        allClauses.add(clauses[j]);
++      }
+     }
+ 
+-    /**
+-     * Sets the boost for this term to <code>b</code>.  Documents containing
+-     * this term will (in addition to the normal weightings) have their score
+-     * multiplied by <code>b</code>.
+-     */
+-    public void setBoost(float b) { boost = b; }
+-
+-    /**
+-     * Gets the boost for this term.  Documents containing
+-     * this term will (in addition to the normal weightings) have their score
+-     * multiplied by <code>b</code>.   The boost is 1.0 by default.
+-     */
+-    public float getBoost() { return boost; }
+-
+-    /**
+-     * Prints a query to a string, with <code>field</code> as the default field
+-     * for terms.
+-     * <p>The representation used is one that is readable by
+-     * {@link org.apache.lucene.queryParser.QueryParser QueryParser}
+-     * (although, if the query was created by the parser, the printed
+-     * representation may not be exactly what was parsed).
+-     */
+-    public abstract String toString(String field);
++    BooleanQuery result = new BooleanQuery();
++    Iterator i = allClauses.iterator();
++    while (i.hasNext()) {
++      result.add((BooleanClause)i.next());
++    }
++    return result;
++  }
++
++
+ }
+diff --git a/src/java/org/apache/lucene/search/RangeQuery.java b/src/java/org/apache/lucene/search/RangeQuery.java
+index 277e174..6eaa1af 100644
+--- a/src/java/org/apache/lucene/search/RangeQuery.java
++++ b/src/java/org/apache/lucene/search/RangeQuery.java
+@@ -66,8 +66,6 @@ public class RangeQuery extends Query
+     private Term lowerTerm;
+     private Term upperTerm;
+     private boolean inclusive;
+-    private IndexReader reader;
+-    private BooleanQuery query;
+     
+     /** Constructs a query selecting all terms greater than 
+      * <code>lowerTerm</code> but less than <code>upperTerm</code>.
+@@ -89,99 +87,59 @@ public class RangeQuery extends Query
+         this.upperTerm = upperTerm;
+         this.inclusive = inclusive;
+     }
+-    
+-    final void prepare(IndexReader reader)
+-    {
+-        this.query = null;
+-        this.reader = reader;
+-    }
+-    
+-    final float sumOfSquaredWeights(Searcher searcher) throws IOException
+-    {
+-        return getQuery().sumOfSquaredWeights(searcher);
+-    }
+-    
+-    void normalize(float norm)
+-    {
+-        try
+-        {
+-            getQuery().normalize(norm);
+-        } 
+-        catch (IOException e)
+-        {
+-            throw new RuntimeException(e.toString());
+-        }
+-    }
+-    
+-    Scorer scorer(IndexReader reader, Similarity similarity) throws IOException
+-    {
+-        return getQuery().scorer(reader, similarity);
+-    }
+-    
+-    private BooleanQuery getQuery() throws IOException
+-    {
+-        if (query == null)
+-        {
+-            BooleanQuery q = new BooleanQuery();
+-            // if we have a lowerTerm, start there. otherwise, start at beginning
+-            if (lowerTerm == null) lowerTerm = new Term(getField(), "");
+-            TermEnum enum = reader.terms(lowerTerm);
+-            try
+-            {
+-                String lowerText = null;
+-                String field;
+-                boolean checkLower = false;
+-                if (!inclusive) // make adjustments to set to exclusive
+-                {
+-                    if (lowerTerm != null)
+-                    {
+-                        lowerText = lowerTerm.text();
+-                        checkLower = true;
+-                    }
+-                    if (upperTerm != null)
+-                    {
+-                        // set upperTerm to an actual term in the index
+-                        TermEnum uppEnum = reader.terms(upperTerm);
+-                        upperTerm = uppEnum.term();
+-                    }
+-                }
+-                String testField = getField();
+-                do
+-                {
+-                    Term term = enum.term();
+-                    if (term != null && term.field() == testField)
+-                    {
+-                        if (!checkLower || term.text().compareTo(lowerText) > 0) 
+-                        {
+-                            checkLower = false;
+-                            if (upperTerm != null)
+-                            {
+-                                int compare = upperTerm.compareTo(term);
+-                                /* if beyond the upper term, or is exclusive and
+-                                 * this is equal to the upper term, break out */
+-                                if ((compare < 0) || (!inclusive && compare == 0)) break;
+-                            }
+-                            TermQuery tq = new TermQuery(term);	  // found a match
+-                            tq.setBoost(boost);               // set the boost
+-                            q.add(tq, false, false);		  // add to q
+-                        }
+-                    } 
+-                    else
+-                    {
+-                        break;
+-                    }
++
++    public Query rewrite(IndexReader reader) throws IOException {
++      BooleanQuery query = new BooleanQuery();
++      // if we have a lowerTerm, start there. otherwise, start at beginning
++      if (lowerTerm == null) lowerTerm = new Term(getField(), "");
++      TermEnum enum = reader.terms(lowerTerm);
++      try {
++        String lowerText = null;
++        String field;
++        boolean checkLower = false;
++          if (!inclusive) {             // make adjustments to set to exclusive
++            if (lowerTerm != null) {
++              lowerText = lowerTerm.text();
++              checkLower = true;
++            }
++            if (upperTerm != null) {
++              // set upperTerm to an actual term in the index
++              TermEnum uppEnum = reader.terms(upperTerm);
++              upperTerm = uppEnum.term();
++            }
++          }
++          String testField = getField();
++          do {
++            Term term = enum.term();
++            if (term != null && term.field() == testField) {
++              if (!checkLower || term.text().compareTo(lowerText) > 0) {
++                checkLower = false;
++                if (upperTerm != null) {
++                  int compare = upperTerm.compareTo(term);
++                  /* if beyond the upper term, or is exclusive and
++                   * this is equal to the upper term, break out */
++                  if ((compare < 0) || (!inclusive && compare == 0)) break;
+                 }
+-                while (enum.next());
++                TermQuery tq = new TermQuery(term); // found a match
++                tq.setBoost(getBoost());          // set the boost
++                query.add(tq, false, false); // add to query
++              }
+             } 
+-            finally
+-            {
+-                enum.close();
++            else {
++              break;
+             }
+-            query = q;
+-        }
+-        return query;
++          }
++          while (enum.next());
++      } finally {
++        enum.close();
++      }
++      return query;
+     }
+     
++    public Query combine(Query[] queries) {
++      return Query.mergeBooleanQueries(queries);
++    }
++
+     private String getField()
+     {
+         return (lowerTerm != null ? lowerTerm.field() : upperTerm.field());
+@@ -201,10 +159,10 @@ public class RangeQuery extends Query
+         buffer.append("-");
+         buffer.append(upperTerm != null ? upperTerm.text() : "null");
+         buffer.append(inclusive ? "]" : "}");
+-        if (boost != 1.0f)
++        if (getBoost() != 1.0f)
+         {
+             buffer.append("^");
+-            buffer.append(Float.toString(boost));
++            buffer.append(Float.toString(getBoost()));
+         }
+         return buffer.toString();
+     }
+diff --git a/src/java/org/apache/lucene/search/RemoteSearchable.java b/src/java/org/apache/lucene/search/RemoteSearchable.java
+index 5059c9f..62474f1 100644
+--- a/src/java/org/apache/lucene/search/RemoteSearchable.java
++++ b/src/java/org/apache/lucene/search/RemoteSearchable.java
+@@ -102,6 +102,14 @@ public class RemoteSearchable
+     return local.doc(i);
+   }
+ 
++  public Query rewrite(Query original) throws IOException {
++    return local.rewrite(original);
++  }
++
++  public Explanation explain(Query query, int doc) throws IOException {
++    return local.explain(query, doc);
++  }
++
+   /** Exports a searcher for the index in args[0] named
+    * "//localhost/Searchable". */
+   public static void main(String args[]) throws Exception {
+diff --git a/src/java/org/apache/lucene/search/Scorer.java b/src/java/org/apache/lucene/search/Scorer.java
+index bd04dfb..68d03a4 100644
+--- a/src/java/org/apache/lucene/search/Scorer.java
++++ b/src/java/org/apache/lucene/search/Scorer.java
+@@ -56,16 +56,27 @@ package org.apache.lucene.search;
+ 
+ import java.io.IOException;
+ 
+-abstract class Scorer {
++/** Expert: Implements scoring for a class of queries. */
++public abstract class Scorer {
+   private Similarity similarity;
+ 
++  /** Constructs a Scorer. */
+   protected Scorer(Similarity similarity) {
+     this.similarity = similarity;
+   }
+ 
++  /** Returns the Similarity implementation used by this scorer. */
+   public Similarity getSimilarity() {
+     return this.similarity;
+   }
+ 
+-  abstract void score(HitCollector hc, int maxDoc) throws IOException;
++  /** Scores hits and passes them to a collector.  Stops at the last document
++   * before <code>maxDoc</code>.  If called repeatedly, will restart at point
++   * where it last left off.
++   */
++  public abstract void score(HitCollector hc, int maxDoc) throws IOException;
++
++  /** Returns an explanation of the score for <code>doc</code>. */
++  public abstract Explanation explain(int doc) throws IOException;
++
+ }
+diff --git a/src/java/org/apache/lucene/search/Searchable.java b/src/java/org/apache/lucene/search/Searchable.java
+index 0c2ff72..c31938d 100644
+--- a/src/java/org/apache/lucene/search/Searchable.java
++++ b/src/java/org/apache/lucene/search/Searchable.java
+@@ -112,4 +112,12 @@ public interface Searchable extends java.rmi.Remote {
+    * @see IndexReader#document(int).
+    */
+   Document doc(int i) throws IOException;
++
++  /** */
++  Query rewrite(Query query) throws IOException;
++
++  /** */
++  Explanation explain(Query query, int doc) throws IOException;
++
++
+ }
+diff --git a/src/java/org/apache/lucene/search/SloppyPhraseScorer.java b/src/java/org/apache/lucene/search/SloppyPhraseScorer.java
+index c3afa75..effce5f 100644
+--- a/src/java/org/apache/lucene/search/SloppyPhraseScorer.java
++++ b/src/java/org/apache/lucene/search/SloppyPhraseScorer.java
+@@ -62,9 +62,9 @@ import org.apache.lucene.index.*;
+ final class SloppyPhraseScorer extends PhraseScorer {
+   private int slop;
+ 
+-  SloppyPhraseScorer(TermPositions[] tps, Similarity similarity,
+-                     int slop, byte[] norms, float weight) throws IOException {
+-    super(tps, similarity, norms, weight);
++  SloppyPhraseScorer(Weight weight, TermPositions[] tps, Similarity similarity,
++                     int slop, byte[] norms) throws IOException {
++    super(weight, tps, similarity, norms);
+     this.slop = slop;
+   }
+ 
+diff --git a/src/java/org/apache/lucene/search/TermQuery.java b/src/java/org/apache/lucene/search/TermQuery.java
+index 3e666a4..d6f6b3d 100644
+--- a/src/java/org/apache/lucene/search/TermQuery.java
++++ b/src/java/org/apache/lucene/search/TermQuery.java
+@@ -64,34 +64,77 @@ import org.apache.lucene.index.IndexReader;
+   */
+ public class TermQuery extends Query {
+   private Term term;
+-  private float idf = 0.0f;
+-  private float weight = 0.0f;
+ 
+-  /** Constructs a query for the term <code>t</code>. */
+-  public TermQuery(Term t) {
+-    term = t;
+-  }
++  private class TermWeight implements Weight {
++    private Searcher searcher;
++    private float value;
++    private float idf;
++    private float queryNorm;
++
++    public TermWeight(Searcher searcher) {
++      this.searcher = searcher;
++    }
++
++    public Query getQuery() { return TermQuery.this; }
++    public float getValue() { return value; }
++
++    public float sumOfSquaredWeights() throws IOException {
++      idf = searcher.getSimilarity().idf(term, searcher);
++      value = idf * getBoost();
++      return value * value;			  // square term weights
++    }
++
++    public void normalize(float norm) {
++      queryNorm = norm;
++      queryNorm *= idf;                           // factor from document
++      value *= queryNorm;                         // normalize for query
++    }
++
++    public Scorer scorer(IndexReader reader) throws IOException {
++      TermDocs termDocs = reader.termDocs(term);
++      
++      if (termDocs == null)
++        return null;
++      
++      return new TermScorer(this, termDocs, searcher.getSimilarity(),
++                            reader.norms(term.field()));
++    }
+ 
+-  final float sumOfSquaredWeights(Searcher searcher) throws IOException {
+-    idf = searcher.getSimilarity().idf(term, searcher);
+-    weight = idf * boost;
+-    return weight * weight;			  // square term weights
++    public Explanation explain() throws IOException {
++      Query q = getQuery();
++
++      Explanation result = new Explanation();
++      result.setDescription("weight(" + getQuery() + "), product of:");
++
++      Explanation boostExpl = new Explanation(getBoost(), "boost");
++      if (getBoost() != 1.0f)
++        result.addDetail(boostExpl);
++      
++      Explanation idfExpl =
++        new Explanation(idf, "idf(docFreq=" + searcher.docFreq(term) + ")");
++      result.addDetail(idfExpl);
++      
++      Explanation normExpl = new Explanation(queryNorm,"queryNorm");
++      result.addDetail(normExpl);
++
++      result.setValue(boostExpl.getValue() *
++                      idfExpl.getValue() *
++                      normExpl.getValue());
++
++      return result;
++    }
+   }
+ 
+-  final void normalize(float norm) {
+-    weight *= norm;				  // normalize for query
+-    weight *= idf;				  // factor from document
++  /** Constructs a query for the term <code>t</code>. */
++  public TermQuery(Term t) {
++    term = t;
+   }
+ 
+-  Scorer scorer(IndexReader reader, Similarity similarity)
+-       throws IOException {
+-    TermDocs termDocs = reader.termDocs(term);
++  /** Returns the term of this query. */
++  public Term getTerm() { return term; };
+ 
+-    if (termDocs == null)
+-      return null;
+-    
+-    return new TermScorer(termDocs, similarity,
+-                          reader.norms(term.field()), weight);
++  protected Weight createWeight(Searcher searcher) {
++    return new TermWeight(searcher);
+   }
+ 
+   /** Prints a user-readable version of this query. */
+@@ -102,10 +145,25 @@ public class TermQuery extends Query {
+       buffer.append(":");
+     }
+     buffer.append(term.text());
+-    if (boost != 1.0f) {
++    if (getBoost() != 1.0f) {
+       buffer.append("^");
+-      buffer.append(Float.toString(boost));
++      buffer.append(Float.toString(getBoost()));
+     }
+     return buffer.toString();
+   }
++
++  /** Returns true iff <code>o</code> is equal to this. */
++  public boolean equals(Object o) {
++    if (!(o instanceof TermQuery))
++      return false;
++    TermQuery other = (TermQuery)o;
++    return (this.getBoost() == other.getBoost())
++      && this.term.equals(other.term);
++  }
++
++  /** Returns a hash code value for this object.*/
++  public int hashCode() {
++    return Float.floatToIntBits(getBoost()) ^ term.hashCode();
++  }
++
+ }
+diff --git a/src/java/org/apache/lucene/search/TermScorer.java b/src/java/org/apache/lucene/search/TermScorer.java
+index 7582c66..45b1cdd 100644
+--- a/src/java/org/apache/lucene/search/TermScorer.java
++++ b/src/java/org/apache/lucene/search/TermScorer.java
+@@ -55,12 +55,14 @@ package org.apache.lucene.search;
+  */
+ 
+ import java.io.IOException;
++import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermDocs;
+ 
+ final class TermScorer extends Scorer {
++  private Weight weight;
+   private TermDocs termDocs;
+   private byte[] norms;
+-  private float weight;
++  private float weightValue;
+   private int doc;
+ 
+   private final int[] docs = new int[32];	  // buffered doc numbers
+@@ -71,15 +73,16 @@ final class TermScorer extends Scorer {
+   private static final int SCORE_CACHE_SIZE = 32;
+   private float[] scoreCache = new float[SCORE_CACHE_SIZE];
+ 
+-  TermScorer(TermDocs td, Similarity similarity, byte[] norms, float weight)
+-    throws IOException {
++  TermScorer(Weight weight, TermDocs td, Similarity similarity,
++             byte[] norms) throws IOException {
+     super(similarity);
++    this.weight = weight;
+     this.termDocs = td;
+     this.norms = norms;
+-    this.weight = weight;
++    this.weightValue = weight.getValue();
+ 
+     for (int i = 0; i < SCORE_CACHE_SIZE; i++)
+-      scoreCache[i] = getSimilarity().tf(i) * weight;
++      scoreCache[i] = getSimilarity().tf(i) * weightValue;
+ 
+     pointerMax = termDocs.read(docs, freqs);	  // fill buffers
+ 
+@@ -91,7 +94,7 @@ final class TermScorer extends Scorer {
+     }
+   }
+ 
+-  final void score(HitCollector c, final int end) throws IOException {
++  public final void score(HitCollector c, final int end) throws IOException {
+     int d = doc;				  // cache doc in local
+     Similarity similarity = getSimilarity();      // cache sim in local
+     while (d < end) {				  // for docs in window
+@@ -99,7 +102,7 @@ final class TermScorer extends Scorer {
+       float score =				  // compute tf(f)*weight
+ 	f < SCORE_CACHE_SIZE			  // check cache
+ 	 ? scoreCache[f]			  // cache hit
+-	 : similarity.tf(f)*weight;		  // cache miss
++	 : similarity.tf(f)*weightValue;          // cache miss
+ 
+       score *= Similarity.decodeNorm(norms[d]);	  // normalize for field
+ 
+@@ -119,4 +122,45 @@ final class TermScorer extends Scorer {
+     }
+     doc = d;					  // flush cache
+   }
++
++  public Explanation explain(int doc) throws IOException {
++    Explanation result = new Explanation();
++    TermQuery query = (TermQuery)weight.getQuery();
++
++    result.setDescription("termScore(" + query + "), product of:");
++    
++    Explanation weightExplanation = weight.explain();
++    result.addDetail(weightExplanation);
++
++    Explanation tfExplanation = new Explanation();
++    int tf = 0;
++    while (pointer < pointerMax) {
++      if (docs[pointer] == doc)
++        tf = freqs[pointer];
++      pointer++;
++    }
++    if (tf == 0) {
++      while (termDocs.next()) {
++        if (termDocs.doc() == doc) {
++          tf = termDocs.freq();
++        }
++      }
++    }
++    termDocs.close();
++    tfExplanation.setValue(getSimilarity().tf(tf));
++    tfExplanation.setDescription("tf(termFreq("+query.getTerm()+")="+tf+")");
++    result.addDetail(tfExplanation);
++    
++    Explanation normExplanation = new Explanation();
++    normExplanation.setValue(Similarity.decodeNorm(norms[doc]));
++    String field = query.getTerm().field();
++    normExplanation.setDescription("norm(field="+field + ", doc="+doc + ")");
++    result.addDetail(normExplanation);
++
++    result.setValue(weightExplanation.getValue() *
++                    tfExplanation.getValue() *
++                    normExplanation.getValue());
++    
++    return result;
++  }
+ }
+diff --git a/src/java/org/apache/lucene/search/Weight.java b/src/java/org/apache/lucene/search/Weight.java
+new file mode 100644
+index 0000000..6cf58b1
+--- /dev/null
++++ b/src/java/org/apache/lucene/search/Weight.java
+@@ -0,0 +1,88 @@
++package org.apache.lucene.search;
++
++/* ====================================================================
++ * The Apache Software License, Version 1.1
++ *
++ * Copyright (c) 2003 The Apache Software Foundation.  All rights
++ * reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * 3. The end-user documentation included with the redistribution,
++ *    if any, must include the following acknowledgment:
++ *       "This product includes software developed by the
++ *        Apache Software Foundation (http://www.apache.org/)."
++ *    Alternately, this acknowledgment may appear in the software itself,
++ *    if and wherever such third-party acknowledgments normally appear.
++ *
++ * 4. The names "Apache" and "Apache Software Foundation" and
++ *    "Apache Lucene" must not be used to endorse or promote products
++ *    derived from this software without prior written permission. For
++ *    written permission, please contact apache@apache.org.
++ *
++ * 5. Products derived from this software may not be called "Apache",
++ *    "Apache Lucene", nor may "Apache" appear in their name, without
++ *    prior written permission of the Apache Software Foundation.
++ *
++ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED.  IN NO EVENT SHALL THE APACHE SOFTWARE FOUNDATION OR
++ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
++ * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
++ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
++ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ * ====================================================================
++ *
++ * This software consists of voluntary contributions made by many
++ * individuals on behalf of the Apache Software Foundation.  For more
++ * information on the Apache Software Foundation, please see
++ * <http://www.apache.org/>.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.index.IndexReader;
++
++/** Expert: Calculate query weights and build query scorers.
++ *
++ * <p>A Weight is constructed by a query, given a Searcher ({@link
++ * Query#createWeight(Searcher)}).  The {@link #sumOfSquaredWeights()} method
++ * is then called on the top-level query to compute the query normalization
++ * factor (@link Similarity#queryNorm(float)}).  This factor is then passed to
++ * {@link #normalize(float)}.  At this point the weighting is complete and a
++ * scorer may be constructed by calling {@link #scorer(IndexReader)}.
++ */
++public interface Weight extends java.io.Serializable {
++  /** The query that this concerns. */
++  Query getQuery();
++
++  /** The weight for this query. */
++  float getValue();
++
++  /** The sum of squared weights of contained query clauses. */
++  float sumOfSquaredWeights() throws IOException;
++
++  /** Assigns the query normalization factor to this. */
++  void normalize(float norm);
++
++  /** Constructs a scorer for this. */
++  Scorer scorer(IndexReader reader) throws IOException;
++
++  /** An explanation of this weight computation. */
++  Explanation explain() throws IOException;
++}
+diff --git a/src/java/org/apache/lucene/search/WildcardQuery.java b/src/java/org/apache/lucene/search/WildcardQuery.java
+index 644ff6c..f341843 100644
+--- a/src/java/org/apache/lucene/search/WildcardQuery.java
++++ b/src/java/org/apache/lucene/search/WildcardQuery.java
+@@ -60,17 +60,12 @@ import java.io.IOException;
+ 
+ /** Implements the wildcard search query */
+ public class WildcardQuery extends MultiTermQuery {
+-    private Term wildcardTerm;
++  public WildcardQuery(Term term) {
++    super(term);
++  }
+ 
+-    public WildcardQuery(Term term) {
+-        super(term);
+-        wildcardTerm = term;
+-    }
+-
+-    final void prepare(IndexReader reader) {
+-        try {
+-            setEnum(new WildcardTermEnum(reader, wildcardTerm));
+-        } catch (IOException e) {}
+-    }
++  protected FilteredTermEnum getEnum(IndexReader reader) throws IOException {
++    return new WildcardTermEnum(reader, getTerm());
++  }
+     
+ }
+diff --git a/src/test/org/apache/lucene/queryParser/TestQueryParser.java b/src/test/org/apache/lucene/queryParser/TestQueryParser.java
+index 5435e7c..e6cdb39 100644
+--- a/src/test/org/apache/lucene/queryParser/TestQueryParser.java
++++ b/src/test/org/apache/lucene/queryParser/TestQueryParser.java
+@@ -190,6 +190,8 @@ public class TestQueryParser extends TestCase {
+ 	assertTrue(getQuery("\"hello there\"", null) instanceof PhraseQuery);
+ 
+ 	assertQueryEquals("germ term^2.0", null, "germ term^2.0");
++	assertQueryEquals("(term)^2.0", null, "term^2.0");
++	assertQueryEquals("(germ term)^2.0", null, "(germ term)^2.0");
+ 	assertQueryEquals("term^2.0", null, "term^2.0");
+ 	assertQueryEquals("term^2", null, "term^2.0");
+ 	assertQueryEquals("\"germ term\"^2.0", null, "\"germ term\"^2.0");
+

@@ -1,0 +1,460 @@
+GitDiffStart: c0d330c04174185123ddc289ffb3393528a67d96 | Mon Oct 30 22:00:31 2006 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index f5e776b..e10a056 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -211,6 +211,11 @@ Optimizations
+      size buffers, which will speed up merging and retrieving binary
+      and compressed fields.  (Nadav Har'El via Yonik Seeley)
+ 
++ 11. LUCENE-687: Lazy skipping on proximity file speeds up most
++     queries involving term positions, including phrase queries.
++     (Michael Busch via Yonik Seeley)
++
++
+ Test Cases
+   1. Added TestTermScorer.java (Grant Ingersoll)
+ 
+diff --git a/src/java/org/apache/lucene/index/SegmentTermPositions.java b/src/java/org/apache/lucene/index/SegmentTermPositions.java
+index daeb336..a1d5e37 100644
+--- a/src/java/org/apache/lucene/index/SegmentTermPositions.java
++++ b/src/java/org/apache/lucene/index/SegmentTermPositions.java
+@@ -26,6 +26,11 @@ extends SegmentTermDocs implements TermPositions {
+   private int proxCount;
+   private int position;
+   
++  // these variables are being used to remember information
++  // for a lazy skip
++  private long lazySkipPointer = 0;
++  private int lazySkipDocCount = 0;
++  
+   SegmentTermPositions(SegmentReader p) {
+     super(p);
+     this.proxStream = (IndexInput)parent.proxStream.clone();
+@@ -34,7 +39,9 @@ extends SegmentTermDocs implements TermPositions {
+   final void seek(TermInfo ti) throws IOException {
+     super.seek(ti);
+     if (ti != null)
+-      proxStream.seek(ti.proxPointer);
++      lazySkipPointer = ti.proxPointer;
++    
++    lazySkipDocCount = 0;
+     proxCount = 0;
+   }
+ 
+@@ -44,22 +51,25 @@ extends SegmentTermDocs implements TermPositions {
+   }
+ 
+   public final int nextPosition() throws IOException {
++    // perform lazy skips if neccessary
++    lazySkip();
+     proxCount--;
+     return position += proxStream.readVInt();
+   }
+ 
+   protected final void skippingDoc() throws IOException {
+-    for (int f = freq; f > 0; f--)		  // skip all positions
+-      proxStream.readVInt();
++    // we remember to skip the remaining positions of the current
++    // document lazily
++    lazySkipDocCount += freq;
+   }
+ 
+   public final boolean next() throws IOException {
+-    for (int f = proxCount; f > 0; f--)		  // skip unread positions
+-      proxStream.readVInt();
+-
+-    if (super.next()) {				  // run super
+-      proxCount = freq;				  // note frequency
+-      position = 0;				  // reset position
++    // we remember to skip a document lazily
++    lazySkipDocCount += proxCount;
++    
++    if (super.next()) {               // run super
++      proxCount = freq;               // note frequency
++      position = 0;               // reset position
+       return true;
+     }
+     return false;
+@@ -72,8 +82,37 @@ extends SegmentTermDocs implements TermPositions {
+ 
+   /** Called by super.skipTo(). */
+   protected void skipProx(long proxPointer) throws IOException {
+-    proxStream.seek(proxPointer);
++    // we save the pointer, we might have to skip there lazily
++    lazySkipPointer = proxPointer;
++    lazySkipDocCount = 0;
+     proxCount = 0;
+   }
+ 
++  private void skipPositions(int n) throws IOException {
++    for (int f = n; f > 0; f--)         // skip unread positions
++      proxStream.readVInt();
++  }
++
++  // It is not always neccessary to move the prox pointer
++  // to a new document after the freq pointer has been moved.
++  // Consider for example a phrase query with two terms:
++  // the freq pointer for term 1 has to move to document x
++  // to answer the question if the term occurs in that document. But
++  // only if term 2 also matches document x, the positions have to be
++  // read to figure out if term 1 and term 2 appear next
++  // to each other in document x and thus satisfy the query.
++  // So we move the prox pointer lazily to the document
++  // as soon as positions are requested.
++  private void lazySkip() throws IOException {
++    if (lazySkipPointer != 0) {
++      proxStream.seek(lazySkipPointer);
++      lazySkipPointer = 0;
++    }
++     
++    if (lazySkipDocCount != 0) {
++      skipPositions(lazySkipDocCount);
++      lazySkipDocCount = 0;
++    }
++  }
++
+ }
+diff --git a/src/test/org/apache/lucene/index/TestLazyProxSkipping.java b/src/test/org/apache/lucene/index/TestLazyProxSkipping.java
+new file mode 100755
+index 0000000..cfd6f1e
+--- /dev/null
++++ b/src/test/org/apache/lucene/index/TestLazyProxSkipping.java
+@@ -0,0 +1,150 @@
++package org.apache.lucene.index;
++
++/**
++ * Copyright 2006 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.analysis.WhitespaceAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.search.Hits;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.PhraseQuery;
++import org.apache.lucene.search.Searcher;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.RAMDirectory;
++
++import junit.framework.TestCase;
++
++/**
++ * Tests lazy skipping on the proximity file.
++ *
++ */
++public class TestLazyProxSkipping extends TestCase {
++    private Searcher searcher;
++    private int seeksCounter = 0;
++    
++    private String field = "tokens";
++    private String term1 = "xx";
++    private String term2 = "yy";
++    private String term3 = "zz";
++    
++    private void createIndex(int numHits) throws IOException {
++        int numDocs = 500;
++        
++        Directory directory = new RAMDirectory();
++        IndexWriter writer = new IndexWriter(directory, new WhitespaceAnalyzer(), true);
++        
++        for (int i = 0; i < numDocs; i++) {
++            Document doc = new Document();
++            String content;
++            if (i % (numDocs / numHits) == 0) {
++                // add a document that matches the query "term1 term2"
++                content = this.term1 + " " + this.term2;
++            } else if (i % 15 == 0) {
++                // add a document that only contains term1
++                content = this.term1 + " " + this.term1;
++            } else {
++                // add a document that contains term2 but not term 1
++                content = this.term3 + " " + this.term2;
++            }
++
++            doc.add(new Field(this.field, content, Field.Store.YES, Field.Index.TOKENIZED));
++            writer.addDocument(doc);
++        }
++        
++        // make sure the index has only a single segment
++        writer.optimize();
++        writer.close();
++        
++        // the index is a single segment, thus IndexReader.open() returns an instance of SegmentReader
++        SegmentReader reader = (SegmentReader) IndexReader.open(directory);
++
++        // we decorate the proxStream with a wrapper class that allows to count the number of calls of seek()
++        reader.proxStream = new SeeksCountingStream(reader.proxStream);
++        
++        this.searcher = new IndexSearcher(reader);        
++    }
++    
++    private Hits search() throws IOException {
++        // create PhraseQuery "term1 term2" and search
++        PhraseQuery pq = new PhraseQuery();
++        pq.add(new Term(this.field, this.term1));
++        pq.add(new Term(this.field, this.term2));
++        return this.searcher.search(pq);        
++    }
++    
++    private void performTest(int numHits) throws IOException {
++        createIndex(numHits);
++        this.seeksCounter = 0;
++        Hits hits = search();
++        // verify that the right number of docs was found
++        assertEquals(numHits, hits.length());
++        
++        // check if the number of calls of seek() does not exceed the number of hits
++        assertEquals(numHits, this.seeksCounter);
++    }
++    
++    public void testLazySkipping() throws IOException {
++        // test whether only the minimum amount of seeks() are performed
++        performTest(5);
++        performTest(10);
++    }
++    
++
++    // Simply extends IndexInput in a way that we are able to count the number
++    // of invocations of seek()
++    class SeeksCountingStream extends IndexInput {
++          private IndexInput input;      
++          
++          
++          SeeksCountingStream(IndexInput input) {
++              this.input = input;
++          }      
++                
++          public byte readByte() throws IOException {
++              return this.input.readByte();
++          }
++    
++          public void readBytes(byte[] b, int offset, int len) throws IOException {
++              this.input.readBytes(b, offset, len);        
++          }
++    
++          public void close() throws IOException {
++              this.input.close();
++          }
++    
++          public long getFilePointer() {
++              return this.input.getFilePointer();
++          }
++    
++          public void seek(long pos) throws IOException {
++              TestLazyProxSkipping.this.seeksCounter++;
++              this.input.seek(pos);
++          }
++    
++          public long length() {
++              return this.input.length();
++          }
++          
++          public Object clone() {
++              return new SeeksCountingStream((IndexInput) this.input.clone());
++          }
++      
++    }
++}
+diff --git a/src/test/org/apache/lucene/search/TestScorerPerf.java b/src/test/org/apache/lucene/search/TestScorerPerf.java
+index 110f2e69..ee93a04 100755
+--- a/src/test/org/apache/lucene/search/TestScorerPerf.java
++++ b/src/test/org/apache/lucene/search/TestScorerPerf.java
+@@ -52,13 +52,19 @@ public class TestScorerPerf extends TestCase {
+     s = new IndexSearcher(rd);
+   }
+ 
+-  public void createRandomTerms(int nDocs, int nTerms, Directory dir) throws Exception {
++  public void createRandomTerms(int nDocs, int nTerms, double power, Directory dir) throws Exception {
++    int[] freq = new int[nTerms];
++    for (int i=0; i<nTerms; i++) {
++      int f = (nTerms+1)-i;  // make first terms less frequent
++      freq[i] = (int)Math.ceil(Math.pow(f,power));
++    }
++
+     IndexWriter iw = new IndexWriter(dir,new WhitespaceAnalyzer(), true);
+     iw.setMaxBufferedDocs(123);
+     for (int i=0; i<nDocs; i++) {
+       Document d = new Document();
+       for (int j=0; j<nTerms; j++) {
+-        if (r.nextInt(nTerms) <= j) {
++        if (r.nextInt(freq[j]) == 0) {
+           d.add(new Field("f", Character.toString((char)j), Field.Store.NO, Field.Index.UN_TOKENIZED));
+         }
+       }
+@@ -176,9 +182,6 @@ public class TestScorerPerf extends TestCase {
+       }
+ 
+       oq.add(bq, BooleanClause.Occur.MUST);
+-      if (validate) {
+-
+-      }
+       } // outer
+ 
+ 
+@@ -211,7 +214,6 @@ public class TestScorerPerf extends TestCase {
+         do {tnum = r.nextInt(termsInIndex);} while (terms.get(tnum));
+         Query tq = new TermQuery(new Term("f",Character.toString((char)tnum)));
+         bq.add(tq, BooleanClause.Occur.MUST);
+-        break;
+       }
+ 
+       CountingHitCollector hc = new CountingHitCollector();
+@@ -245,7 +247,6 @@ public class TestScorerPerf extends TestCase {
+         do {tnum = r.nextInt(termsInIndex);} while (terms.get(tnum));
+         Query tq = new TermQuery(new Term("f",Character.toString((char)tnum)));
+         bq.add(tq, BooleanClause.Occur.MUST);
+-        break;
+       } // inner
+ 
+       oq.add(bq, BooleanClause.Occur.MUST);
+@@ -261,6 +262,31 @@ public class TestScorerPerf extends TestCase {
+   }
+ 
+ 
++    public int doSloppyPhrase(IndexSearcher s,
++                                int termsInIndex,
++                                int maxClauses,
++                                int iter
++  ) throws IOException {
++    int ret=0;
++
++    for (int i=0; i<iter; i++) {
++      int nClauses = r.nextInt(maxClauses-1)+2; // min 2 clauses
++      PhraseQuery q = new PhraseQuery();
++      for (int j=0; j<nClauses; j++) {
++        int tnum = r.nextInt(termsInIndex);
++        q.add(new Term("f",Character.toString((char)tnum)), j);
++      }
++      q.setSlop(termsInIndex);  // this could be random too
++
++      CountingHitCollector hc = new CountingHitCollector();
++      s.search(q, hc);
++      ret += hc.getSum();
++    }
++
++    return ret;
++  }
++
++
+   public void testConjunctions() throws Exception {
+     // test many small sets... the bugs will be found on boundary conditions
+     createDummySearcher();
+@@ -272,53 +298,82 @@ public class TestScorerPerf extends TestCase {
+   }
+ 
+   /***
++  int bigIter=6;
+   public void testConjunctionPerf() throws Exception {
+     createDummySearcher();
+     validate=false;
+     sets=randBitSets(32,1000000);
+-    long start = System.currentTimeMillis();
+-    doConjunctions(500,6);
+-    long end = System.currentTimeMillis();
++    for (int i=0; i<bigIter; i++) {
++      long start = System.currentTimeMillis();
++      doConjunctions(500,6);
++      long end = System.currentTimeMillis();
++      System.out.println("milliseconds="+(end-start));
++    }
+     s.close();
+-    System.out.println("milliseconds="+(end-start));
+   }
+ 
+   public void testNestedConjunctionPerf() throws Exception {
+     createDummySearcher();
+     validate=false;
+     sets=randBitSets(32,1000000);
+-    long start = System.currentTimeMillis();
+-    doNestedConjunctions(500,3,3);
+-    long end = System.currentTimeMillis();
++    for (int i=0; i<bigIter; i++) {
++      long start = System.currentTimeMillis();
++      doNestedConjunctions(500,3,3);
++      long end = System.currentTimeMillis();
++      System.out.println("milliseconds="+(end-start));
++    }
+     s.close();
+-    System.out.println("milliseconds="+(end-start));
+   }
+ 
+   public void testConjunctionTerms() throws Exception {
++    validate=false;
+     RAMDirectory dir = new RAMDirectory();
+     System.out.println("Creating index");
+-    createRandomTerms(100000,25, dir);
++    createRandomTerms(100000,25,2, dir);
+     s = new IndexSearcher(dir);
+     System.out.println("Starting performance test");
+-    long start = System.currentTimeMillis();
+-    doTermConjunctions(s,25,5,10000);
+-    long end = System.currentTimeMillis();
++    for (int i=0; i<bigIter; i++) {
++      long start = System.currentTimeMillis();
++      doTermConjunctions(s,25,5,10000);
++      long end = System.currentTimeMillis();
++      System.out.println("milliseconds="+(end-start));
++    }
+     s.close();
+-    System.out.println("milliseconds="+(end-start));
+   }
+ 
+   public void testNestedConjunctionTerms() throws Exception {
++    validate=false;    
+     RAMDirectory dir = new RAMDirectory();
+     System.out.println("Creating index");
+-    createRandomTerms(100000,25, dir);
++    createRandomTerms(100000,25,2, dir);
+     s = new IndexSearcher(dir);
+     System.out.println("Starting performance test");
+-    long start = System.currentTimeMillis();
+-    doNestedTermConjunctions(s,25,5,5,1000);
+-    long end = System.currentTimeMillis();
++    for (int i=0; i<bigIter; i++) {
++      long start = System.currentTimeMillis();
++      doNestedTermConjunctions(s,25,5,5,1000);
++      long end = System.currentTimeMillis();
++      System.out.println("milliseconds="+(end-start));
++    }
+     s.close();
+-    System.out.println("milliseconds="+(end-start));
+   }
+-  ***/
++
++
++  public void testSloppyPhrasePerf() throws Exception {
++    validate=false;    
++    RAMDirectory dir = new RAMDirectory();
++    System.out.println("Creating index");
++    createRandomTerms(100000,25,2,dir);
++    s = new IndexSearcher(dir);
++    System.out.println("Starting performance test");
++    for (int i=0; i<bigIter; i++) {
++      long start = System.currentTimeMillis();
++      doSloppyPhrase(s,25,2,1000);
++      long end = System.currentTimeMillis();
++      System.out.println("milliseconds="+(end-start));
++    }
++    s.close();
++
++  }
++   ***/
+ 
+ }
+

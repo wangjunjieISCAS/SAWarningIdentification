@@ -1,0 +1,493 @@
+GitDiffStart: e7f81b4d6ccf72b218087527ec3cfc89dd12f16f | Mon Jun 16 20:33:44 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 733bc7e..217c392 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -282,6 +282,9 @@ Optimizations
+ 
+ * LUCENE-5751: Speed up MemoryDocValues. (Adrien Grand, Robert Muir)
+ 
++* LUCENE-5767: OrdinalMap optimizations, that mostly help on low cardinalities.
++  (Martijn van Groningen, Adrien Grand) 
++
+ Bug fixes
+ 
+ * LUCENE-5738: Ensure NativeFSLock prevents opening the file channel for the
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/DocValuesConsumer.java b/lucene/core/src/java/org/apache/lucene/codecs/DocValuesConsumer.java
+index 878c9d9..6e1cd9d 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/DocValuesConsumer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/DocValuesConsumer.java
+@@ -39,6 +39,7 @@ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.LongBitSet;
++import org.apache.lucene.util.LongValues;
+ 
+ /** 
+  * Abstract API that consumes numeric, binary and
+@@ -505,6 +506,7 @@ public abstract class DocValuesConsumer implements Closeable {
+               int nextValue;
+               AtomicReader currentReader;
+               Bits currentLiveDocs;
++              LongValues currentMap;
+               boolean nextIsSet;
+ 
+               @Override
+@@ -539,6 +541,7 @@ public abstract class DocValuesConsumer implements Closeable {
+                     if (readerUpto < readers.length) {
+                       currentReader = readers[readerUpto];
+                       currentLiveDocs = currentReader.getLiveDocs();
++                      currentMap = map.getGlobalOrds(readerUpto);
+                     }
+                     docIDUpto = 0;
+                     continue;
+@@ -547,7 +550,7 @@ public abstract class DocValuesConsumer implements Closeable {
+                   if (currentLiveDocs == null || currentLiveDocs.get(docIDUpto)) {
+                     nextIsSet = true;
+                     int segOrd = dvs[readerUpto].getOrd(docIDUpto);
+-                    nextValue = segOrd == -1 ? -1 : (int) map.getGlobalOrd(readerUpto, segOrd);
++                    nextValue = segOrd == -1 ? -1 : (int) currentMap.get(segOrd);
+                     docIDUpto++;
+                     return true;
+                   }
+@@ -707,6 +710,7 @@ public abstract class DocValuesConsumer implements Closeable {
+               long nextValue;
+               AtomicReader currentReader;
+               Bits currentLiveDocs;
++              LongValues currentMap;
+               boolean nextIsSet;
+               long ords[] = new long[8];
+               int ordUpto;
+@@ -751,6 +755,7 @@ public abstract class DocValuesConsumer implements Closeable {
+                     if (readerUpto < readers.length) {
+                       currentReader = readers[readerUpto];
+                       currentLiveDocs = currentReader.getLiveDocs();
++                      currentMap = map.getGlobalOrds(readerUpto);
+                     }
+                     docIDUpto = 0;
+                     continue;
+@@ -766,7 +771,7 @@ public abstract class DocValuesConsumer implements Closeable {
+                       if (ordLength == ords.length) {
+                         ords = ArrayUtil.grow(ords, ordLength+1);
+                       }
+-                      ords[ordLength] = map.getGlobalOrd(readerUpto, ord);
++                      ords[ordLength] = currentMap.get(ord);
+                       ordLength++;
+                     }
+                     docIDUpto++;
+diff --git a/lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java b/lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java
+index 207d6a0..0c21ed4 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java
++++ b/lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java
+@@ -25,6 +25,7 @@ import org.apache.lucene.index.MultiTermsEnum.TermsEnumWithSlice;
+ import org.apache.lucene.util.Accountable;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LongValues;
+ import org.apache.lucene.util.RamUsageEstimator;
+ import org.apache.lucene.util.packed.AppendingPackedLongBuffer;
+ import org.apache.lucene.util.packed.MonotonicAppendingLongBuffer;
+@@ -373,7 +374,7 @@ public class MultiDocValues {
+       return new MultiSortedSetDocValues(values, starts, mapping);
+     }
+   }
+-  
++
+   /** maps per-segment ordinals to/from global ordinal space */
+   // TODO: use more efficient packed ints structures?
+   // TODO: pull this out? its pretty generic (maps between N ord()-enabled TermsEnums) 
+@@ -387,8 +388,10 @@ public class MultiDocValues {
+     final MonotonicAppendingLongBuffer globalOrdDeltas;
+     // globalOrd -> first segment container
+     final AppendingPackedLongBuffer firstSegments;
+-    // for every segment, segmentOrd -> (globalOrd - segmentOrd)
+-    final MonotonicAppendingLongBuffer ordDeltas[];
++    // for every segment, segmentOrd -> globalOrd
++    final LongValues segmentToGlobalOrds[];
++    // ram usage
++    final long ramBytesUsed;
+     
+     /** 
+      * Creates an ordinal map that allows mapping ords to/from a merged
+@@ -398,16 +401,20 @@ public class MultiDocValues {
+      *             not be dense (e.g. can be FilteredTermsEnums}.
+      * @throws IOException if an I/O error occurred.
+      */
+-    public OrdinalMap(Object owner, TermsEnum subs[]) throws IOException {
++    public OrdinalMap(Object owner, TermsEnum subs[], float acceptableOverheadRatio) throws IOException {
+       // create the ordinal mappings by pulling a termsenum over each sub's 
+       // unique terms, and walking a multitermsenum over those
+       this.owner = owner;
++      // even though we accept an overhead ratio, we keep these ones with COMPACT
++      // since they are only used to resolve values given a global ord, which is
++      // slow anyway
+       globalOrdDeltas = new MonotonicAppendingLongBuffer(PackedInts.COMPACT);
+       firstSegments = new AppendingPackedLongBuffer(PackedInts.COMPACT);
+-      ordDeltas = new MonotonicAppendingLongBuffer[subs.length];
++      final MonotonicAppendingLongBuffer[] ordDeltas = new MonotonicAppendingLongBuffer[subs.length];
+       for (int i = 0; i < ordDeltas.length; i++) {
+-        ordDeltas[i] = new MonotonicAppendingLongBuffer();
++        ordDeltas[i] = new MonotonicAppendingLongBuffer(acceptableOverheadRatio);
+       }
++      long[] ordDeltaBits = new long[subs.length];
+       long segmentOrds[] = new long[subs.length];
+       ReaderSlice slices[] = new ReaderSlice[subs.length];
+       TermsEnumIndex indexes[] = new TermsEnumIndex[slices.length];
+@@ -431,6 +438,7 @@ public class MultiDocValues {
+           }
+           // for each per-segment ord, map it back to the global term.
+           while (segmentOrds[segmentIndex] <= segmentOrd) {
++            ordDeltaBits[segmentIndex] |= delta;
+             ordDeltas[segmentIndex].add(delta);
+             segmentOrds[segmentIndex]++;
+           }
+@@ -442,14 +450,63 @@ public class MultiDocValues {
+       for (int i = 0; i < ordDeltas.length; ++i) {
+         ordDeltas[i].freeze();
+       }
++      // ordDeltas is typically the bottleneck, so let's see what we can do to make it faster
++      segmentToGlobalOrds = new LongValues[subs.length];
++      long ramBytesUsed = BASE_RAM_BYTES_USED + globalOrdDeltas.ramBytesUsed() + firstSegments.ramBytesUsed() + RamUsageEstimator.shallowSizeOf(segmentToGlobalOrds);
++      for (int i = 0; i < ordDeltas.length; ++i) {
++        final MonotonicAppendingLongBuffer deltas = ordDeltas[i];
++        if (ordDeltaBits[i] == 0L) {
++          // segment ords perfectly match global ordinals
++          // likely in case of low cardinalities and large segments
++          segmentToGlobalOrds[i] = LongValues.IDENTITY;
++        } else {
++          final int bitsRequired = ordDeltaBits[i] < 0 ? 64 : PackedInts.bitsRequired(ordDeltaBits[i]);
++          final long monotonicBits = deltas.ramBytesUsed() * 8;
++          final long packedBits = bitsRequired * deltas.size();
++          if (deltas.size() <= Integer.MAX_VALUE
++              && packedBits <= monotonicBits * (1 + acceptableOverheadRatio)) {
++            // monotonic compression mostly adds overhead, let's keep the mapping in plain packed ints
++            final int size = (int) deltas.size();
++            final PackedInts.Mutable newDeltas = PackedInts.getMutable(size, bitsRequired, acceptableOverheadRatio);
++            final MonotonicAppendingLongBuffer.Iterator it = deltas.iterator();
++            for (int ord = 0; ord < size; ++ord) {
++              newDeltas.set(ord, it.next());
++            }
++            assert !it.hasNext();
++            segmentToGlobalOrds[i] = new LongValues() {
++              @Override
++              public long get(long ord) {
++                return ord + newDeltas.get((int) ord);
++              }
++            };
++            ramBytesUsed += newDeltas.ramBytesUsed();
++          } else {
++            segmentToGlobalOrds[i] = new LongValues() {
++              @Override
++              public long get(long ord) {
++                return ord + deltas.get((int) ord);
++              }
++            };
++            ramBytesUsed += deltas.ramBytesUsed();
++          }
++          ramBytesUsed += RamUsageEstimator.shallowSizeOf(segmentToGlobalOrds[i]);
++        }
++      }
++      this.ramBytesUsed = ramBytesUsed;
+     }
+-    
++
++    /** Create an {@link OrdinalMap} with the default overhead ratio.
++     *  @see #OrdinalMap(Object, TermsEnum[], float)  */
++    public OrdinalMap(Object owner, TermsEnum subs[]) throws IOException {
++      this(owner, subs, PackedInts.DEFAULT);
++    }
++
+     /** 
+-     * Given a segment number and segment ordinal, returns
+-     * the corresponding global ordinal.
++     * Given a segment number, return a {@link LongValues} instance that maps
++     * segment ordinals to global ordinals.
+      */
+-    public long getGlobalOrd(int segmentIndex, long segmentOrd) {
+-      return segmentOrd + ordDeltas[segmentIndex].get(segmentOrd);
++    public LongValues getGlobalOrds(int segmentIndex) {
++      return segmentToGlobalOrds[segmentIndex];
+     }
+ 
+     /**
+@@ -477,11 +534,7 @@ public class MultiDocValues {
+ 
+     @Override
+     public long ramBytesUsed() {
+-      long size = BASE_RAM_BYTES_USED + globalOrdDeltas.ramBytesUsed() + firstSegments.ramBytesUsed() + RamUsageEstimator.shallowSizeOf(ordDeltas);
+-      for (int i = 0; i < ordDeltas.length; i++) {
+-        size += ordDeltas[i].ramBytesUsed();
+-      }
+-      return size;
++      return ramBytesUsed;
+     }
+   }
+   
+@@ -499,7 +552,7 @@ public class MultiDocValues {
+   
+     /** Creates a new MultiSortedDocValues over <code>values</code> */
+     MultiSortedDocValues(SortedDocValues values[], int docStarts[], OrdinalMap mapping) throws IOException {
+-      assert values.length == mapping.ordDeltas.length;
++      assert values.length == mapping.segmentToGlobalOrds.length;
+       assert docStarts.length == values.length + 1;
+       this.values = values;
+       this.docStarts = docStarts;
+@@ -510,7 +563,7 @@ public class MultiDocValues {
+     public int getOrd(int docID) {
+       int subIndex = ReaderUtil.subIndex(docID, docStarts);
+       int segmentOrd = values[subIndex].getOrd(docID - docStarts[subIndex]);
+-      return segmentOrd == -1 ? segmentOrd : (int) mapping.getGlobalOrd(subIndex, segmentOrd);
++      return segmentOrd == -1 ? segmentOrd : (int) mapping.segmentToGlobalOrds[subIndex].get(segmentOrd);
+     }
+  
+     @Override
+@@ -541,7 +594,7 @@ public class MultiDocValues {
+     
+     /** Creates a new MultiSortedSetDocValues over <code>values</code> */
+     MultiSortedSetDocValues(SortedSetDocValues values[], int docStarts[], OrdinalMap mapping) throws IOException {
+-      assert values.length == mapping.ordDeltas.length;
++      assert values.length == mapping.segmentToGlobalOrds.length;
+       assert docStarts.length == values.length + 1;
+       this.values = values;
+       this.docStarts = docStarts;
+@@ -554,7 +607,7 @@ public class MultiDocValues {
+       if (segmentOrd == NO_MORE_ORDS) {
+         return segmentOrd;
+       } else {
+-        return mapping.getGlobalOrd(currentSubIndex, segmentOrd);
++        return mapping.segmentToGlobalOrds[currentSubIndex].get(segmentOrd);
+       }
+     }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/LongValues.java b/lucene/core/src/java/org/apache/lucene/util/LongValues.java
+index 2543506..138ea55 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/LongValues.java
++++ b/lucene/core/src/java/org/apache/lucene/util/LongValues.java
+@@ -27,6 +27,16 @@ import org.apache.lucene.util.packed.PackedInts;
+  *  @lucene.internal */
+ public abstract class LongValues extends NumericDocValues {
+ 
++  /** An instance that returns the provided value. */
++  public static final LongValues IDENTITY = new LongValues() {
++
++    @Override
++    public long get(long index) {
++      return index;
++    }
++
++  };
++
+   /** Get value at <code>index</code>. */
+   public abstract long get(long index);
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestOrdinalMap.java b/lucene/core/src/test/org/apache/lucene/index/TestOrdinalMap.java
+index 83520e8..35006e5 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestOrdinalMap.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestOrdinalMap.java
+@@ -30,6 +30,7 @@ import org.apache.lucene.index.MultiDocValues.MultiSortedSetDocValues;
+ import org.apache.lucene.index.MultiDocValues.OrdinalMap;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LongValues;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.RamUsageTester;
+ import org.apache.lucene.util.TestUtil;
+@@ -44,6 +45,10 @@ public class TestOrdinalMap extends LuceneTestCase {
+       }
+       return true;
+     }
++
++    public boolean accept(Object o) {
++      return o != LongValues.IDENTITY;
++    }
+   };
+ 
+   public void testRamBytesUsed() throws IOException {
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesFacetCounts.java b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesFacetCounts.java
+index 1e20ccc..ccbae26 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesFacetCounts.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesFacetCounts.java
+@@ -40,6 +40,7 @@ import org.apache.lucene.index.ReaderUtil;
+ import org.apache.lucene.index.SortedSetDocValues;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LongValues;
+ 
+ /** Compute facets counts from previously
+  *  indexed {@link SortedSetDocValuesFacetField},
+@@ -188,7 +189,8 @@ public class SortedSetDocValuesFacetCounts extends Facets {
+       // temp ram req'ts (sum of number of ords across all
+       // segs)
+       if (ordinalMap != null) {
+-        int segOrd = hits.context.ord;
++        final int segOrd = hits.context.ord;
++        final LongValues ordMap = ordinalMap.getGlobalOrds(segOrd);
+ 
+         int numSegOrds = (int) segValues.getValueCount();
+ 
+@@ -202,7 +204,7 @@ public class SortedSetDocValuesFacetCounts extends Facets {
+             int term = (int) segValues.nextOrd();
+             while (term != SortedSetDocValues.NO_MORE_ORDS) {
+               //System.out.println("      segOrd=" + segOrd + " ord=" + term + " globalOrd=" + ordinalMap.getGlobalOrd(segOrd, term));
+-              counts[(int) ordinalMap.getGlobalOrd(segOrd, term)]++;
++              counts[(int) ordMap.get(term)]++;
+               term = (int) segValues.nextOrd();
+             }
+           }
+@@ -228,7 +230,7 @@ public class SortedSetDocValuesFacetCounts extends Facets {
+             int count = segCounts[ord];
+             if (count != 0) {
+               //System.out.println("    migrate segOrd=" + segOrd + " ord=" + ord + " globalOrd=" + ordinalMap.getGlobalOrd(segOrd, ord));
+-              counts[(int) ordinalMap.getGlobalOrd(segOrd, ord)] += count;
++              counts[(int) ordMap.get(ord)] += count;
+             }
+           }
+         }
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/util/RamUsageTester.java b/lucene/test-framework/src/java/org/apache/lucene/util/RamUsageTester.java
+index 5a3d96d..bce8754 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/util/RamUsageTester.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/util/RamUsageTester.java
+@@ -39,6 +39,10 @@ public final class RamUsageTester {
+       return true;
+     }
+ 
++    public boolean accept(Object o) {
++      return true;
++    }
++
+   };
+ 
+   /** A filter that allows to decide on what to take into account when measuring RAM usage. */
+@@ -47,6 +51,9 @@ public final class RamUsageTester {
+     /** Whether the provided field should be taken into account when measuring RAM usage. */
+     boolean accept(Field field);
+ 
++    /** Whether the provided field value should be taken into account when measuring RAM usage. */
++    boolean accept(Object o);
++
+   }
+ 
+   /**
+@@ -119,7 +126,7 @@ public final class RamUsageTester {
+             // Push refs for traversal later.
+             for (int i = len; --i >= 0 ;) {
+               final Object o = Array.get(ob, i);
+-              if (o != null && !seen.contains(o)) {
++              if (o != null && !seen.contains(o) && filter.accept(o)) {
+                 stack.add(o);
+               }
+             }            
+@@ -141,7 +148,7 @@ public final class RamUsageTester {
+             if (filter.accept(f)) {
+               // Fast path to eliminate redundancies.
+               final Object o = f.get(ob);
+-              if (o != null && !seen.contains(o)) {
++              if (o != null && !seen.contains(o) && filter.accept(o)) {
+                 stack.add(o);
+               }
+             }
+diff --git a/solr/core/src/java/org/apache/solr/request/DocValuesFacets.java b/solr/core/src/java/org/apache/solr/request/DocValuesFacets.java
+index 0712a07..81d1220 100644
+--- a/solr/core/src/java/org/apache/solr/request/DocValuesFacets.java
++++ b/solr/core/src/java/org/apache/solr/request/DocValuesFacets.java
+@@ -32,6 +32,7 @@ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.Filter;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.CharsRef;
++import org.apache.lucene.util.LongValues;
+ import org.apache.lucene.util.UnicodeUtil;
+ import org.apache.solr.common.params.FacetParams;
+ import org.apache.solr.common.util.NamedList;
+@@ -247,11 +248,12 @@ public class DocValuesFacets {
+   
+   /** accumulates per-segment single-valued facet counts, mapping to global ordinal space on-the-fly */
+   static void accumSingleGeneric(int counts[], int startTermIndex, SortedDocValues si, DocIdSetIterator disi, int subIndex, OrdinalMap map) throws IOException {
++    final LongValues ordmap = map == null ? null : map.getGlobalOrds(subIndex);
+     int doc;
+     while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+       int term = si.getOrd(doc);
+       if (map != null && term >= 0) {
+-        term = (int) map.getGlobalOrd(subIndex, term);
++        term = (int) ordmap.get(term);
+       }
+       int arrIdx = term-startTermIndex;
+       if (arrIdx>=0 && arrIdx<counts.length) counts[arrIdx]++;
+@@ -293,6 +295,7 @@ public class DocValuesFacets {
+     
+   /** accumulates per-segment multi-valued facet counts, mapping to global ordinal space on-the-fly */
+   static void accumMultiGeneric(int counts[], int startTermIndex, SortedSetDocValues si, DocIdSetIterator disi, int subIndex, OrdinalMap map) throws IOException {
++    final LongValues ordMap = map == null ? null : map.getGlobalOrds(subIndex);
+     int doc;
+     while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+       si.setDocument(doc);
+@@ -307,7 +310,7 @@ public class DocValuesFacets {
+       
+       do {
+         if (map != null) {
+-          term = (int) map.getGlobalOrd(subIndex, term);
++          term = (int) ordMap.get(term);
+         }
+         int arrIdx = term-startTermIndex;
+         if (arrIdx>=0 && arrIdx<counts.length) counts[arrIdx]++;
+@@ -346,6 +349,7 @@ public class DocValuesFacets {
+   
+   /** folds counts in segment ordinal space (segCounts) into global ordinal space (counts) */
+   static void migrateGlobal(int counts[], int segCounts[], int subIndex, OrdinalMap map) {
++    final LongValues ordMap = map.getGlobalOrds(subIndex);
+     // missing count
+     counts[0] += segCounts[0];
+     
+@@ -353,7 +357,7 @@ public class DocValuesFacets {
+     for (int ord = 1; ord < segCounts.length; ord++) {
+       int count = segCounts[ord];
+       if (count != 0) {
+-        counts[1+(int) map.getGlobalOrd(subIndex, ord-1)] += count;
++        counts[1+(int) ordMap.get(ord-1)] += count;
+       }
+     }
+   }
+diff --git a/solr/core/src/java/org/apache/solr/request/DocValuesStats.java b/solr/core/src/java/org/apache/solr/request/DocValuesStats.java
+index b560664..271eb32 100644
+--- a/solr/core/src/java/org/apache/solr/request/DocValuesStats.java
++++ b/solr/core/src/java/org/apache/solr/request/DocValuesStats.java
+@@ -35,6 +35,7 @@ import org.apache.lucene.search.Filter;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.TermRangeQuery;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LongValues;
+ import org.apache.solr.handler.component.FieldFacetStats;
+ import org.apache.solr.handler.component.StatsValues;
+ import org.apache.solr.handler.component.StatsValuesFactory;
+@@ -161,12 +162,13 @@ public class DocValuesStats {
+ 
+   /** accumulates per-segment single-valued stats */
+   static void accumSingle(int counts[], int docBase, FieldFacetStats[] facetStats, SortedDocValues si, DocIdSetIterator disi, int subIndex, OrdinalMap map) throws IOException {
++    final LongValues ordMap = map == null ? null : map.getGlobalOrds(subIndex);
+     int doc;
+     while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+       int term = si.getOrd(doc);
+       if (term >= 0) {
+         if (map != null) {
+-          term = (int) map.getGlobalOrd(subIndex, term);
++          term = (int) ordMap.get(term);
+         }
+         counts[term]++;
+         for (FieldFacetStats f : facetStats) {
+@@ -178,6 +180,7 @@ public class DocValuesStats {
+   
+   /** accumulates per-segment multi-valued stats */
+   static void accumMulti(int counts[], int docBase, FieldFacetStats[] facetStats, SortedSetDocValues si, DocIdSetIterator disi, int subIndex, OrdinalMap map) throws IOException {
++    final LongValues ordMap = map == null ? null : map.getGlobalOrds(subIndex);
+     int doc;
+     while ((doc = disi.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+       si.setDocument(doc);
+@@ -185,7 +188,7 @@ public class DocValuesStats {
+       while ((ord = si.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
+         int term = (int) ord;
+         if (map != null) {
+-          term = (int) map.getGlobalOrd(subIndex, term);
++          term = (int) ordMap.get(term);
+         }
+         counts[term]++;
+         for (FieldFacetStats f : facetStats) {
+

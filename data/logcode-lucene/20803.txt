@@ -1,0 +1,273 @@
+GitDiffStart: d3987d9ed4d42cedad720df47c9e5efdbecd2653 | Wed Dec 17 10:36:30 2008 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 8f7a6a1..4d23b31 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -138,6 +138,9 @@ Optimizations
+  2. LUCENE-1443: Performance improvement for OpenBitSetDISI.inPlaceAnd()
+     (Paul Elschot via yonik)
+ 
++ 3. LUCENE-1484: Remove synchronization of IndexReader.document() by
++    using CloseableThreadLocal internally.  (Jason Rutherglen via Mike
++    McCandless).
+ 
+ Documentation
+ 
+diff --git a/src/java/org/apache/lucene/index/FieldsReader.java b/src/java/org/apache/lucene/index/FieldsReader.java
+index 3b2b915..36d31ad 100644
+--- a/src/java/org/apache/lucene/index/FieldsReader.java
++++ b/src/java/org/apache/lucene/index/FieldsReader.java
+@@ -38,7 +38,7 @@ import java.util.zip.Inflater;
+  *
+  * @version $Id$
+  */
+-final class FieldsReader {
++final class FieldsReader implements Cloneable {
+   private final FieldInfos fieldInfos;
+ 
+   // The main fieldStream, used only for cloning.
+@@ -48,6 +48,7 @@ final class FieldsReader {
+   // It should not be cloned outside of a synchronized context.
+   private final IndexInput fieldsStream;
+ 
++  private final IndexInput cloneableIndexStream;
+   private final IndexInput indexStream;
+   private int numTotalDocs;
+   private int size;
+@@ -60,7 +61,33 @@ final class FieldsReader {
+   private int docStoreOffset;
+ 
+   private CloseableThreadLocal fieldsStreamTL = new CloseableThreadLocal();
+-
++  private boolean isOriginal = false;
++
++  /** Returns a cloned FieldsReader that shares open
++   *  IndexInputs with the original one.  It is the caller's
++   *  job not to close the original FieldsReader until all
++   *  clones are called (eg, currently SegmentReader manages
++   *  this logic). */
++  public Object clone() {
++    ensureOpen();
++    return new FieldsReader(fieldInfos, numTotalDocs, size, format, formatSize, docStoreOffset, cloneableFieldsStream, cloneableIndexStream);
++  }
++  
++  // Used only by clone
++  private FieldsReader(FieldInfos fieldInfos, int numTotalDocs, int size, int format, int formatSize,
++                       int docStoreOffset, IndexInput cloneableFieldsStream, IndexInput cloneableIndexStream) {
++    this.fieldInfos = fieldInfos;
++    this.numTotalDocs = numTotalDocs;
++    this.size = size;
++    this.format = format;
++    this.formatSize = formatSize;
++    this.docStoreOffset = docStoreOffset;
++    this.cloneableFieldsStream = cloneableFieldsStream;
++    this.cloneableIndexStream = cloneableIndexStream;
++    fieldsStream = (IndexInput) cloneableFieldsStream.clone();
++    indexStream = (IndexInput) cloneableIndexStream.clone();
++  }
++  
+   FieldsReader(Directory d, String segment, FieldInfos fn) throws IOException {
+     this(d, segment, fn, BufferedIndexInput.BUFFER_SIZE, -1, 0);
+   }
+@@ -71,17 +98,17 @@ final class FieldsReader {
+ 
+   FieldsReader(Directory d, String segment, FieldInfos fn, int readBufferSize, int docStoreOffset, int size) throws IOException {
+     boolean success = false;
+-
++    isOriginal = true;
+     try {
+       fieldInfos = fn;
+ 
+       cloneableFieldsStream = d.openInput(segment + "." + IndexFileNames.FIELDS_EXTENSION, readBufferSize);
+-      indexStream = d.openInput(segment + "." + IndexFileNames.FIELDS_INDEX_EXTENSION, readBufferSize);
+-
++      cloneableIndexStream = d.openInput(segment + "." + IndexFileNames.FIELDS_INDEX_EXTENSION, readBufferSize);
++      
+       // First version of fdx did not include a format
+       // header, but, the first int will always be 0 in that
+       // case
+-      int firstInt = indexStream.readInt();
++      int firstInt = cloneableIndexStream.readInt();
+       if (firstInt == 0)
+         format = 0;
+       else
+@@ -101,8 +128,8 @@ final class FieldsReader {
+ 
+       fieldsStream = (IndexInput) cloneableFieldsStream.clone();
+ 
+-      final long indexSize = indexStream.length()-formatSize;
+-
++      final long indexSize = cloneableIndexStream.length()-formatSize;
++      
+       if (docStoreOffset != -1) {
+         // We read only a slice out of this shared fields file
+         this.docStoreOffset = docStoreOffset;
+@@ -116,6 +143,7 @@ final class FieldsReader {
+         this.size = (int) (indexSize >> 3);
+       }
+ 
++      indexStream = (IndexInput) cloneableIndexStream.clone();
+       numTotalDocs = (int) (indexSize >> 3);
+       success = true;
+     } finally {
+@@ -150,8 +178,13 @@ final class FieldsReader {
+       if (fieldsStream != null) {
+         fieldsStream.close();
+       }
+-      if (cloneableFieldsStream != null) {
+-        cloneableFieldsStream.close();
++      if (isOriginal) {
++        if (cloneableFieldsStream != null) {
++          cloneableFieldsStream.close();
++        }
++        if (cloneableIndexStream != null) {
++          cloneableIndexStream.close();
++        }
+       }
+       if (indexStream != null) {
+         indexStream.close();
+diff --git a/src/java/org/apache/lucene/index/SegmentReader.java b/src/java/org/apache/lucene/index/SegmentReader.java
+index 304d5bd..36fe170 100644
+--- a/src/java/org/apache/lucene/index/SegmentReader.java
++++ b/src/java/org/apache/lucene/index/SegmentReader.java
+@@ -47,7 +47,7 @@ class SegmentReader extends DirectoryIndexReader {
+   private int readBufferSize;
+ 
+   FieldInfos fieldInfos;
+-  private FieldsReader fieldsReader;
++  private FieldsReader fieldsReaderOrig = null;
+ 
+   TermInfosReader tis;
+   TermVectorsReader termVectorsReaderOrig = null;
+@@ -79,6 +79,16 @@ class SegmentReader extends DirectoryIndexReader {
+   // in case this is a re-opened reader
+   private SegmentReader referencedSegmentReader = null;
+   
++  /**
++   * Sets the initial value 
++   */
++  private class FieldsReaderLocal extends CloseableThreadLocal {
++    protected Object initialValue() {
++      return (FieldsReader) fieldsReaderOrig.clone();
++    }
++  }
++  CloseableThreadLocal fieldsReaderLocal = new FieldsReaderLocal();
++  
+   private class Norm {
+     volatile int refCount;
+     boolean useSingleNormStream;
+@@ -354,12 +364,12 @@ class SegmentReader extends DirectoryIndexReader {
+         fieldsSegment = segment;
+ 
+       if (doOpenStores) {
+-        fieldsReader = new FieldsReader(storeDir, fieldsSegment, fieldInfos, readBufferSize,
+-                                        si.getDocStoreOffset(), si.docCount);
++        fieldsReaderOrig = new FieldsReader(storeDir, fieldsSegment, fieldInfos, readBufferSize,
++                                            si.getDocStoreOffset(), si.docCount);
+ 
+         // Verify two sources of "maxDoc" agree:
+-        if (si.getDocStoreOffset() == -1 && fieldsReader.size() != si.docCount) {
+-          throw new CorruptIndexException("doc counts differ for segment " + si.name + ": fieldsReader shows " + fieldsReader.size() + " but segmentInfo shows " + si.docCount);
++        if (si.getDocStoreOffset() == -1 && fieldsReaderOrig.size() != si.docCount) {
++          throw new CorruptIndexException("doc counts differ for segment " + si.name + ": fieldsReader shows " + fieldsReaderOrig.size() + " but segmentInfo shows " + si.docCount);
+         }
+       }
+ 
+@@ -456,7 +466,7 @@ class SegmentReader extends DirectoryIndexReader {
+     }    
+     
+ 
+-      // clone reader
++    // clone reader
+     SegmentReader clone;
+     if (readOnly) 
+       clone = new ReadOnlySegmentReader();
+@@ -479,31 +489,9 @@ class SegmentReader extends DirectoryIndexReader {
+       clone.proxStream = proxStream;
+       clone.termVectorsReaderOrig = termVectorsReaderOrig;
+   
+-      
+-      // we have to open a new FieldsReader, because it is not thread-safe
+-      // and can thus not be shared among multiple SegmentReaders
+-      // TODO: Change this in case FieldsReader becomes thread-safe in the future
+-      final String fieldsSegment;
+-  
+-      Directory storeDir = directory();
+-      
+-      if (si.getDocStoreOffset() != -1) {
+-        fieldsSegment = si.getDocStoreSegment();
+-        if (storeCFSReader != null) {
+-          storeDir = storeCFSReader;
+-        }
+-      } else {
+-        fieldsSegment = segment;
+-        if (cfsReader != null) {
+-          storeDir = cfsReader;
+-        }
+-      }
+-  
+-      if (fieldsReader != null) {
+-        clone.fieldsReader = new FieldsReader(storeDir, fieldsSegment, fieldInfos, readBufferSize,
+-                                        si.getDocStoreOffset(), si.docCount);
+-      }
+-      
++      if (fieldsReaderOrig != null) {
++        clone.fieldsReaderOrig = (FieldsReader) fieldsReaderOrig.clone();
++      }      
+       
+       if (!deletionsUpToDate) {
+         // load deleted docs
+@@ -613,13 +601,14 @@ class SegmentReader extends DirectoryIndexReader {
+   }
+ 
+   FieldsReader getFieldsReader() {
+-    return fieldsReader;
++    return (FieldsReader) fieldsReaderLocal.get();
+   }
+ 
+   protected void doClose() throws IOException {
+     boolean hasReferencedReader = (referencedSegmentReader != null);
+ 
+     termVectorsLocal.close();
++    fieldsReaderLocal.close();
+ 
+     if (hasReferencedReader) {
+       referencedSegmentReader.decRefReaderNotNorms();
+@@ -637,11 +626,6 @@ class SegmentReader extends DirectoryIndexReader {
+       singleNormStream = null;
+     }
+     
+-    // re-opened SegmentReaders have their own instance of FieldsReader
+-    if (fieldsReader != null) {
+-      fieldsReader.close();
+-    }
+-
+     if (!hasReferencedReader) { 
+       // close everything, nothing is shared anymore with other readers
+       if (tis != null) {
+@@ -656,6 +640,9 @@ class SegmentReader extends DirectoryIndexReader {
+       if (termVectorsReaderOrig != null)
+         termVectorsReaderOrig.close();
+   
++      if (fieldsReaderOrig != null)
++        fieldsReaderOrig.close();
++  
+       if (cfsReader != null)
+         cfsReader.close();
+   
+@@ -725,12 +712,12 @@ class SegmentReader extends DirectoryIndexReader {
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+    */
+-  public synchronized Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
+     ensureOpen();
+     if (isDeleted(n))
+       throw new IllegalArgumentException
+               ("attempt to access a deleted document");
+-    return fieldsReader.doc(n, fieldSelector);
++    return getFieldsReader().doc(n, fieldSelector);
+   }
+ 
+   public synchronized boolean isDeleted(int n) {
+

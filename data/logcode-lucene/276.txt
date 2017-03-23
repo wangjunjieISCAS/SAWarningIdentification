@@ -1,0 +1,645 @@
+GitDiffStart: 46aeb52588c6ecf298ee894a79fb162e4e3437fe | Mon Oct 17 13:55:26 2016 -0400
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 08abc76..0ea8191 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -279,6 +279,8 @@ Other Changes
+ 
+ * SOLR-9625: Add HelloWorldSolrCloudTestCase class (Christine Poerschke, Alan Woodward, Alexandre Rafalovitch)
+ 
++* SOLR-9642: Refactor the core level snapshot cleanup mechanism to rely on Lucene (Hrishikesh Gadre via yonik)
++
+ ==================  6.2.1 ==================
+ 
+ Bug Fixes
+diff --git a/solr/core/src/java/org/apache/solr/core/SolrCore.java b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index dd422ad..2827f03 100644
+--- a/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -39,6 +39,7 @@ import java.util.LinkedHashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.Properties;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
+@@ -81,7 +82,9 @@ import org.apache.solr.common.util.ObjectReleaseTracker;
+ import org.apache.solr.common.util.SimpleOrderedMap;
+ import org.apache.solr.common.util.Utils;
+ import org.apache.solr.core.DirectoryFactory.DirContext;
++import org.apache.solr.core.snapshots.SolrSnapshotManager;
+ import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager;
++import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager.SnapshotMetaData;
+ import org.apache.solr.handler.IndexFetcher;
+ import org.apache.solr.handler.ReplicationHandler;
+ import org.apache.solr.handler.RequestHandlerBase;
+@@ -194,6 +197,7 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+   private final List<Runnable> confListeners = new CopyOnWriteArrayList<>();
+ 
+   private final ReentrantLock ruleExpiryLock;
++  private final ReentrantLock snapshotDelLock; // A lock instance to guard against concurrent deletions.
+ 
+   public Date getStartTimeStamp() { return startTime; }
+ 
+@@ -431,6 +435,83 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+     }
+   }
+ 
++  /**
++   * This method deletes the snapshot with the specified name. If the directory
++   * storing the snapshot is not the same as the *current* core index directory,
++   * then delete the files corresponding to this snapshot. Otherwise we leave the
++   * index files related to snapshot as is (assuming the underlying Solr IndexDeletionPolicy
++   * will clean them up appropriately).
++   *
++   * @param commitName The name of the snapshot to be deleted.
++   * @throws IOException in case of I/O error.
++   */
++  public void deleteNamedSnapshot(String commitName) throws IOException {
++    // Note this lock is required to prevent multiple snapshot deletions from
++    // opening multiple IndexWriter instances simultaneously.
++    this.snapshotDelLock.lock();
++    try {
++      Optional<SnapshotMetaData> metadata = snapshotMgr.release(commitName);
++      if (metadata.isPresent()) {
++        long gen = metadata.get().getGenerationNumber();
++        String indexDirPath = metadata.get().getIndexDirPath();
++
++        if (!indexDirPath.equals(getIndexDir())) {
++          Directory d = getDirectoryFactory().get(indexDirPath, DirContext.DEFAULT, "none");
++          try {
++            Collection<SnapshotMetaData> snapshots = snapshotMgr.listSnapshotsInIndexDir(indexDirPath);
++            log.info("Following snapshots exist in the index directory {} : {}", indexDirPath, snapshots);
++            if (snapshots.isEmpty()) {// No snapshots remain in this directory. Can be cleaned up!
++              log.info("Removing index directory {} since all named snapshots are deleted.", indexDirPath);
++              getDirectoryFactory().remove(d);
++            } else {
++              SolrSnapshotManager.deleteSnapshotIndexFiles(this, d, gen);
++            }
++          } finally {
++            getDirectoryFactory().release(d);
++          }
++        }
++      }
++    } finally {
++      snapshotDelLock.unlock();
++    }
++  }
++
++  /**
++   * This method deletes the index files not associated with any named snapshot only
++   * if the specified indexDirPath is not the *current* index directory.
++   *
++   * @param indexDirPath The path of the directory
++   * @throws IOException In case of I/O error.
++   */
++  public void deleteNonSnapshotIndexFiles(String indexDirPath) throws IOException {
++    // Skip if the specified indexDirPath is the *current* index directory.
++    if (getIndexDir().equals(indexDirPath)) {
++      return;
++    }
++
++    // Note this lock is required to prevent multiple snapshot deletions from
++    // opening multiple IndexWriter instances simultaneously.
++    this.snapshotDelLock.lock();
++    Directory dir = getDirectoryFactory().get(indexDirPath, DirContext.DEFAULT, "none");
++    try {
++      Collection<SnapshotMetaData> snapshots = snapshotMgr.listSnapshotsInIndexDir(indexDirPath);
++      log.info("Following snapshots exist in the index directory {} : {}", indexDirPath, snapshots);
++      // Delete the old index directory only if no snapshot exists in that directory.
++      if (snapshots.isEmpty()) {
++        log.info("Removing index directory {} since all named snapshots are deleted.", indexDirPath);
++        getDirectoryFactory().remove(dir);
++      } else {
++        SolrSnapshotManager.deleteNonSnapshotIndexFiles(this, dir, snapshots);
++      }
++    } finally {
++      snapshotDelLock.unlock();
++      if (dir != null) {
++        getDirectoryFactory().release(dir);
++      }
++    }
++  }
++
++
+   private void initListeners() {
+     final Class<SolrEventListener> clazz = SolrEventListener.class;
+     final String label = "Event Listener";
+@@ -863,6 +944,8 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+     bufferUpdatesIfConstructing(coreDescriptor);
+ 
+     this.ruleExpiryLock = new ReentrantLock();
++    this.snapshotDelLock = new ReentrantLock();
++
+     registerConfListener();
+     
+     assert ObjectReleaseTracker.track(this);
+diff --git a/solr/core/src/java/org/apache/solr/core/snapshots/SolrSnapshotManager.java b/solr/core/src/java/org/apache/solr/core/snapshots/SolrSnapshotManager.java
+index 95df3ff..4257baf 100644
+--- a/solr/core/src/java/org/apache/solr/core/snapshots/SolrSnapshotManager.java
++++ b/solr/core/src/java/org/apache/solr/core/snapshots/SolrSnapshotManager.java
+@@ -19,18 +19,18 @@ package org.apache.solr.core.snapshots;
+ import java.io.IOException;
+ import java.lang.invoke.MethodHandles;
+ import java.util.Collection;
+-import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
+-
+-import com.google.common.annotations.VisibleForTesting;
+-import org.apache.lucene.index.DirectoryReader;
+ import org.apache.lucene.index.IndexCommit;
++import org.apache.lucene.index.IndexDeletionPolicy;
++import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.IndexWriterConfig.OpenMode;
++import org.apache.lucene.index.NoMergePolicy;
+ import org.apache.lucene.store.Directory;
++import org.apache.solr.core.SolrCore;
+ import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager.SnapshotMetaData;
++import org.apache.solr.update.SolrIndexWriter;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -43,92 +43,78 @@ public class SolrSnapshotManager {
+   /**
+    * This method deletes index files of the {@linkplain IndexCommit} for the specified generation number.
+    *
++   * @param core The Solr core
+    * @param dir The index directory storing the snapshot.
+-   * @param gen The generation number for the {@linkplain IndexCommit}
++   * @param gen The generation number of the {@linkplain IndexCommit} to be deleted.
+    * @throws IOException in case of I/O errors.
+    */
+-  public static void deleteIndexFiles ( Directory dir, Collection<SnapshotMetaData> snapshots, long gen ) throws IOException {
+-    List<IndexCommit> commits = DirectoryReader.listCommits(dir);
+-    Map<String, Integer> refCounts = buildRefCounts(snapshots, commits);
+-    for (IndexCommit ic : commits) {
+-      if (ic.getGeneration() == gen) {
+-        deleteIndexFiles(dir,refCounts, ic);
+-        break;
++  public static void deleteSnapshotIndexFiles(SolrCore core, Directory dir, final long gen) throws IOException {
++    deleteSnapshotIndexFiles(core, dir, new IndexDeletionPolicy() {
++      @Override
++      public void onInit(List<? extends IndexCommit> commits) throws IOException {
++        for (IndexCommit ic : commits) {
++          if (gen == ic.getGeneration()) {
++            log.info("Deleting non-snapshotted index commit with generation {}", ic.getGeneration());
++            ic.delete();
++          }
++        }
+       }
+-    }
++
++      @Override
++      public void onCommit(List<? extends IndexCommit> commits)
++          throws IOException {}
++    });
+   }
+ 
+   /**
+-   * This method deletes all files not corresponding to a configured snapshot in the specified index directory.
++   * This method deletes index files not associated with the specified <code>snapshots</code>.
+    *
+-   * @param dir The index directory to search for.
++   * @param core The Solr core
++   * @param dir The index directory storing the snapshot.
++   * @param snapshots The snapshots to be preserved.
+    * @throws IOException in case of I/O errors.
+    */
+-  public static void deleteNonSnapshotIndexFiles (Directory dir, Collection<SnapshotMetaData> snapshots) throws IOException {
+-    List<IndexCommit> commits = DirectoryReader.listCommits(dir);
+-    Map<String, Integer> refCounts = buildRefCounts(snapshots, commits);
+-    Set<Long> snapshotGenNumbers = snapshots.stream()
+-                                            .map(SnapshotMetaData::getGenerationNumber)
+-                                            .collect(Collectors.toSet());
+-    for (IndexCommit ic : commits) {
+-      if (!snapshotGenNumbers.contains(ic.getGeneration())) {
+-        deleteIndexFiles(dir,refCounts, ic);
+-      }
++  public static void deleteNonSnapshotIndexFiles(SolrCore core, Directory dir, Collection<SnapshotMetaData> snapshots) throws IOException {
++    final Set<Long> genNumbers = new HashSet<>();
++    for (SnapshotMetaData m : snapshots) {
++      genNumbers.add(m.getGenerationNumber());
+     }
+-  }
+ 
+-  /**
+-   * This method computes reference count for the index files by taking into consideration
+-   * (a) configured snapshots and (b) files sharing between two or more {@linkplain IndexCommit} instances.
+-   *
+-   * @param snapshots A collection of user configured snapshots
+-   * @param commits A list of {@linkplain IndexCommit} instances
+-   * @return A map containing reference count for each index file referred in one of the {@linkplain IndexCommit} instances.
+-   * @throws IOException in case of I/O error.
+-   */
+-  @VisibleForTesting
+-  static Map<String, Integer> buildRefCounts (Collection<SnapshotMetaData> snapshots, List<IndexCommit> commits) throws IOException {
+-    Map<String, Integer> result = new HashMap<>();
+-    Map<Long, IndexCommit> commitsByGen = commits.stream().collect(
+-        Collectors.toMap(IndexCommit::getGeneration, Function.identity()));
+-
+-    for(SnapshotMetaData md : snapshots) {
+-      IndexCommit ic = commitsByGen.get(md.getGenerationNumber());
+-      if (ic != null) {
+-        Collection<String> fileNames = ic.getFileNames();
+-        for(String fileName : fileNames) {
+-          int refCount = result.getOrDefault(fileName, 0);
+-          result.put(fileName, refCount+1);
++    deleteSnapshotIndexFiles(core, dir, new IndexDeletionPolicy() {
++      @Override
++      public void onInit(List<? extends IndexCommit> commits) throws IOException {
++        for (IndexCommit ic : commits) {
++          if (!genNumbers.contains(ic.getGeneration())) {
++            log.info("Deleting non-snapshotted index commit with generation {}", ic.getGeneration());
++            ic.delete();
++          }
+         }
+       }
+-    }
+ 
+-    return result;
++      @Override
++      public void onCommit(List<? extends IndexCommit> commits)
++          throws IOException {}
++    });
+   }
+ 
+   /**
+-   * This method deletes the index files associated with specified <code>indexCommit</code> provided they
+-   * are not referred by some other {@linkplain IndexCommit}.
++   * This method deletes index files of the {@linkplain IndexCommit} for the specified generation number.
+    *
+-   * @param dir The index directory containing the {@linkplain IndexCommit} to be deleted.
+-   * @param refCounts A map containing reference counts for each file associated with every {@linkplain IndexCommit}
+-   *                  in the specified directory.
+-   * @param indexCommit The {@linkplain IndexCommit} whose files need to be deleted.
++   * @param core The Solr core
++   * @param dir The index directory storing the snapshot.
+    * @throws IOException in case of I/O errors.
+    */
+-  private static void deleteIndexFiles ( Directory dir, Map<String, Integer> refCounts, IndexCommit indexCommit ) throws IOException {
+-    log.info("Deleting index files for index commit with generation {} in directory {}", indexCommit.getGeneration(), dir);
+-    for (String fileName : indexCommit.getFileNames()) {
+-      try {
+-        // Ensure that a file being deleted is not referred by some other commit.
+-        int ref = refCounts.getOrDefault(fileName, 0);
+-        log.debug("Reference count for file {} is {}", fileName, ref);
+-        if (ref == 0) {
+-          dir.deleteFile(fileName);
+-        }
+-      } catch (IOException e) {
+-        log.warn("Unable to delete file {} in directory {} due to exception {}", fileName, dir, e.getMessage());
+-      }
++  private static void deleteSnapshotIndexFiles(SolrCore core, Directory dir, IndexDeletionPolicy delPolicy) throws IOException {
++    IndexWriterConfig conf = core.getSolrConfig().indexConfig.toIndexWriterConfig(core);
++    conf.setOpenMode(OpenMode.APPEND);
++    conf.setMergePolicy(NoMergePolicy.INSTANCE);//Don't want to merge any commits here!
++    conf.setIndexDeletionPolicy(delPolicy);
++    conf.setCodec(core.getCodec());
++
++    try (SolrIndexWriter iw = new SolrIndexWriter("SolrSnapshotCleaner", dir, conf)) {
++      // Do nothing. The only purpose of opening index writer is to invoke the Lucene IndexDeletionPolicy#onInit
++      // method so that we can cleanup the files associated with specified index commit.
++      // Note the index writer creates a new commit during the close() operation (which is harmless).
+     }
+   }
+ }
+diff --git a/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java b/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java
+index b9d9f51..bdbd4e7 100644
+--- a/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java
++++ b/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java
+@@ -82,9 +82,6 @@ import org.apache.solr.core.DirectoryFactory;
+ import org.apache.solr.core.DirectoryFactory.DirContext;
+ import org.apache.solr.core.IndexDeletionPolicyWrapper;
+ import org.apache.solr.core.SolrCore;
+-import org.apache.solr.core.snapshots.SolrSnapshotManager;
+-import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager;
+-import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager.SnapshotMetaData;
+ import org.apache.solr.handler.ReplicationHandler.*;
+ import org.apache.solr.request.LocalSolrQueryRequest;
+ import org.apache.solr.request.SolrQueryRequest;
+@@ -478,17 +475,8 @@ public class IndexFetcher {
+                 // may be closed
+                 if (indexDir != null) {
+                   solrCore.getDirectoryFactory().doneWithDirectory(indexDir);
+-
+-                  SolrSnapshotMetaDataManager snapshotsMgr = solrCore.getSnapshotMetaDataManager();
+-                  Collection<SnapshotMetaData> snapshots = snapshotsMgr.listSnapshotsInIndexDir(indexDirPath);
+-
+-                  // Delete the old index directory only if no snapshot exists in that directory.
+-                  if(snapshots.isEmpty()) {
+-                    LOG.info("removing old index directory " + indexDir);
+-                    solrCore.getDirectoryFactory().remove(indexDir);
+-                  } else {
+-                    SolrSnapshotManager.deleteNonSnapshotIndexFiles(indexDir, snapshots);
+-                  }
++                  // Cleanup all index files not associated with any *named* snapshot.
++                  solrCore.deleteNonSnapshotIndexFiles(indexDirPath);
+                 }
+               }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/handler/RestoreCore.java b/solr/core/src/java/org/apache/solr/handler/RestoreCore.java
+index 62cb93f..c00d7bd 100644
+--- a/solr/core/src/java/org/apache/solr/handler/RestoreCore.java
++++ b/solr/core/src/java/org/apache/solr/handler/RestoreCore.java
+@@ -19,7 +19,6 @@ package org.apache.solr.handler;
+ import java.lang.invoke.MethodHandles;
+ import java.net.URI;
+ import java.text.SimpleDateFormat;
+-import java.util.Collection;
+ import java.util.Date;
+ import java.util.Locale;
+ import java.util.concurrent.Callable;
+@@ -33,9 +32,6 @@ import org.apache.solr.common.SolrException;
+ import org.apache.solr.core.DirectoryFactory;
+ import org.apache.solr.core.SolrCore;
+ import org.apache.solr.core.backup.repository.BackupRepository;
+-import org.apache.solr.core.snapshots.SolrSnapshotManager;
+-import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager;
+-import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager.SnapshotMetaData;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -135,16 +131,8 @@ public class RestoreCore implements Callable<Boolean> {
+       }
+       if (success) {
+         core.getDirectoryFactory().doneWithDirectory(indexDir);
+-
+-        SolrSnapshotMetaDataManager snapshotsMgr = core.getSnapshotMetaDataManager();
+-        Collection<SnapshotMetaData> snapshots = snapshotsMgr.listSnapshotsInIndexDir(indexDirPath);
+-
+-        // Delete the old index directory only if no snapshot exists in that directory.
+-        if (snapshots.isEmpty()) {
+-          core.getDirectoryFactory().remove(indexDir);
+-        } else {
+-          SolrSnapshotManager.deleteNonSnapshotIndexFiles(indexDir, snapshots);
+-        }
++        // Cleanup all index files not associated with any *named* snapshot.
++        core.deleteNonSnapshotIndexFiles(indexDirPath);
+       }
+ 
+       return true;
+diff --git a/solr/core/src/java/org/apache/solr/handler/admin/DeleteSnapshotOp.java b/solr/core/src/java/org/apache/solr/handler/admin/DeleteSnapshotOp.java
+index 3dd9071..739837c 100644
+--- a/solr/core/src/java/org/apache/solr/handler/admin/DeleteSnapshotOp.java
++++ b/solr/core/src/java/org/apache/solr/handler/admin/DeleteSnapshotOp.java
+@@ -17,17 +17,11 @@
+ 
+ package org.apache.solr.handler.admin;
+ 
+-import java.util.Optional;
+-
+-import org.apache.lucene.store.Directory;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.params.CoreAdminParams;
+ import org.apache.solr.common.params.SolrParams;
+ import org.apache.solr.core.CoreContainer;
+-import org.apache.solr.core.DirectoryFactory;
+ import org.apache.solr.core.SolrCore;
+-import org.apache.solr.core.snapshots.SolrSnapshotManager;
+-import org.apache.solr.core.snapshots.SolrSnapshotMetaDataManager;
+ 
+ 
+ class DeleteSnapshotOp implements CoreAdminHandler.CoreAdminOp {
+@@ -39,30 +33,15 @@ class DeleteSnapshotOp implements CoreAdminHandler.CoreAdminOp {
+ 
+     String commitName = params.required().get(CoreAdminParams.COMMIT_NAME);
+     String cname = params.required().get(CoreAdminParams.CORE);
+-    try (SolrCore core = cc.getCore(cname)) {
+-      if (core == null) {
+-        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Unable to locate core " + cname);
+-      }
+-
+-      SolrSnapshotMetaDataManager mgr = core.getSnapshotMetaDataManager();
+-      Optional<SolrSnapshotMetaDataManager.SnapshotMetaData> metadata = mgr.release(commitName);
+-      if (metadata.isPresent()) {
+-        long gen = metadata.get().getGenerationNumber();
+-        String indexDirPath = metadata.get().getIndexDirPath();
++    SolrCore core = cc.getCore(cname);
++    if (core == null) {
++      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Unable to locate core " + cname);
++    }
+ 
+-        // If the directory storing the snapshot is not the same as the *current* core
+-        // index directory, then delete the files corresponding to this snapshot.
+-        // Otherwise we leave the index files related to snapshot as is (assuming the
+-        // underlying Solr IndexDeletionPolicy will clean them up appropriately).
+-        if (!indexDirPath.equals(core.getIndexDir())) {
+-          Directory d = core.getDirectoryFactory().get(indexDirPath, DirectoryFactory.DirContext.DEFAULT, DirectoryFactory.LOCK_TYPE_NONE);
+-          try {
+-            SolrSnapshotManager.deleteIndexFiles(d, mgr.listSnapshotsInIndexDir(indexDirPath), gen);
+-          } finally {
+-            core.getDirectoryFactory().release(d);
+-          }
+-        }
+-      }
++    try {
++      core.deleteNamedSnapshot(commitName);
++    } finally {
++      core.close();
+     }
+   }
+ }
+diff --git a/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java b/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
+index fcfc559..d75214a 100644
+--- a/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
++++ b/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
+@@ -77,6 +77,15 @@ public class SolrIndexWriter extends IndexWriter {
+     }
+   }
+ 
++  public SolrIndexWriter(String name, Directory d, IndexWriterConfig conf) throws IOException {
++    super(d, conf);
++    this.name = name;
++    this.infoStream = conf.getInfoStream();
++    this.directory = d;
++    numOpens.incrementAndGet();
++    log.debug("Opened Writer " + name);
++  }
++
+   private SolrIndexWriter(SolrCore core, String name, String path, Directory directory, boolean create, IndexSchema schema, SolrIndexConfig config, IndexDeletionPolicy delPolicy, Codec codec) throws IOException {
+     super(directory,
+           config.toIndexWriterConfig(core).
+@@ -182,7 +191,10 @@ public class SolrIndexWriter extends IndexWriter {
+         IOUtils.closeQuietly(infoStream);
+       }
+       numCloses.incrementAndGet();
+-      directoryFactory.release(directory);
++
++      if (directoryFactory != null) {
++        directoryFactory.release(directory);
++      }
+     }
+   }
+ 
+diff --git a/solr/core/src/test/org/apache/solr/core/snapshots/TestSolrCoreSnapshots.java b/solr/core/src/test/org/apache/solr/core/snapshots/TestSolrCoreSnapshots.java
+index aacac52..da6dbac 100644
+--- a/solr/core/src/test/org/apache/solr/core/snapshots/TestSolrCoreSnapshots.java
++++ b/solr/core/src/test/org/apache/solr/core/snapshots/TestSolrCoreSnapshots.java
+@@ -17,8 +17,6 @@
+ package org.apache.solr.core.snapshots;
+ 
+ import java.lang.invoke.MethodHandles;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+ import java.nio.file.Paths;
+ import java.util.ArrayList;
+ import java.util.Collection;
+@@ -124,7 +122,7 @@ public class TestSolrCoreSnapshots extends SolrCloudTestCase {
+       // and the other containing document deletions.
+       {
+         List<IndexCommit> commits = listCommits(metaData.getIndexDirPath());
+-        assertTrue(2 <= commits.size());
++        assertTrue(commits.size() >= 2);
+       }
+ 
+       // Backup the earlier created snapshot.
+@@ -146,9 +144,11 @@ public class TestSolrCoreSnapshots extends SolrCloudTestCase {
+       }
+ 
+       // Verify that the old index directory (before restore) contains only those index commits referred by snapshots.
++      // The IndexWriter (used to cleanup index files) creates an additional commit during closing. Hence we expect 2 commits (instead
++      // of 1).
+       {
+         List<IndexCommit> commits = listCommits(metaData.getIndexDirPath());
+-        assertEquals(1, commits.size());
++        assertEquals(2, commits.size());
+         assertEquals(metaData.getGenerationNumber(), commits.get(0).getGeneration());
+       }
+ 
+@@ -161,123 +161,16 @@ public class TestSolrCoreSnapshots extends SolrCloudTestCase {
+       // Delete second snapshot
+       deleteSnapshot(adminClient, coreName, duplicateCommit.getName());
+ 
+-      // Verify that corresponding index files have been deleted.
+-      assertTrue(listCommits(duplicateCommit.getIndexDirPath()).isEmpty());
++      // Verify that corresponding index files have been deleted. Ideally this directory should
++      // be removed immediately. But the current DirectoryFactory impl waits until the
++      // closing the core (or the directoryFactory) for actual removal. Since the IndexWriter
++      // (used to cleanup index files) creates an additional commit during closing, we expect a single
++      // commit (instead of 0).
++      assertEquals(1, listCommits(duplicateCommit.getIndexDirPath()).size());
+     }
+   }
+ 
+   @Test
+-  public void testHandlingSharedIndexFiles() throws Exception {
+-    CloudSolrClient solrClient = cluster.getSolrClient();
+-    String collectionName = "SolrCoreSnapshots_IndexFileSharing";
+-    CollectionAdminRequest.Create create = CollectionAdminRequest.createCollection(collectionName, "conf1", 1, 1);
+-    create.process(solrClient);
+-
+-    int nDocs = BackupRestoreUtils.indexDocs(cluster.getSolrClient(), collectionName, docsSeed);
+-    DocCollection collectionState = solrClient.getZkStateReader().getClusterState().getCollection(collectionName);
+-    assertEquals(1, collectionState.getActiveSlices().size());
+-    Slice shard = collectionState.getActiveSlices().iterator().next();
+-    assertEquals(1, shard.getReplicas().size());
+-    Replica replica = shard.getReplicas().iterator().next();
+-
+-    String replicaBaseUrl = replica.getStr(BASE_URL_PROP);
+-    String coreName = replica.getStr(ZkStateReader.CORE_NAME_PROP);
+-    String backupName = TestUtil.randomSimpleString(random(), 1, 5);
+-    String location = createTempDir().toFile().getAbsolutePath();
+-
+-    try (
+-        SolrClient adminClient = getHttpSolrClient(cluster.getJettySolrRunners().get(0).getBaseUrl().toString());
+-        SolrClient masterClient = getHttpSolrClient(replica.getCoreUrl())) {
+-
+-      int numTests = TestUtil.nextInt(random(), 2, 5);
+-      List<SnapshotMetaData> snapshots = new ArrayList<>(numTests);
+-
+-      // Create multiple commits and create a snapshot per commit.
+-      // This should result in Lucene reusing some of the segments for later index commits.
+-      for (int attempt=0; attempt<numTests; attempt++) {
+-        if (nDocs > 0) {
+-          //Delete a few docs
+-          int numDeletes = TestUtil.nextInt(random(), 1, nDocs);
+-          for(int i=0; i<numDeletes; i++) {
+-            masterClient.deleteByQuery("id:" + i);
+-          }
+-        }
+-
+-        // Add a few more
+-        int moreAdds = TestUtil.nextInt(random(), 1, 100);
+-        for (int i = 0; i < moreAdds; i++) {
+-          SolrInputDocument doc = new SolrInputDocument();
+-          doc.addField("id", i + nDocs);
+-          doc.addField("name", "name = " + (i + nDocs));
+-          masterClient.add(doc);
+-        }
+-        masterClient.commit();
+-
+-        // Create a snapshot
+-        snapshots.add(createSnapshot(adminClient, coreName, "snapshot_" + attempt));
+-      }
+-
+-      // Backup the earlier created snapshot.
+-      {
+-        Map<String,String> params = new HashMap<>();
+-        params.put("name", backupName);
+-        params.put("commitName", snapshots.get(0).getName());
+-        params.put("location", location);
+-        BackupRestoreUtils.runCoreAdminCommand(replicaBaseUrl, coreName, CoreAdminAction.BACKUPCORE.toString(), params);
+-      }
+-
+-      // Restore the backup. The purpose of the restore operation is to change the *current* index directory.
+-      // This is required since we delegate the file deletion to underlying IndexDeletionPolicy in case of
+-      // *current* index directory. Hence for the purpose of this test, we want to ensure that the created
+-      // snapshots are NOT in the *current* index directory.
+-      {
+-        Map<String,String> params = new HashMap<>();
+-        params.put("name", "snapshot." + backupName);
+-        params.put("location", location);
+-        BackupRestoreUtils.runCoreAdminCommand(replicaBaseUrl, coreName, CoreAdminAction.RESTORECORE.toString(), params);
+-      }
+-
+-      {
+-        SnapshotMetaData snapshotMetaData = snapshots.get(0);
+-
+-        List<IndexCommit> commits = listCommits(snapshotMetaData.getIndexDirPath());
+-        // Check if number of index commits are > 0 to ensure index file sharing.
+-        assertTrue(commits.size() > 0);
+-        Map<String,Integer> refCounts = SolrSnapshotManager.buildRefCounts(snapshots, commits);
+-
+-        Optional<IndexCommit> ic = commits.stream()
+-            .filter(entry -> entry.getGeneration() == snapshotMetaData.getGenerationNumber())
+-            .findFirst();
+-        assertTrue(ic.isPresent());
+-        Collection<String> nonSharedFiles = new ArrayList<>();
+-        Collection<String> sharedFiles = new ArrayList<>();
+-        for (String fileName : ic.get().getFileNames()) {
+-          if (refCounts.getOrDefault(fileName, 0) > 1) {
+-            sharedFiles.add(fileName);
+-          } else {
+-            nonSharedFiles.add(fileName);
+-          }
+-        }
+-
+-        // Delete snapshot
+-        deleteSnapshot(adminClient, coreName, snapshotMetaData.getName());
+-
+-        // Verify that the shared files are not deleted.
+-        for (String fileName : sharedFiles) {
+-          Path path = Paths.get(snapshotMetaData.getIndexDirPath(), fileName);
+-          assertTrue(path + " should exist.", Files.exists(path));
+-        }
+-
+-        // Verify that the non-shared files are deleted.
+-        for (String fileName : nonSharedFiles) {
+-          Path path = Paths.get(snapshotMetaData.getIndexDirPath(), fileName);
+-          assertFalse(path + " should not exist.", Files.exists(path));
+-        }
+-        }
+-      }
+-  }
+-
+-  @Test
+   public void testIndexOptimization() throws Exception {
+     CloudSolrClient solrClient = cluster.getSolrClient();
+     String collectionName = "SolrCoreSnapshots_IndexOptimization";
+

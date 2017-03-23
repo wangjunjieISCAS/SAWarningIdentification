@@ -1,0 +1,902 @@
+GitDiffStart: 1a93333d50c5e9618323de229c21f9e891eb8a14 | Wed May 20 16:52:37 2015 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index e6282ce..4622e06 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -307,6 +307,10 @@ Optimizations
+   configurable and use knowledge that a batch is being processed to poll efficiently.
+   (Timothy Potter)
+ 
++* SOLR-7332: Initialize the highest value for all version buckets with the max value from
++  the index or recent updates to avoid unnecessary lookups to the index to check for reordered
++  updates when processing new documents. (Timothy Potter, yonik)
++
+ Other Changes
+ ----------------------
+ 
+diff --git a/solr/core/src/java/org/apache/solr/core/SolrCore.java b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index 09a1a20..5ebbf8a 100644
+--- a/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -1806,6 +1806,10 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+         }
+ 
+         if (currSearcher == null) {
++          if (updateHandler != null && updateHandler.getUpdateLog() != null) {
++            updateHandler.getUpdateLog().onFirstSearcher(newSearcher);
++          }
++
+           future = searcherExecutor.submit(new Callable() {
+             @Override
+             public Object call() throws Exception {
+diff --git a/solr/core/src/java/org/apache/solr/update/UpdateLog.java b/solr/core/src/java/org/apache/solr/update/UpdateLog.java
+index 01e197b..c286cba 100644
+--- a/solr/core/src/java/org/apache/solr/update/UpdateLog.java
++++ b/solr/core/src/java/org/apache/solr/update/UpdateLog.java
+@@ -145,6 +145,7 @@ public class UpdateLog implements PluginInfoInitialized {
+   protected int numRecordsToKeep;
+   protected int maxNumLogsToKeep;
+   protected int numVersionBuckets; // This should only be used to initialize VersionInfo... the actual number of buckets may be rounded up to a power of two.
++  protected Long maxVersionFromIndex = null;
+ 
+   // keep track of deletes only... this is not updated on an add
+   protected LinkedHashMap<BytesRef, LogPtr> oldDeletes = new LinkedHashMap<BytesRef, LogPtr>(numDeletesToKeep) {
+@@ -703,6 +704,7 @@ public class UpdateLog implements PluginInfoInitialized {
+         SolrCore.verbose("TLOG: postSoftCommit: disposing of prevMap="+ System.identityHashCode(prevMap) + ", prevMap2=" + System.identityHashCode(prevMap2));
+       }
+       clearOldMaps();
++
+     }
+   }
+ 
+@@ -1052,6 +1054,15 @@ public class UpdateLog implements PluginInfoInitialized {
+         log.decref();
+       }
+     }
++
++    public long getMaxRecentVersion() {
++      long maxRecentVersion = 0L;
++      if (updates != null) {
++        for (Long key : updates.keySet())
++          maxRecentVersion = Math.max(maxRecentVersion, Math.abs(key.longValue()));
++      }
++      return maxRecentVersion;
++    }
+   }
+ 
+   /** The RecentUpdates object returned must be closed after use */
+@@ -1257,6 +1268,12 @@ public class UpdateLog implements PluginInfoInitialized {
+         // change the state while updates are still blocked to prevent races
+         state = State.ACTIVE;
+         if (finishing) {
++
++          // after replay, update the max from the index
++          log.info("Re-computing max version from index after log re-play.");
++          maxVersionFromIndex = null;
++          getMaxVersionFromIndex();
++
+           versionInfo.unblockUpdates();
+         }
+ 
+@@ -1527,6 +1544,69 @@ public class UpdateLog implements PluginInfoInitialized {
+       }
+     }
+   }
+-  
++
++  // this method is primarily used for unit testing and is not part of the public API for this class
++  Long getMaxVersionFromIndex() {
++    if (maxVersionFromIndex == null && versionInfo != null) {
++      RefCounted<SolrIndexSearcher> newestSearcher = (uhandler != null && uhandler.core != null)
++          ? uhandler.core.getRealtimeSearcher() : null;
++      if (newestSearcher == null)
++        throw new IllegalStateException("No searcher available to lookup max version from index!");
++
++      try {
++        maxVersionFromIndex = seedBucketsWithHighestVersion(newestSearcher.get(), versionInfo);
++      } finally {
++        newestSearcher.decref();
++      }
++    }
++    return maxVersionFromIndex;
++  }
++
++  /**
++   * Used to seed all version buckets with the max value of the version field in the index.
++   */
++  protected Long seedBucketsWithHighestVersion(SolrIndexSearcher newSearcher, VersionInfo versions) {
++    Long highestVersion = null;
++    long startMs = System.currentTimeMillis();
++
++    RecentUpdates recentUpdates = null;
++    try {
++      recentUpdates = getRecentUpdates();
++      long maxVersionFromRecent = recentUpdates.getMaxRecentVersion();
++      long maxVersionFromIndex = versions.getMaxVersionFromIndex(newSearcher);
++
++      long maxVersion = Math.max(maxVersionFromIndex, maxVersionFromRecent);
++      if (maxVersion == 0L) {
++        maxVersion = versions.getNewClock();
++        log.warn("Could not find max version in index or recent updates, using new clock {}", maxVersion);
++      }
++
++      // seed all version buckets with the highest value from recent and index
++      versions.seedBucketsWithHighestVersion(maxVersion);
++
++      highestVersion = maxVersion;
++    } catch (IOException ioExc) {
++      log.warn("Failed to determine the max value of the version field due to: "+ioExc, ioExc);
++    } finally {
++      if (recentUpdates != null)
++        recentUpdates.close();
++    }
++
++    long tookMs = (System.currentTimeMillis() - startMs);
++    log.info("Took {} ms to seed version buckets with highest version {}",
++        tookMs, String.valueOf(highestVersion));
++
++    return highestVersion;
++  }
++
++  public void onFirstSearcher(SolrIndexSearcher newSearcher) {
++    log.info("On first searcher opened, looking up max value of version field");
++    versionInfo.blockUpdates();
++    try {
++      maxVersionFromIndex = seedBucketsWithHighestVersion(newSearcher, versionInfo);
++    } finally {
++      versionInfo.unblockUpdates();
++    }
++  }
+ }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/update/VersionInfo.java b/solr/core/src/java/org/apache/solr/update/VersionInfo.java
+index c541ac6..825a944 100644
+--- a/solr/core/src/java/org/apache/solr/update/VersionInfo.java
++++ b/solr/core/src/java/org/apache/solr/update/VersionInfo.java
+@@ -22,17 +22,30 @@ import java.util.Map;
+ import java.util.concurrent.locks.ReadWriteLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.StoredDocument;
++import org.apache.lucene.index.Terms;
+ import org.apache.lucene.queries.function.FunctionValues;
+ import org.apache.lucene.queries.function.ValueSource;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Sort;
++import org.apache.lucene.search.SortField;
++import org.apache.lucene.search.TopFieldDocs;
+ import org.apache.lucene.util.BitUtil;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.NumericUtils;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.schema.IndexSchema;
+ import org.apache.solr.schema.SchemaField;
+ import org.apache.solr.search.SolrIndexSearcher;
+ import org.apache.solr.util.RefCounted;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ public class VersionInfo {
++
++  public static Logger log = LoggerFactory.getLogger(VersionInfo.class);
++
+   public static final String VERSION_FIELD="_version_";
+ 
+   private final UpdateLog ulog;
+@@ -88,7 +101,6 @@ public class VersionInfo {
+   }
+ 
+   public void reload() {
+-
+   }
+ 
+   public SchemaField getVersionField() {
+@@ -191,13 +203,13 @@ public class VersionInfo {
+     try {
+       SolrIndexSearcher searcher = newestSearcher.get();
+       long lookup = searcher.lookupId(idBytes);
+-      if (lookup < 0) return null;
++      if (lookup < 0) return null; // this means the doc doesn't exist in the index yet
+ 
+       ValueSource vs = versionField.getType().getValueSource(versionField, null);
+       Map context = ValueSource.newContext(searcher);
+       vs.createWeight(context, searcher);
+-      FunctionValues fv = vs.getValues(context, searcher.getTopReaderContext().leaves().get((int)(lookup>>32)));
+-      long ver = fv.longVal((int)lookup);
++      FunctionValues fv = vs.getValues(context, searcher.getTopReaderContext().leaves().get((int) (lookup >> 32)));
++      long ver = fv.longVal((int) lookup);
+       return ver;
+ 
+     } catch (IOException e) {
+@@ -209,4 +221,47 @@ public class VersionInfo {
+     }
+   }
+ 
++  public Long getMaxVersionFromIndex(SolrIndexSearcher searcher) throws IOException {
++
++    String versionFieldName = versionField.getName();
++
++    log.info("Refreshing highest value of {} for {} version buckets from index", versionFieldName, buckets.length);
++    long maxVersionInIndex = 0L;
++
++    // if indexed, then we have terms to get the max from
++    if (versionField.indexed()) {
++      Terms versionTerms = searcher.getLeafReader().terms(versionFieldName);
++      if (versionTerms != null) {
++        maxVersionInIndex = NumericUtils.getMaxLong(versionTerms);
++        log.info("Found MAX value {} from Terms for {} in index", maxVersionInIndex, versionFieldName);
++      } else {
++        log.warn("No terms found for {}, cannot seed version bucket highest value from index", versionFieldName);
++      }
++    } else {
++      ValueSource vs = versionField.getType().getValueSource(versionField, null);
++      Map funcContext = ValueSource.newContext(searcher);
++      vs.createWeight(funcContext, searcher);
++      // TODO: multi-thread this
++      for (LeafReaderContext ctx : searcher.getTopReaderContext().leaves()) {
++        int maxDoc = ctx.reader().maxDoc();
++        FunctionValues fv = vs.getValues(funcContext, ctx);
++        for (int doc = 0; doc < maxDoc; doc++) {
++          long v = fv.longVal(doc);
++          maxVersionInIndex = Math.max(v, maxVersionInIndex);
++        }
++      }
++    }
++
++    return maxVersionInIndex;
++  }
++
++  public void seedBucketsWithHighestVersion(long highestVersion) {
++    for (int i=0; i<buckets.length; i++) {
++      // should not happen, but in case other threads are calling updateHighest on the version bucket
++      synchronized (buckets[i]) {
++        if (buckets[i].highest < highestVersion)
++          buckets[i].highest = highestVersion;
++      }
++    }
++  }
+ }
+diff --git a/solr/core/src/test-files/solr/collection1/conf/schema-version-dv.xml b/solr/core/src/test-files/solr/collection1/conf/schema-version-dv.xml
+new file mode 100644
+index 0000000..4f4e035
+--- /dev/null
++++ b/solr/core/src/test-files/solr/collection1/conf/schema-version-dv.xml
+@@ -0,0 +1,37 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++<schema name="example" version="1.5">
++  <fields>
++    <field name="_version_" type="long" indexed="false" stored="true" docValues="true"/>
++    <field name="id" type="string" indexed="true" stored="true" required="true" multiValued="false"/>
++    <field name="text" type="text_general" indexed="true" stored="false" multiValued="true"/>
++    <field name="signatureField" type="string" indexed="true" stored="false"/>
++    <dynamicField name="*_sS" type="string"  indexed="false" stored="true"/>
++  </fields>
++  <uniqueKey>id</uniqueKey>
++  <types>
++    <fieldType name="string" class="solr.StrField" sortMissingLast="true"/>
++    <fieldType name="long" class="solr.TrieLongField" precisionStep="0" positionIncrementGap="0"/>
++    <fieldType name="text_general" class="solr.TextField" positionIncrementGap="100">
++      <analyzer>
++        <tokenizer class="solr.StandardTokenizerFactory"/>
++        <filter class="solr.LowerCaseFilterFactory"/>
++      </analyzer>
++    </fieldType>
++  </types>
++</schema>
+diff --git a/solr/core/src/test-files/solr/collection1/conf/schema-version-indexed.xml b/solr/core/src/test-files/solr/collection1/conf/schema-version-indexed.xml
+new file mode 100644
+index 0000000..9578a38
+--- /dev/null
++++ b/solr/core/src/test-files/solr/collection1/conf/schema-version-indexed.xml
+@@ -0,0 +1,37 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++<schema name="example" version="1.5">
++  <fields>
++    <field name="_version_" type="long" indexed="true" stored="true"/>
++    <field name="id" type="string" indexed="true" stored="true" required="true" multiValued="false"/>
++    <field name="text" type="text_general" indexed="true" stored="false" multiValued="true"/>
++    <field name="signatureField" type="string" indexed="true" stored="false"/>
++    <dynamicField name="*_sS" type="string"  indexed="false" stored="true"/>
++  </fields>
++  <uniqueKey>id</uniqueKey>
++  <types>
++    <fieldType name="string" class="solr.StrField" sortMissingLast="true"/>
++    <fieldType name="long" class="solr.TrieLongField" precisionStep="0" positionIncrementGap="0"/>
++    <fieldType name="text_general" class="solr.TextField" positionIncrementGap="100">
++      <analyzer>
++        <tokenizer class="solr.StandardTokenizerFactory"/>
++        <filter class="solr.LowerCaseFilterFactory"/>
++      </analyzer>
++    </fieldType>
++  </types>
++</schema>
+diff --git a/solr/core/src/test/org/apache/solr/cloud/DistributedVersionInfoTest.java b/solr/core/src/test/org/apache/solr/cloud/DistributedVersionInfoTest.java
+new file mode 100644
+index 0000000..f73d15f
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/cloud/DistributedVersionInfoTest.java
+@@ -0,0 +1,411 @@
++package org.apache.solr.cloud;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.lucene.util.LuceneTestCase.Slow;
++import org.apache.solr.JSONTestUtil;
++import org.apache.solr.SolrTestCaseJ4.SuppressSSL;
++import org.apache.solr.client.solrj.SolrClient;
++import org.apache.solr.client.solrj.SolrQuery;
++import org.apache.solr.client.solrj.SolrServerException;
++import org.apache.solr.client.solrj.impl.HttpSolrClient;
++import org.apache.solr.client.solrj.request.CollectionAdminRequest;
++import org.apache.solr.client.solrj.request.CoreAdminRequest;
++import org.apache.solr.client.solrj.request.QueryRequest;
++import org.apache.solr.client.solrj.request.UpdateRequest;
++import org.apache.solr.client.solrj.response.CollectionAdminResponse;
++import org.apache.solr.client.solrj.response.CoreAdminResponse;
++import org.apache.solr.client.solrj.response.QueryResponse;
++import org.apache.solr.common.SolrDocument;
++import org.apache.solr.common.SolrDocumentList;
++import org.apache.solr.common.SolrInputDocument;
++import org.apache.solr.common.cloud.Replica;
++import org.apache.solr.common.cloud.ZkCoreNodeProps;
++import org.apache.solr.common.params.CollectionParams;
++import org.apache.solr.common.params.ModifiableSolrParams;
++import org.apache.solr.common.util.NamedList;
++import org.apache.solr.update.processor.DistributedUpdateProcessor;
++import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import static org.apache.solr.update.processor.DistributingUpdateProcessorFactory.DISTRIB_UPDATE_PARAM;
++import static org.apache.solr.update.processor.DistributedUpdateProcessor.DISTRIB_FROM;
++
++@Slow
++@SuppressSSL(bugUrl = "https://issues.apache.org/jira/browse/SOLR-5776")
++public class DistributedVersionInfoTest extends AbstractFullDistribZkTestBase {
++
++  protected static final transient Logger log =
++      LoggerFactory.getLogger(DistributedVersionInfoTest.class);
++
++  protected static final int maxWaitSecsToSeeAllActive = 30;
++
++  @Test
++  public void test() throws Exception {
++    waitForThingsToLevelOut(30000);
++
++    log.info("DistributedVersionInfoTest RUNNING");
++
++    testReplicaVersionHandling();
++
++    log.info("DistributedVersionInfoTest succeeded ... shutting down now!");
++  }
++
++  protected void testReplicaVersionHandling() throws Exception {
++    final String testCollectionName = "c8n_vers_1x3";
++    String shardId = "shard1";
++    int rf = 3;
++    createCollectionRetry(testCollectionName, 1, rf, 1);
++    cloudClient.setDefaultCollection(testCollectionName);
++
++    final Replica leader = cloudClient.getZkStateReader().getLeaderRetry(testCollectionName, shardId);
++    List<Replica> notLeaders =
++        ensureAllReplicasAreActive(testCollectionName, shardId, 1, rf, maxWaitSecsToSeeAllActive);
++
++    sendDoc(1);
++    cloudClient.commit();
++
++    // verify doc is on the leader and replica
++    assertDocsExistInAllReplicas(notLeaders, testCollectionName, 1, 1, null);
++
++    // get max version from the leader and replica
++    Replica replica = notLeaders.get(0);
++    Long maxOnLeader = getMaxVersionFromIndex(leader);
++    Long maxOnReplica = getMaxVersionFromIndex(replica);
++    assertEquals("leader and replica should have same max version: " + maxOnLeader, maxOnLeader, maxOnReplica);
++
++    // send the same doc but with a lower version than the max in the index
++    try (SolrClient client = new HttpSolrClient(replica.getCoreUrl())) {
++      String docId = String.valueOf(1);
++      SolrInputDocument doc = new SolrInputDocument();
++      doc.setField(id, docId);
++      doc.setField("_version_", maxOnReplica - 1); // bad version!!!
++
++      // simulate what the leader does when sending a doc to a replica
++      ModifiableSolrParams params = new ModifiableSolrParams();
++      params.set(DISTRIB_UPDATE_PARAM, DistributedUpdateProcessor.DistribPhase.FROMLEADER.toString());
++      params.set(DISTRIB_FROM, leader.getCoreUrl());
++
++      UpdateRequest req = new UpdateRequest();
++      req.setParams(params);
++      req.add(doc);
++
++      log.info("Sending doc with out-of-date version ("+(maxOnReplica -1)+") document directly to replica");
++
++      client.request(req);
++      client.commit();
++
++      Long docVersion = getVersionFromIndex(replica, docId);
++      assertEquals("older version should have been thrown away", maxOnReplica, docVersion);
++    }
++
++    reloadCollection(leader, testCollectionName);
++
++    maxOnLeader = getMaxVersionFromIndex(leader);
++    maxOnReplica = getMaxVersionFromIndex(replica);
++    assertEquals("leader and replica should have same max version after reload", maxOnLeader, maxOnReplica);
++
++    // now start sending docs while collection is reloading
++
++    delQ("*:*");
++    commit();
++
++    final Set<Integer> deletedDocs = new HashSet<>();
++    final AtomicInteger docsSent = new AtomicInteger(0);
++    final Random rand = new Random(5150);
++    Thread docSenderThread = new Thread() {
++      public void run() {
++
++        // brief delay before sending docs
++        try {
++          Thread.sleep(rand.nextInt(30)+1);
++        } catch (InterruptedException e) {}
++
++        for (int i=0; i < 1000; i++) {
++          if (i % (rand.nextInt(20)+1) == 0) {
++            try {
++              Thread.sleep(rand.nextInt(50)+1);
++            } catch (InterruptedException e) {}
++          }
++
++          int docId = i+1;
++          try {
++            sendDoc(docId);
++            docsSent.incrementAndGet();
++          } catch (Exception e) {}
++        }
++      }
++    };
++
++    Thread reloaderThread = new Thread() {
++      public void run() {
++        try {
++          Thread.sleep(rand.nextInt(300)+1);
++        } catch (InterruptedException e) {}
++
++        for (int i=0; i < 3; i++) {
++          try {
++            reloadCollection(leader, testCollectionName);
++          } catch (Exception e) {}
++
++          try {
++            Thread.sleep(rand.nextInt(300)+300);
++          } catch (InterruptedException e) {}
++        }
++      }
++    };
++
++    Thread deleteThread = new Thread() {
++      public void run() {
++
++        // brief delay before sending docs
++        try {
++          Thread.sleep(500);
++        } catch (InterruptedException e) {}
++
++        for (int i=0; i < 200; i++) {
++          try {
++            Thread.sleep(rand.nextInt(50)+1);
++          } catch (InterruptedException e) {}
++
++          int docToDelete = rand.nextInt(docsSent.get())+1;
++          if (!deletedDocs.contains(docToDelete)) {
++            delI(String.valueOf(docToDelete));
++            deletedDocs.add(docToDelete);
++          }
++        }
++      }
++    };
++
++    Thread committerThread = new Thread() {
++      public void run() {
++        try {
++          Thread.sleep(rand.nextInt(200)+1);
++        } catch (InterruptedException e) {}
++
++        for (int i=0; i < 20; i++) {
++          try {
++            cloudClient.commit();
++          } catch (Exception e) {}
++
++          try {
++            Thread.sleep(rand.nextInt(100)+100);
++          } catch (InterruptedException e) {}
++        }
++      }
++    };
++
++
++    docSenderThread.start();
++    reloaderThread.start();
++    committerThread.start();
++    deleteThread.start();
++
++    docSenderThread.join();
++    reloaderThread.join();
++    committerThread.join();
++    deleteThread.join();
++
++    cloudClient.commit();
++
++    log.info("\n\n\n Total of "+deletedDocs.size()+" docs deleted \n\n\n");
++
++    maxOnLeader = getMaxVersionFromIndex(leader);
++    maxOnReplica = getMaxVersionFromIndex(replica);
++    assertEquals("leader and replica should have same max version before reload", maxOnLeader, maxOnReplica);
++
++    reloadCollection(leader, testCollectionName);
++
++    maxOnLeader = getMaxVersionFromIndex(leader);
++    maxOnReplica = getMaxVersionFromIndex(replica);
++    assertEquals("leader and replica should have same max version after reload", maxOnLeader, maxOnReplica);
++
++    assertDocsExistInAllReplicas(notLeaders, testCollectionName, 1, 1000, deletedDocs);
++
++    // try to clean up
++    try {
++      CollectionAdminRequest.Delete req = new CollectionAdminRequest.Delete();
++      req.setCollectionName(testCollectionName);
++      req.process(cloudClient);
++    } catch (Exception e) {
++      // don't fail the test
++      log.warn("Could not delete collection {} after test completed", testCollectionName);
++    }
++  }
++
++  protected long getMaxVersionFromIndex(Replica replica) throws IOException, SolrServerException {
++    return getVersionFromIndex(replica, null);
++  }
++
++  protected long getVersionFromIndex(Replica replica, String docId) throws IOException, SolrServerException {
++    Long vers = null;
++    String queryStr = (docId != null) ? "id:" + docId : "_version_:[0 TO *]";
++    SolrQuery query = new SolrQuery(queryStr);
++    query.setRows(1);
++    query.setFields("id", "_version_");
++    query.addSort(new SolrQuery.SortClause("_version_", SolrQuery.ORDER.desc));
++    query.setParam("distrib", false);
++
++    try (SolrClient client = new HttpSolrClient(replica.getCoreUrl())) {
++      QueryResponse qr = client.query(query);
++      SolrDocumentList hits = qr.getResults();
++      if (hits.isEmpty())
++        fail("No results returned from query: "+query);
++
++      vers = (Long) hits.get(0).getFirstValue("_version_");
++    }
++
++    if (vers == null)
++      fail("Failed to get version using query " + query + " from " + replica.getCoreUrl());
++
++    return vers.longValue();
++  }
++
++  private void createCollectionRetry(String testCollectionName, int numShards, int replicationFactor, int maxShardsPerNode)
++      throws SolrServerException, IOException {
++    CollectionAdminResponse resp = createCollection(testCollectionName, numShards, replicationFactor, maxShardsPerNode);
++    if (resp.getResponse().get("failure") != null) {
++      CollectionAdminRequest.Delete req = new CollectionAdminRequest.Delete();
++      req.setCollectionName(testCollectionName);
++      req.process(cloudClient);
++
++      resp = createCollection(testCollectionName, numShards, replicationFactor, maxShardsPerNode);
++
++      if (resp.getResponse().get("failure") != null) {
++        fail("Could not create " + testCollectionName);
++      }
++    }
++  }
++
++  protected void assertDocsExistInAllReplicas(List<Replica> notLeaders,
++                                              String testCollectionName,
++                                              int firstDocId,
++                                              int lastDocId,
++                                              Set<Integer> deletedDocs)
++      throws Exception
++  {
++    Replica leader =
++        cloudClient.getZkStateReader().getLeaderRetry(testCollectionName, "shard1", 10000);
++    HttpSolrClient leaderSolr = getHttpSolrClient(leader);
++    List<HttpSolrClient> replicas = new ArrayList<HttpSolrClient>(notLeaders.size());
++    for (Replica r : notLeaders)
++      replicas.add(getHttpSolrClient(r));
++
++    try {
++      for (int d = firstDocId; d <= lastDocId; d++) {
++
++        if (deletedDocs != null && deletedDocs.contains(d))
++          continue;
++
++        String docId = String.valueOf(d);
++        Long leaderVers = assertDocExists(leaderSolr, testCollectionName, docId, null);
++        for (HttpSolrClient replicaSolr : replicas)
++          assertDocExists(replicaSolr, testCollectionName, docId, leaderVers);
++      }
++    } finally {
++      if (leaderSolr != null) {
++        leaderSolr.close();
++      }
++      for (HttpSolrClient replicaSolr : replicas) {
++        replicaSolr.close();
++      }
++    }
++  }
++
++  protected HttpSolrClient getHttpSolrClient(Replica replica) throws Exception {
++    return new HttpSolrClient(replica.getCoreUrl());
++  }
++
++  protected void sendDoc(int docId) throws Exception {
++    SolrInputDocument doc = new SolrInputDocument();
++    doc.addField(id, String.valueOf(docId));
++    doc.addField("a_t", "hello" + docId);
++    sendDocsWithRetry(Collections.singletonList(doc), 2, 3, 100);
++  }
++
++  /**
++   * Query the real-time get handler for a specific doc by ID to verify it
++   * exists in the provided server, using distrib=false so it doesn't route to another replica.
++   */
++  @SuppressWarnings("rawtypes")
++  protected Long assertDocExists(HttpSolrClient solr, String coll, String docId, Long expVers) throws Exception {
++    QueryRequest qr = new QueryRequest(params("qt", "/get", "id", docId, "distrib", "false", "fl", "id,_version_"));
++    NamedList rsp = solr.request(qr);
++    SolrDocument doc = (SolrDocument)rsp.get("doc");
++    String match = JSONTestUtil.matchObj("/id", doc, new Integer(docId));
++    assertTrue("Doc with id=" + docId + " not found in " + solr.getBaseURL() +
++        " due to: " + match + "; rsp=" + rsp, match == null);
++
++    Long vers = (Long)doc.getFirstValue("_version_");
++    assertNotNull(vers);
++    if (expVers != null)
++      assertEquals("expected version of doc "+docId+" to be "+expVers, expVers, vers);
++
++    return vers;
++  }
++
++  protected boolean reloadCollection(Replica replica, String testCollectionName) throws Exception {
++    ZkCoreNodeProps coreProps = new ZkCoreNodeProps(replica);
++    String coreName = coreProps.getCoreName();
++    boolean reloadedOk = false;
++    try (HttpSolrClient client = new HttpSolrClient(coreProps.getBaseUrl())) {
++      CoreAdminResponse statusResp = CoreAdminRequest.getStatus(coreName, client);
++      long leaderCoreStartTime = statusResp.getStartTime(coreName).getTime();
++
++      Thread.sleep(1000);
++
++      // send reload command for the collection
++      log.info("Sending RELOAD command for " + testCollectionName);
++      ModifiableSolrParams params = new ModifiableSolrParams();
++      params.set("action", CollectionParams.CollectionAction.RELOAD.toString());
++      params.set("name", testCollectionName);
++      QueryRequest request = new QueryRequest(params);
++      request.setPath("/admin/collections");
++
++      log.info("Sending reload command to " + testCollectionName);
++
++      client.request(request);
++      Thread.sleep(2000); // reload can take a short while
++
++      // verify reload is done, waiting up to 30 seconds for slow test environments
++      long timeout = System.nanoTime() + TimeUnit.NANOSECONDS.convert(30, TimeUnit.SECONDS);
++      while (System.nanoTime() < timeout) {
++        statusResp = CoreAdminRequest.getStatus(coreName, client);
++        long startTimeAfterReload = statusResp.getStartTime(coreName).getTime();
++        if (startTimeAfterReload > leaderCoreStartTime) {
++          reloadedOk = true;
++          break;
++        }
++        // else ... still waiting to see the reloaded core report a later start time
++        Thread.sleep(1000);
++      }
++    }
++    return reloadedOk;
++  }
++}
+diff --git a/solr/core/src/test/org/apache/solr/update/VersionInfoTest.java b/solr/core/src/test/org/apache/solr/update/VersionInfoTest.java
+new file mode 100644
+index 0000000..2c451db
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/update/VersionInfoTest.java
+@@ -0,0 +1,133 @@
++package org.apache.solr.update;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.util.BytesRef;
++import org.apache.solr.SolrTestCaseJ4;
++import org.apache.solr.common.util.Hash;
++import org.apache.solr.core.CoreContainer;
++import org.apache.solr.request.SolrQueryRequest;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class VersionInfoTest extends SolrTestCaseJ4 {
++
++  @Test
++  public void testMaxIndexedVersionFromIndex() throws Exception {
++    initCore("solrconfig-tlog.xml", "schema-version-indexed.xml");
++    try {
++      testMaxVersionLogic(req());
++    } finally {
++      deleteCore();
++    }
++  }
++
++  @Test
++  public void testMaxDocValuesVersionFromIndex() throws Exception {
++    initCore("solrconfig-tlog.xml","schema-version-dv.xml");
++    try {
++      testMaxVersionLogic(req());
++    } finally {
++      deleteCore();
++    }
++  }
++
++  protected void testMaxVersionLogic(SolrQueryRequest req) throws Exception {
++    UpdateHandler uhandler = req.getCore().getUpdateHandler();
++    UpdateLog ulog = uhandler.getUpdateLog();
++    ulog.init(uhandler, req.getCore());
++
++    clearIndex();
++    assertU(commit());
++
++    // index the first doc
++    String docId = Integer.toString(1);
++    assertU(adoc("id", docId));
++    assertU(commit());
++
++    // max from index should not be 0 or null
++    Long maxVersionFromIndex = ulog.getMaxVersionFromIndex();
++    assertNotNull(maxVersionFromIndex);
++    assertTrue(maxVersionFromIndex != 0L);
++
++    // version from index should be less than or equal the version of the first doc indexed
++    VersionInfo vInfo = ulog.getVersionInfo();
++    Long version = vInfo.getVersionFromIndex(new BytesRef(docId));
++    assertNotNull("version info should not be null for test doc: "+docId, version);
++    assertTrue("max version from index should be less than or equal to the version of first doc added, diff: "+
++            (version - maxVersionFromIndex), maxVersionFromIndex <= version);
++
++    BytesRef idBytes = new BytesRef(docId);
++    int bucketHash = Hash.murmurhash3_x86_32(idBytes.bytes, idBytes.offset, idBytes.length, 0);
++    VersionBucket bucket = vInfo.bucket(bucketHash);
++    assertTrue(bucket.highest == version.longValue());
++
++    // send 2nd doc ...
++    docId = Integer.toString(2);
++    assertU(adoc("id", docId));
++    assertU(commit());
++
++    maxVersionFromIndex = ulog.getMaxVersionFromIndex();
++    assertNotNull(maxVersionFromIndex);
++    assertTrue(maxVersionFromIndex != 0L);
++
++    vInfo = ulog.getVersionInfo();
++    version = vInfo.getVersionFromIndex(new BytesRef(docId));
++    assertNotNull("version info should not be null for test doc: "+docId, version);
++    assertTrue("max version from index should be less than version of last doc added, diff: "+
++            (version - maxVersionFromIndex), maxVersionFromIndex < version);
++
++    idBytes = new BytesRef(docId);
++    bucketHash = Hash.murmurhash3_x86_32(idBytes.bytes, idBytes.offset, idBytes.length, 0);
++    bucket = vInfo.bucket(bucketHash);
++    assertTrue(bucket.highest == version.longValue());
++
++    Long versionFromTLog = ulog.lookupVersion(idBytes);
++    Long versionFromIndex = vInfo.getVersionFromIndex(idBytes);
++    assertEquals("version from tlog and version from index should be the same",
++        versionFromTLog, versionFromIndex);
++
++    // reload the core, which should reset the max
++    CoreContainer coreContainer = req.getCore().getCoreDescriptor().getCoreContainer();
++    coreContainer.reload(req.getCore().getName());
++    maxVersionFromIndex = ulog.getMaxVersionFromIndex();
++    assertEquals("max version from index should be equal to version of last doc added after reload",
++        maxVersionFromIndex, version);
++
++    // one more doc after reload
++    docId = Integer.toString(3);
++    assertU(adoc("id", docId));
++    assertU(commit());
++
++    maxVersionFromIndex = ulog.getMaxVersionFromIndex();
++    assertNotNull(maxVersionFromIndex);
++    assertTrue(maxVersionFromIndex != 0L);
++
++    vInfo = ulog.getVersionInfo();
++    version = vInfo.getVersionFromIndex(new BytesRef(docId));
++    assertNotNull("version info should not be null for test doc: "+docId, version);
++    assertTrue("max version from index should be less than version of last doc added, diff: "+
++        (version - maxVersionFromIndex), maxVersionFromIndex < version);
++
++    idBytes = new BytesRef(docId);
++    bucketHash = Hash.murmurhash3_x86_32(idBytes.bytes, idBytes.offset, idBytes.length, 0);
++    bucket = vInfo.bucket(bucketHash);
++    assertTrue(bucket.highest == version.longValue());
++  }
++}
+

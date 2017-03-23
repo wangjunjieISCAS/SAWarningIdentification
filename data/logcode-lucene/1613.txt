@@ -1,0 +1,213 @@
+GitDiffStart: 3d633c6e68ec7a2e47d398daae203582537593a4 | Mon Mar 7 18:12:10 2016 -0500
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 16550c6..5e717d4 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -9,6 +9,11 @@ http://s.apache.org/luceneversions
+ ======================= Lucene 6.1.0 =======================
+ (No Changes)
+ 
++Optimizations
++
++* LUCENE-7071: Reduce bytes copying in OfflineSorter, giving ~10%
++  speedup on merging 2D LatLonPoint values (Mike McCandless)
++
+ ======================= Lucene 6.0.0 =======================
+ 
+ System Requirements
+diff --git a/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java b/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java
+index 5f8fd41..6bb12bd 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java
++++ b/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java
+@@ -280,6 +280,28 @@ public final class ByteBlockPool {
+     return newUpto+3;
+   }
+ 
++  /** Fill the provided {@link BytesRef} with the bytes at the specified offset/length slice.
++   *  This will avoid copying the bytes, if the slice fits into a single block; otherwise, it uses
++   *  the provided {@linkl BytesRefBuilder} to copy bytes over. */
++  void setBytesRef(BytesRefBuilder builder, BytesRef result, long offset, int length) {
++    result.length = length;
++
++    int bufferIndex = (int) (offset >> BYTE_BLOCK_SHIFT);
++    byte[] buffer = buffers[bufferIndex];
++    int pos = (int) (offset & BYTE_BLOCK_MASK);
++    if (pos + length <= BYTE_BLOCK_SIZE) {
++      // common case where the slice lives in a single block: just reference the buffer directly without copying
++      result.bytes = buffer;
++      result.offset = pos;
++    } else {
++      // uncommon case: the slice spans at least 2 blocks, so we must copy the bytes:
++      builder.grow(length);
++      result.bytes = builder.get().bytes;
++      result.offset = 0;
++      readBytes(offset, result.bytes, 0, length);
++    }
++  }
++
+   // Fill in a BytesRef from term's length & bytes encoded in
+   // byte block
+   public void setBytesRef(BytesRef term, int textStart) {
+diff --git a/lucene/core/src/java/org/apache/lucene/util/BytesRefArray.java b/lucene/core/src/java/org/apache/lucene/util/BytesRefArray.java
+index 47ca52b..a19b7da 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/BytesRefArray.java
++++ b/lucene/core/src/java/org/apache/lucene/util/BytesRefArray.java
+@@ -108,7 +108,23 @@ public final class BytesRefArray {
+     }
+     throw new IndexOutOfBoundsException("index " + index
+         + " must be less than the size: " + lastElement);
+-    
++  }
++
++  /** Used only by sort below, to set a {@link BytesRef} with the specified slice, avoiding copying bytes in the common case when the slice
++   *  is contained in a single block in the byte block pool. */
++  private void setBytesRef(BytesRefBuilder spare, BytesRef result, int index) {
++    if (index < lastElement) {
++      int offset = offsets[index];
++      int length;
++      if (index == lastElement - 1) {
++        length = currentOffset - offset;
++      } else {
++        length = offsets[index + 1] - offset;
++      }
++      pool.setBytesRef(spare, result, offset, length);
++    } else {
++      throw new IndexOutOfBoundsException("index " + index + " must be less than the size: " + lastElement);
++    }
+   }
+   
+   private int[] sort(final Comparator<BytesRef> comp) {
+@@ -127,25 +143,30 @@ public final class BytesRefArray {
+       @Override
+       protected int compare(int i, int j) {
+         final int idx1 = orderedEntries[i], idx2 = orderedEntries[j];
+-        return comp.compare(get(scratch1, idx1), get(scratch2, idx2));
++        setBytesRef(scratch1, scratchBytes1, idx1);
++        setBytesRef(scratch2, scratchBytes2, idx2);
++        return comp.compare(scratchBytes1, scratchBytes2);
+       }
+       
+       @Override
+       protected void setPivot(int i) {
+         final int index = orderedEntries[i];
+-        pivot = get(pivotBuilder, index);
++        setBytesRef(pivotBuilder, pivot, index);
+       }
+       
+       @Override
+       protected int comparePivot(int j) {
+         final int index = orderedEntries[j];
+-        return comp.compare(pivot, get(scratch2, index));
++        setBytesRef(scratch2, scratchBytes2, index);
++        return comp.compare(pivot, scratchBytes2);
+       }
+ 
+-      private BytesRef pivot;
+-      private final BytesRefBuilder pivotBuilder = new BytesRefBuilder(),
+-          scratch1 = new BytesRefBuilder(),
+-          scratch2 = new BytesRefBuilder();
++      private final BytesRef pivot = new BytesRef();
++      private final BytesRef scratchBytes1 = new BytesRef();
++      private final BytesRef scratchBytes2 = new BytesRef();
++      private final BytesRefBuilder pivotBuilder = new BytesRefBuilder();
++      private final BytesRefBuilder scratch1 = new BytesRefBuilder();
++      private final BytesRefBuilder scratch2 = new BytesRefBuilder();
+     }.sort(0, size());
+     return orderedEntries;
+   }
+@@ -173,6 +194,7 @@ public final class BytesRefArray {
+    */
+   public BytesRefIterator iterator(final Comparator<BytesRef> comp) {
+     final BytesRefBuilder spare = new BytesRefBuilder();
++    final BytesRef result = new BytesRef();
+     final int size = size();
+     final int[] indices = comp == null ? null : sort(comp);
+     return new BytesRefIterator() {
+@@ -181,7 +203,8 @@ public final class BytesRefArray {
+       @Override
+       public BytesRef next() {
+         if (pos < size) {
+-          return get(spare, indices == null ? pos++ : indices[pos++]);
++          setBytesRef(spare, result, indices == null ? pos++ : indices[pos++]);
++          return result;
+         }
+         return null;
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java b/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java
+index 283dc1f..18e421b 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/OfflineSorter.java
+@@ -282,7 +282,6 @@ public class OfflineSorter {
+ 
+   /** Sort a single partition in-memory. */
+   protected String sortPartition(TrackingDirectoryWrapper trackingDir) throws IOException {
+-    BytesRefArray data = this.buffer;
+ 
+     try (IndexOutput tempFile = trackingDir.createTempOutput(tempFileNamePrefix, "sort", IOContext.DEFAULT);
+          ByteSequencesWriter out = getWriter(tempFile);) {
+@@ -299,7 +298,7 @@ public class OfflineSorter {
+       }
+       
+       // Clean up the buffer for the next partition.
+-      data.clear();
++      buffer.clear();
+ 
+       return tempFile.getName();
+     }
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java
+index 2be1759..bc71e45 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/SortedInputIterator.java
+@@ -146,6 +146,7 @@ public class SortedInputIterator implements InputIterator {
+     @Override
+     public int compare(BytesRef left, BytesRef right) {
+       // Make shallow copy in case decode changes the BytesRef:
++      assert left != right;
+       leftScratch.bytes = left.bytes;
+       leftScratch.offset = left.offset;
+       leftScratch.length = left.length;
+@@ -245,24 +246,24 @@ public class SortedInputIterator implements InputIterator {
+   
+   /** decodes the weight at the current position */
+   protected long decode(BytesRef scratch, ByteArrayDataInput tmpInput) {
+-    tmpInput.reset(scratch.bytes);
++    tmpInput.reset(scratch.bytes, scratch.offset, scratch.length);
+     tmpInput.skipBytes(scratch.length - 8); // suggestion
+-    scratch.length -= 8; // long
++    scratch.length -= Long.BYTES; // long
+     return tmpInput.readLong();
+   }
+   
+   /** decodes the contexts at the current position */
+   protected Set<BytesRef> decodeContexts(BytesRef scratch, ByteArrayDataInput tmpInput) {
+-    tmpInput.reset(scratch.bytes);
++    tmpInput.reset(scratch.bytes, scratch.offset, scratch.length);
+     tmpInput.skipBytes(scratch.length - 2); //skip to context set size
+     short ctxSetSize = tmpInput.readShort();
+     scratch.length -= 2;
+     final Set<BytesRef> contextSet = new HashSet<>();
+     for (short i = 0; i < ctxSetSize; i++) {
+-      tmpInput.setPosition(scratch.length - 2);
++      tmpInput.setPosition(scratch.offset + scratch.length - 2);
+       short curContextLength = tmpInput.readShort();
+       scratch.length -= 2;
+-      tmpInput.setPosition(scratch.length - curContextLength);
++      tmpInput.setPosition(scratch.offset + scratch.length - curContextLength);
+       BytesRef contextSpare = new BytesRef(curContextLength);
+       tmpInput.readBytes(contextSpare.bytes, 0, curContextLength);
+       contextSpare.length = curContextLength;
+@@ -274,10 +275,11 @@ public class SortedInputIterator implements InputIterator {
+   
+   /** decodes the payload at the current position */
+   protected BytesRef decodePayload(BytesRef scratch, ByteArrayDataInput tmpInput) {
+-    tmpInput.reset(scratch.bytes);
++    tmpInput.reset(scratch.bytes, scratch.offset, scratch.length);
+     tmpInput.skipBytes(scratch.length - 2); // skip to payload size
+     short payloadLength = tmpInput.readShort(); // read payload size
+-    tmpInput.setPosition(scratch.length - 2 - payloadLength); // setPosition to start of payload
++    assert payloadLength >= 0: payloadLength;
++    tmpInput.setPosition(scratch.offset + scratch.length - 2 - payloadLength); // setPosition to start of payload
+     BytesRef payloadScratch = new BytesRef(payloadLength); 
+     tmpInput.readBytes(payloadScratch.bytes, 0, payloadLength); // read payload
+     payloadScratch.length = payloadLength;
+

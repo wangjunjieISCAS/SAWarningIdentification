@@ -1,0 +1,535 @@
+GitDiffStart: ccc91689b25668d4f3eccf1ecbfecfe9f669170b | Fri Sep 3 17:12:26 2010 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index d784511..365399d 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -288,6 +288,12 @@ Optimizations
+ * SOLR-2046: Simplify legacy replication scripts by adding common functions
+   to scripts-util. (koji)
+ 
++* SOLR-2092: Speed up single-valued and multi-valued "fc" faceting. Typical
++  improvement is 5%, but can be much greater (up to 10x faster) when facet.offset
++  is very large (deep paging). (yonik)
++
++
++
+ Bug Fixes
+ ----------------------
+ 
+diff --git a/solr/src/java/org/apache/solr/request/SimpleFacets.java b/solr/src/java/org/apache/solr/request/SimpleFacets.java
+index 4e462a0..1173f6d 100644
+--- a/solr/src/java/org/apache/solr/request/SimpleFacets.java
++++ b/solr/src/java/org/apache/solr/request/SimpleFacets.java
+@@ -44,6 +44,7 @@ import org.apache.solr.util.BoundedTreeSet;
+ import org.apache.solr.util.ByteUtils;
+ import org.apache.solr.util.DateMathParser;
+ import org.apache.solr.handler.component.ResponseBuilder;
++import org.apache.solr.util.LongPriorityQueue;
+ 
+ import java.io.IOException;
+ import java.util.*;
+@@ -416,9 +417,9 @@ public class SimpleFacets {
+     }
+ 
+     final int nTerms=endTermIndex-startTermIndex;
++    int missingCount = -1; 
+ 
+     CharArr spare = new CharArr();
+-
+     if (nTerms>0 && docs.size() >= mincount) {
+ 
+       // count collection array only needs to be as big as the number of terms we are
+@@ -475,6 +476,10 @@ public class SimpleFacets {
+         }
+       }
+ 
++      if (startTermIndex == 0) {
++        missingCount = counts[0];
++      }
++
+       // IDEA: we could also maintain a count of "other"... everything that fell outside
+       // of the top 'N'
+ 
+@@ -484,7 +489,8 @@ public class SimpleFacets {
+       if (sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY)) {
+         int maxsize = limit>0 ? offset+limit : Integer.MAX_VALUE-1;
+         maxsize = Math.min(maxsize, nTerms);
+-        final BoundedTreeSet<CountPair<BytesRef,Integer>> queue = new BoundedTreeSet<CountPair<BytesRef,Integer>>(maxsize);
++        LongPriorityQueue queue = new LongPriorityQueue(Math.min(maxsize,1000), maxsize, Long.MIN_VALUE);
++
+         int min=mincount-1;  // the smallest value in the top 'N' values
+         for (int i=(startTermIndex==0)?1:0; i<nTerms; i++) {
+           int c = counts[i];
+@@ -492,18 +498,33 @@ public class SimpleFacets {
+             // NOTE: we use c>min rather than c>=min as an optimization because we are going in
+             // index order, so we already know that the keys are ordered.  This can be very
+             // important if a lot of the counts are repeated (like zero counts would be).
+-            queue.add(new CountPair<BytesRef,Integer>(si.lookup(startTermIndex+i, new BytesRef()), c));
+-            if (queue.size()>=maxsize) min=queue.last().val;
++
++            // smaller term numbers sort higher, so subtract the term number instead
++            long pair = (((long)c)<<32) + (Integer.MAX_VALUE - i);
++            boolean displaced = queue.insert(pair);
++            if (displaced) min=(int)(queue.top() >>> 32);
+           }
+         }
+-        // now select the right page from the results
+-        for (CountPair<BytesRef,Integer> p : queue) {
+-          if (--off>=0) continue;
+-          if (--lim<0) break;
++
++        // if we are deep paging, we don't have to order the highest "offset" counts.
++        int collectCount = Math.max(0, queue.size() - off);
++        assert collectCount < lim;
++
++        // the start and end indexes of our list "sorted" (starting with the highest value)
++        int sortedIdxStart = queue.size() - (collectCount - 1);
++        int sortedIdxEnd = queue.size() + 1;
++        final long[] sorted = queue.sort(collectCount);
++
++        for (int i=sortedIdxStart; i<sortedIdxEnd; i++) {
++          long pair = sorted[i];
++          int c = (int)(pair >>> 32);
++          int tnum = Integer.MAX_VALUE - (int)pair;
++
+           spare.reset();
+-          ft.indexedToReadable(p.key, spare);
+-          res.add(spare.toString(), p.val);
++          ft.indexedToReadable(si.lookup(startTermIndex+tnum, br), spare);
++          res.add(spare.toString(), c);
+         }
++      
+       } else {
+         // add results in index order
+         int i=(startTermIndex==0)?1:0;
+@@ -526,7 +547,10 @@ public class SimpleFacets {
+     }
+ 
+     if (missing) {
+-      res.add(null, getFieldMissingCount(searcher,docs,fieldName));
++      if (missingCount < 0) {
++        missingCount = getFieldMissingCount(searcher,docs,fieldName);
++      }
++      res.add(null, missingCount);
+     }
+     
+     return res;
+diff --git a/solr/src/java/org/apache/solr/request/UnInvertedField.java b/solr/src/java/org/apache/solr/request/UnInvertedField.java
+index 0c470bc..1a0ae8a 100755
+--- a/solr/src/java/org/apache/solr/request/UnInvertedField.java
++++ b/solr/src/java/org/apache/solr/request/UnInvertedField.java
+@@ -37,6 +37,7 @@ import org.apache.solr.core.SolrCore;
+ import org.apache.solr.schema.FieldType;
+ import org.apache.solr.schema.TrieField;
+ import org.apache.solr.search.*;
++import org.apache.solr.util.LongPriorityQueue;
+ import org.apache.solr.util.PrimUtils;
+ import org.apache.solr.util.BoundedTreeSet;
+ import org.apache.solr.handler.component.StatsValues;
+@@ -470,7 +471,9 @@ public class UnInvertedField {
+     if (baseSize >= mincount) {
+ 
+       final int[] index = this.index;
+-      final int[] counts = new int[numTermsInField];
++      // tricky: we add more more element than we need because we will reuse this array later
++      // for ordering term ords before converting to term labels.
++      final int[] counts = new int[numTermsInField + 1];
+ 
+       //
+       // If there is prefix, find it's start and end term numbers
+@@ -575,7 +578,8 @@ public class UnInvertedField {
+       if (sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY)) {
+         int maxsize = limit>0 ? offset+limit : Integer.MAX_VALUE-1;
+         maxsize = Math.min(maxsize, numTermsInField);
+-        final BoundedTreeSet<Long> queue = new BoundedTreeSet<Long>(maxsize);
++        LongPriorityQueue queue = new LongPriorityQueue(Math.min(maxsize,1000), maxsize, Long.MIN_VALUE);
++
+         int min=mincount-1;  // the smallest value in the top 'N' values
+         for (int i=startTerm; i<endTerm; i++) {
+           int c = doNegative ? maxTermCounts[i] - counts[i] : counts[i];
+@@ -584,55 +588,63 @@ public class UnInvertedField {
+             // index order, so we already know that the keys are ordered.  This can be very
+             // important if a lot of the counts are repeated (like zero counts would be).
+ 
+-            // minimize object creation and speed comparison by creating a long that
+-            // encompasses both count and term number.
+-            // Since smaller values are kept in the TreeSet, make higher counts smaller.
+-            //
+-            //   for equal counts, lower term numbers
+-            // should come first and hence be "greater"
+-
+-            //long pair = (((long)c)<<32) | (0x7fffffff-i) ;   // use if priority queue
+-            long pair = (((long)-c)<<32) | i;
+-            queue.add(new Long(pair));
+-            if (queue.size()>=maxsize) min=-(int)(queue.last().longValue() >>> 32);
++            // smaller term numbers sort higher, so subtract the term number instead
++            long pair = (((long)c)<<32) + (Integer.MAX_VALUE - i);
++            boolean displaced = queue.insert(pair);
++            if (displaced) min=(int)(queue.top() >>> 32);
+           }
+         }
++
+         // now select the right page from the results
+ 
++        // if we are deep paging, we don't have to order the highest "offset" counts.
++        int collectCount = Math.max(0, queue.size() - off);
++        assert collectCount < lim;
++
++        // the start and end indexes of our list "sorted" (starting with the highest value)
++        int sortedIdxStart = queue.size() - (collectCount - 1);
++        int sortedIdxEnd = queue.size() + 1;
++        final long[] sorted = queue.sort(collectCount);
+ 
+-        final int[] tnums = new int[Math.min(Math.max(0, queue.size()-off), lim)];
+         final int[] indirect = counts;  // reuse the counts array for the index into the tnums array
+-        assert indirect.length >= tnums.length;
+-        
+-        int tnumCount = 0;
++        assert indirect.length >= sortedIdxEnd;
++
++        for (int i=sortedIdxStart; i<sortedIdxEnd; i++) {
++          long pair = sorted[i];
++          int c = (int)(pair >>> 32);
++          int tnum = Integer.MAX_VALUE - (int)pair;
++
++          indirect[i] = i;   // store the index for indirect sorting
++          sorted[i] = tnum;  // reuse the "sorted" array to store the term numbers for indirect sorting
+ 
+-        for (Long p : queue) {
+-          if (--off>=0) continue;
+-          if (--lim<0) break;
+-          int c = -(int)(p.longValue() >>> 32);
+-          //int tnum = 0x7fffffff - (int)p.longValue();  // use if priority queue
+-          int tnum = (int)p.longValue();
+-          indirect[tnumCount] = tnumCount;
+-          tnums[tnumCount++] = tnum;
+-          // String label = ft.indexedToReadable(getTermText(te, tnum));
+           // add a null label for now... we'll fill it in later.
+           res.add(null, c);
+         }
+ 
+         // now sort the indexes by the term numbers
+-        PrimUtils.sort(0, tnumCount, indirect, new PrimUtils.IntComparator() {
++        PrimUtils.sort(sortedIdxStart, sortedIdxEnd, indirect, new PrimUtils.IntComparator() {
+           @Override
+           public int compare(int a, int b) {
+-            return tnums[a] - tnums[b];
++            return (int)sorted[a] - (int)sorted[b];
++          }
++
++          @Override
++          public boolean lessThan(int a, int b) {
++            return sorted[a] < sorted[b];
++          }
++
++          @Override
++          public boolean equals(int a, int b) {
++            return sorted[a] == sorted[b];
+           }
+         });
+ 
+         // convert the term numbers to term values and set as the label
+-        for (int i=0; i<tnumCount; i++) {
++        for (int i=sortedIdxStart; i<sortedIdxEnd; i++) {
+           int idx = indirect[i];
+-          int tnum = tnums[idx];
+-          String label = getReadableValue(getTermValue(te, tnum), ft, spare);          
+-          res.setName(idx, label);
++          int tnum = (int)sorted[idx];
++          String label = getReadableValue(getTermValue(te, tnum), ft, spare);
++          res.setName(idx - sortedIdxStart, label);
+         }
+ 
+       } else {
+diff --git a/solr/src/java/org/apache/solr/util/LongPriorityQueue.java b/solr/src/java/org/apache/solr/util/LongPriorityQueue.java
+new file mode 100755
+index 0000000..f0f04ae
+--- /dev/null
++++ b/solr/src/java/org/apache/solr/util/LongPriorityQueue.java
+@@ -0,0 +1,235 @@
++package org.apache.solr.util;
++
++import java.util.Arrays;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/** A native long priority queue.
++ * 
++ * @lucene.internal
++*/
++public class LongPriorityQueue {
++  protected int size;             // number of elements currently in the queue
++  protected int currentCapacity;  // number of elements the queue can hold w/o expanding
++  protected int maxSize;          // max number of elements allowed in the queue 
++  protected long[] heap;
++  protected final long sentinel;   // represents a null return value
++
++  public LongPriorityQueue(int initialSize, int maxSize, long sentinel) {
++    this.maxSize = maxSize;
++    this.sentinel = sentinel;
++    initialize(initialSize);
++  }
++
++
++  protected void initialize(int sz) {
++    int heapSize;
++    if (0 == sz)
++      // We allocate 1 extra to avoid if statement in top()
++      heapSize = 2;
++    else {
++      // NOTE: we add +1 because all access to heap is
++      // 1-based not 0-based.  heap[0] is unused.
++      heapSize = Math.max(sz, sz + 1); // handle overflow
++    }
++    heap = new long[heapSize];
++    currentCapacity = sz;
++  }
++
++  public int getCurrentCapacity() {
++    return currentCapacity;
++  }
++
++  public void resize(int sz) {
++    int heapSize;
++    if (sz > maxSize) {
++      maxSize = sz;
++    }
++    if (0 == sz)
++      // We allocate 1 extra to avoid if statement in top()
++      heapSize = 2;
++    else {
++      heapSize = Math.max(sz, sz + 1); // handle overflow
++    }
++    heap = Arrays.copyOf(heap, heapSize);
++    currentCapacity = sz;
++  }
++
++  /**
++   * Adds an object to a PriorityQueue in log(size) time. If one tries to add
++   * more objects than maxSize from initialize an
++   * {@link ArrayIndexOutOfBoundsException} is thrown.
++   * 
++   * @return the new 'top' element in the queue.
++   */
++  public long add(long element) {
++    if (size >= currentCapacity) {
++      int newSize = Math.min(currentCapacity <<1, maxSize);
++      if (newSize < currentCapacity) newSize = Integer.MAX_VALUE;  // handle overflow
++      resize(newSize);
++    }
++    size++;
++    heap[size] = element;
++    upHeap();
++    return heap[1];
++  }
++
++ /**
++   * Adds an object to a PriorityQueue in log(size) time. If one tries to add
++   * more objects than the current capacity, an
++   * {@link ArrayIndexOutOfBoundsException} is thrown.
++   */
++  public void addNoCheck(long element) {
++    ++size;
++    heap[size] = element;
++    upHeap();
++  }
++
++  /**
++   * Adds an object to a PriorityQueue in log(size) time.
++   * It returns the smallest object (if any) that was
++   * dropped off the heap because it was full, or
++   * the sentinel value.
++   *
++   *  This can be
++   * the given parameter (in case it is smaller than the
++   * full heap's minimum, and couldn't be added), or another
++   * object that was previously the smallest value in the
++   * heap and now has been replaced by a larger one, or null
++   * if the queue wasn't yet full with maxSize elements.
++   */
++  public long insertWithOverflow(long element) {
++    if (size < maxSize) {
++      add(element);
++      return sentinel;
++    } else if (element > heap[1]) {
++      long ret = heap[1];
++      heap[1] = element;
++      updateTop();
++      return ret;
++    } else {
++      return element;
++    }
++  }
++
++  /** inserts the element and returns true if this element caused another element
++   * to be dropped from the queue. */
++  public boolean insert(long element) {
++    if (size < maxSize) {
++      add(element);
++      return false;
++    } else if (element > heap[1]) {
++      // long ret = heap[1];
++      heap[1] = element;
++      updateTop();
++      return true;
++    } else {
++      return false;
++    }
++  }
++
++  /** Returns the least element of the PriorityQueue in constant time. */
++  public long top() {
++    return heap[1];
++  }
++
++  /** Removes and returns the least element of the PriorityQueue in log(size)
++    time.  Only valid if size() > 0.
++   */
++  public long pop() {
++    long result = heap[1];	          // save first value
++    heap[1] = heap[size];	          // move last to first
++    size--;
++    downHeap();				  // adjust heap
++    return result;
++  }
++  
++  /**
++   * Should be called when the Object at top changes values.
++   * @return the new 'top' element.
++   */
++  public long updateTop() {
++    downHeap();
++    return heap[1];
++  }
++
++  /** Returns the number of elements currently stored in the PriorityQueue. */
++  public int size() {
++    return size;
++  }
++
++  /** Returns the array used to hold the heap, with the smallest item at array[1]
++   *  and the last (but not necessarily largest) at array[size()].  This is *not*
++   *  fully sorted.
++   */
++  public long[] getInternalArray() {
++    return heap;
++  }
++
++  /** Pops the smallest n items from the heap, placing them in the internal array at
++   *  arr[size] through arr[size-(n-1)] with the smallest (first element popped)
++   *  being at arr[size].  The internal array is returned.
++   */
++  public long[] sort(int n) {
++    while (--n >= 0) {
++      long result = heap[1];	          // save first value
++      heap[1] = heap[size];	          // move last to first
++      heap[size] = result;                  // place it last
++      size--;
++      downHeap();				  // adjust heap
++    }
++    return heap;
++  }
++
++  /** Removes all entries from the PriorityQueue. */
++  public void clear() {
++    size = 0;
++  }
++
++  private void upHeap() {
++    int i = size;
++    long node = heap[i];			  // save bottom node
++    int j = i >>> 1;
++    while (j > 0 && node < heap[j]) {
++      heap[i] = heap[j];			  // shift parents down
++      i = j;
++      j = j >>> 1;
++    }
++    heap[i] = node;				  // install saved node
++  }
++
++  private void downHeap() {
++    int i = 1;
++    long node = heap[i];			  // save top node
++    int j = i << 1;				  // find smaller child
++    int k = j + 1;
++    if (k <= size && heap[k] < heap[j]) {
++      j = k;
++    }
++    while (j <= size && heap[j] < node) {
++      heap[i] = heap[j];			  // shift up child
++      i = j;
++      j = i << 1;
++      k = j + 1;
++      if (k <= size && heap[k] < heap[j]) {
++        j = k;
++      }
++    }
++    heap[i] = node;				  // install saved node
++  }
++}
+diff --git a/solr/src/test/org/apache/solr/util/PrimUtilsTest.java b/solr/src/test/org/apache/solr/util/PrimUtilsTest.java
+index 59a242f..4bcc8c5 100644
+--- a/solr/src/test/org/apache/solr/util/PrimUtilsTest.java
++++ b/solr/src/test/org/apache/solr/util/PrimUtilsTest.java
+@@ -51,4 +51,44 @@ public class PrimUtilsTest extends LuceneTestCase {
+     }
+   }
+ 
++  public void testLongPriorityQueue() {
++    int maxSize = 100;
++    long[] a = new long[maxSize];
++    long[] discards = new long[maxSize];
++
++    for (int iter=0; iter<100; iter++) {
++      int discardCount = 0;
++      int startSize = r.nextInt(maxSize) + 1;
++      int endSize = startSize==maxSize ? maxSize : startSize + r.nextInt(maxSize-startSize);
++      int adds = r.nextInt(maxSize+1);
++      // System.out.println("startSize=" + startSize + " endSize=" + endSize + " adds="+adds);
++      LongPriorityQueue pq = new LongPriorityQueue(startSize, endSize, Long.MIN_VALUE);
++
++      for (int i=0; i<adds; i++) {
++        long v = r.nextLong();
++        a[i] = v;
++        long out = pq.insertWithOverflow(v);
++        if (i < endSize) {
++          assertEquals(out, Long.MIN_VALUE);
++        } else {
++          discards[discardCount++] = out;
++        }
++      }
++      assertEquals(Math.min(adds,endSize), pq.size());
++      assertEquals(adds, pq.size() + discardCount);
++
++      Arrays.sort(a, 0, adds);
++      Arrays.sort(discards, 0, discardCount);
++      for (int i=0; i<discardCount; i++) {
++        assertEquals(a[i], discards[i]);
++      }
++
++      for (int i=discardCount; i<adds; i++) {
++        assertEquals(a[i], pq.pop());
++      }
++
++      assertEquals(0, pq.size());
++    }
++  }
++
+ }
+\ No newline at end of file
+

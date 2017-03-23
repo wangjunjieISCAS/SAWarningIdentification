@@ -1,0 +1,2240 @@
+GitDiffStart: d6823ef3746e7c7dba3aa64571d1ec04db620c0b | Mon Dec 18 16:45:29 2006 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index cc88a64..68eeae8 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -240,6 +240,15 @@ Bug fixes
+     "The handle is invalid" IOExceptions on Windows when trying to
+     close readers or writers. (Michael Busch via Mike McCandless).
+ 
++26. LUCENE-702: Fix IndexWriter.addIndexes(*) to not corrupt the index
++    on any exceptions (eg disk full).  The semantics of these methods
++    is now transactional: either all indices are merged or none are.
++    Also fixed IndexWriter.mergeSegments (called outside of
++    addIndexes(*) by addDocument, optimize, flushRamSegments) and
++    IndexReader.commit() (called by close) to clean up and keep the
++    instance state consistent to what's actually in the index (Mike
++    McCandless).
++
+ Optimizations
+ 
+   1. LUCENE-586: TermDocs.skipTo() is now more efficient for
+diff --git a/src/java/org/apache/lucene/index/IndexFileDeleter.java b/src/java/org/apache/lucene/index/IndexFileDeleter.java
+index 43f144a..bb60213 100644
+--- a/src/java/org/apache/lucene/index/IndexFileDeleter.java
++++ b/src/java/org/apache/lucene/index/IndexFileDeleter.java
+@@ -26,6 +26,8 @@ import java.io.IOException;
+ import java.io.PrintStream;
+ import java.util.Vector;
+ import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
+ 
+ /**
+  * A utility class (used by both IndexReader and
+@@ -35,7 +37,7 @@ import java.util.HashMap;
+  */
+ public class IndexFileDeleter {
+   private Vector deletable;
+-  private Vector pending;
++  private HashSet pending;
+   private Directory directory;
+   private SegmentInfos segmentInfos;
+   private PrintStream infoStream;
+@@ -45,6 +47,12 @@ public class IndexFileDeleter {
+     this.segmentInfos = segmentInfos;
+     this.directory = directory;
+   }
++  void setSegmentInfos(SegmentInfos segmentInfos) {
++    this.segmentInfos = segmentInfos;
++  }
++  SegmentInfos getSegmentInfos() {
++    return segmentInfos;
++  }
+ 
+   void setInfoStream(PrintStream infoStream) {
+     this.infoStream = infoStream;
+@@ -134,6 +142,10 @@ public class IndexFileDeleter {
+                 // This is an orphan'd separate norms file:
+                 doDelete = true;
+               }
++            } else if ("cfs".equals(extension) && !info.getUseCompoundFile()) {
++              // This is a partially written
++              // _segmentName.cfs:
++              doDelete = true;
+             }
+           }
+         }
+@@ -167,6 +179,30 @@ public class IndexFileDeleter {
+         deleteFiles(reader.files(), reader.directory()); // delete other files
+     }
+   }
++
++  /**
++   * Delete these segments, as long as they are not listed
++   * in protectedSegments.  If they are, then, instead, add
++   * them to the pending set.
++  */
++     
++  public final void deleteSegments(Vector segments, HashSet protectedSegments) throws IOException {
++
++    deleteFiles();                                // try to delete files that we couldn't before
++
++    for (int i = 0; i < segments.size(); i++) {
++      SegmentReader reader = (SegmentReader)segments.elementAt(i);
++      if (reader.directory() == this.directory) {
++        if (protectedSegments.contains(reader.getSegmentName())) {
++          addPendingFiles(reader.files()); // record these for deletion on commit
++        } else {
++          deleteFiles(reader.files()); // try to delete our files
++        }
++      }  else {
++        deleteFiles(reader.files(), reader.directory()); // delete other files
++      }
++    }
++  }
+   
+   public final void deleteFiles(Vector files, Directory directory)
+        throws IOException {
+@@ -199,22 +235,51 @@ public class IndexFileDeleter {
+     pending = null;
+   }
+ 
++  /*
++    Record that the files for these segments should be
++    deleted, once the pending deletes are committed.
++   */
++  final void addPendingSegments(Vector segments) throws IOException {
++    for (int i = 0; i < segments.size(); i++) {
++      SegmentReader reader = (SegmentReader)segments.elementAt(i);
++      if (reader.directory() == this.directory) {
++        addPendingFiles(reader.files());
++      }
++    }
++  }
++
++  /*
++    Record list of files for deletion, but do not delete
++    them until commitPendingFiles is called.
++  */
++  final void addPendingFiles(Vector files) {
++    for(int i=0;i<files.size();i++) {
++      addPendingFile((String) files.elementAt(i));
++    }
++  }
++
++  /*
++    Record a file for deletion, but do not delete it until
++    commitPendingFiles is called.
++  */
+   final void addPendingFile(String fileName) {
+     if (pending == null) {
+-      pending = new Vector();
++      pending = new HashSet();
+     }
+-    pending.addElement(fileName);
++    pending.add(fileName);
+   }
+ 
+-  final void commitPendingFiles() {
++  final void commitPendingFiles() throws IOException {
+     if (pending != null) {
+       if (deletable == null) {
+-        deletable = pending;
+-        pending = null;
+-      } else {
+-        deletable.addAll(pending);
+-        pending = null;
++        deletable = new Vector();
++      }
++      Iterator it = pending.iterator();
++      while(it.hasNext()) {
++        deletable.addElement(it.next());
+       }
++      pending = null;
++      deleteFiles();
+     }
+   }
+ 
+diff --git a/src/java/org/apache/lucene/index/IndexReader.java b/src/java/org/apache/lucene/index/IndexReader.java
+index 017671b..b0ef8d6 100644
+--- a/src/java/org/apache/lucene/index/IndexReader.java
++++ b/src/java/org/apache/lucene/index/IndexReader.java
+@@ -120,6 +120,10 @@ public abstract class IndexReader {
+   private boolean stale;
+   private boolean hasChanges;
+ 
++  /** Used by commit() to record pre-commit state in case
++   * rollback is necessary */
++  private boolean rollbackHasChanges;
++  private SegmentInfos rollbackSegmentInfos;
+ 
+   /** Returns an IndexReader reading the index in an FSDirectory in the named
+    path. */
+@@ -584,7 +588,43 @@ public abstract class IndexReader {
+   protected abstract void doUndeleteAll() throws IOException;
+ 
+   /**
+-   * Commit changes resulting from delete, undeleteAll, or setNorm operations
++   * Should internally checkpoint state that will change
++   * during commit so that we can rollback if necessary.
++   */
++  void startCommit() {
++    if (directoryOwner) {
++      rollbackSegmentInfos = (SegmentInfos) segmentInfos.clone();
++    }
++    rollbackHasChanges = hasChanges;
++  }
++
++  /**
++   * Rolls back state to just before the commit (this is
++   * called by commit() if there is some exception while
++   * committing).
++   */
++  void rollbackCommit() {
++    if (directoryOwner) {
++      for(int i=0;i<segmentInfos.size();i++) {
++        // Rollback each segmentInfo.  Because the
++        // SegmentReader holds a reference to the
++        // SegmentInfo we can't [easily] just replace
++        // segmentInfos, so we reset it in place instead:
++        segmentInfos.info(i).reset(rollbackSegmentInfos.info(i));
++      }
++      rollbackSegmentInfos = null;
++    }
++
++    hasChanges = rollbackHasChanges;
++  }
++
++  /**
++   * Commit changes resulting from delete, undeleteAll, or
++   * setNorm operations
++   *
++   * If an exception is hit, then either no changes or all
++   * changes will have been committed to the index
++   * (transactional semantics).
+    * 
+    * @throws IOException
+    */
+@@ -597,15 +637,53 @@ public abstract class IndexReader {
+         deleter.deleteFiles();
+       }
+       if(directoryOwner){
++
++        // Should not be necessary: no prior commit should
++        // have left pending files, so just defensive:
+         deleter.clearPendingFiles();
+-        doCommit();
++
+         String oldInfoFileName = segmentInfos.getCurrentSegmentFileName();
+-        segmentInfos.write(directory);
+-        // Attempt to delete all files we just obsoleted:
++        String nextSegmentsFileName = segmentInfos.getNextSegmentFileName();
++
++        // Checkpoint the state we are about to change, in
++        // case we have to roll back:
++        startCommit();
++
++        boolean success = false;
++        try {
++          doCommit();
++          segmentInfos.write(directory);
++          success = true;
++        } finally {
++
++          if (!success) {
++
++            // Rollback changes that were made to
++            // SegmentInfos but failed to get [fully]
++            // committed.  This way this reader instance
++            // remains consistent (matched to what's
++            // actually in the index):
++            rollbackCommit();
++
++            // Erase any pending files that we were going to delete:
++            deleter.clearPendingFiles();
++
++            // Remove possibly partially written next
++            // segments file:
++            deleter.deleteFile(nextSegmentsFileName);
++
++            // Recompute deletable files & remove them (so
++            // partially written .del files, etc, are
++            // removed):
++            deleter.findDeletableFiles();
++            deleter.deleteFiles();
++          }
++        }
+ 
++        // Attempt to delete all files we just obsoleted:
+         deleter.deleteFile(oldInfoFileName);
+         deleter.commitPendingFiles();
+-        deleter.deleteFiles();
++
+         if (writeLock != null) {
+           writeLock.release();  // release write lock
+           writeLock = null;
+diff --git a/src/java/org/apache/lucene/index/IndexWriter.java b/src/java/org/apache/lucene/index/IndexWriter.java
+index 167249d..61339e5 100644
+--- a/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -31,7 +31,7 @@ import java.io.File;
+ import java.io.IOException;
+ import java.io.PrintStream;
+ import java.util.Vector;
+-
++import java.util.HashSet;
+ 
+ /**
+   An IndexWriter creates and maintains an index.
+@@ -99,6 +99,11 @@ public class IndexWriter {
+ 
+   private Similarity similarity = Similarity.getDefault(); // how to normalize
+ 
++  private boolean inTransaction = false; // true iff we are in a transaction
++  private boolean commitPending; // true if segmentInfos has changes not yet committed
++  private HashSet protectedSegments; // segment names that should not be deleted until commit
++  private SegmentInfos rollbackSegmentInfos;      // segmentInfos we will fallback to if the commit fails
++
+   private SegmentInfos segmentInfos = new SegmentInfos();       // the segments
+   private SegmentInfos ramSegmentInfos = new SegmentInfos();    // the segments in ramDirectory
+   private final RAMDirectory ramDirectory = new RAMDirectory(); // for temp segs
+@@ -473,6 +478,12 @@ public class IndexWriter {
+    * Adds a document to this index.  If the document contains more than
+    * {@link #setMaxFieldLength(int)} terms for a given field, the remainder are
+    * discarded.
++   *
++   * Note that if an Exception is hit (eg disk full) then
++   * the index will be consistent, but this document will
++   * not have been added.  Furthermore, it's possible the
++   * index will have one segment in non-compound format even
++   * when using compound files.
+    */
+   public void addDocument(Document doc) throws IOException {
+     addDocument(doc, analyzer);
+@@ -483,6 +494,9 @@ public class IndexWriter {
+    * value of {@link #getAnalyzer()}.  If the document contains more than
+    * {@link #setMaxFieldLength(int)} terms for a given field, the remainder are
+    * discarded.
++   *
++   * See @link #addDocument(Document) for details on index
++   * state after an IOException.
+    */
+   public void addDocument(Document doc, Analyzer analyzer) throws IOException {
+     DocumentWriter dw =
+@@ -563,8 +577,22 @@ public class IndexWriter {
+    */
+   private PrintStream infoStream = null;
+ 
+-  /** Merges all segments together into a single segment, optimizing an index
+-      for search. */
++  /** Merges all segments together into a single segment,
++   * optimizing an index for search..
++   * 
++   * <p>Note that this requires temporary free space in the
++   * Directory up to the size of the starting index (exact
++   * usage could be less but will depend on many
++   * factors).</p>
++
++   * <p>If an Exception is hit during optimize() (eg, due to
++   * disk full), the index will not be corrupted.  However
++   * it's possible that one of the segments in the index
++   * will be in non-CFS format even when using compound file
++   * format.  This will occur when the Exception is hit
++   * during conversion of the segment into compound
++   * format.</p>
++  */
+   public synchronized void optimize() throws IOException {
+     flushRamSegments();
+     while (segmentInfos.size() > 1 ||
+@@ -579,6 +607,85 @@ public class IndexWriter {
+     }
+   }
+ 
++  /*
++   * Begin a transaction.  During a transaction, any segment
++   * merges that happen (or ram segments flushed) will not
++   * write a new segments file and will not remove any files
++   * that were present at the start of the transaction.  You
++   * must make a matched (try/finall) call to
++   * commitTransaction() or rollbackTransaction() to finish
++   * the transaction.
++   */
++  private void startTransaction() throws IOException {
++    if (inTransaction) {
++      throw new IOException("transaction is already in process");
++    }
++    rollbackSegmentInfos = (SegmentInfos) segmentInfos.clone();
++    protectedSegments = new HashSet();
++    for(int i=0;i<segmentInfos.size();i++) {
++      SegmentInfo si = (SegmentInfo) segmentInfos.elementAt(i);
++      protectedSegments.add(si.name);
++    }
++    inTransaction = true;
++  }
++
++  /*
++   * Rolls back the transaction and restores state to where
++   * we were at the start.
++   */
++  private void rollbackTransaction() throws IOException {
++
++    // Keep the same segmentInfos instance but replace all
++    // of its SegmentInfo instances.  This is so the next
++    // attempt to commit using this instance of IndexWriter
++    // will always write to a new generation ("write once").
++    segmentInfos.clear();
++    segmentInfos.addAll(rollbackSegmentInfos);
++
++    // Ask deleter to locate unreferenced files & remove
++    // them:
++    deleter.clearPendingFiles();
++    deleter.findDeletableFiles();
++    deleter.deleteFiles();
++
++    clearTransaction();
++  }
++
++  /*
++   * Commits the transaction.  This will write the new
++   * segments file and remove and pending deletions we have
++   * accumulated during the transaction
++   */
++  private void commitTransaction() throws IOException {
++    if (commitPending) {
++      boolean success = false;
++      try {
++        // If we hit eg disk full during this write we have
++        // to rollback.:
++        segmentInfos.write(directory);         // commit changes
++        success = true;
++      } finally {
++        if (!success) {
++          rollbackTransaction();
++        }
++      }
++      deleter.commitPendingFiles();
++      commitPending = false;
++    }
++
++    clearTransaction();
++  }
++
++  /* Should only be called by rollbackTransaction &
++   * commitTransaction */
++  private void clearTransaction() {
++    protectedSegments = null;
++    rollbackSegmentInfos = null;
++    inTransaction = false;
++  }
++
++
++
+   /** Merges all segments from an array of indexes into this index.
+    *
+    * <p>This may be used to parallelize batch indexing.  A large document
+@@ -587,27 +694,68 @@ public class IndexWriter {
+    * complete index can then be created by merging sub-collection indexes
+    * with this method.
+    *
+-   * <p>After this completes, the index is optimized. */
++   * <p>After this completes, the index is optimized.
++   *
++   * <p>This method is transactional in how Exceptions are
++   * handled: it does not commit a new segments_N file until
++   * all indexes are added.  This means if an Exception
++   * occurs (eg disk full), then either no indexes will have
++   * been added or they all will have been.</p>
++   *
++   * <p>If an Exception is hit, it's still possible that all
++   * indexes were successfully added.  This happens when the
++   * Exception is hit when trying to build a CFS file.  In
++   * this case, one segment in the index will be in non-CFS
++   * format, even when using compound file format.</p>
++   *
++   * <p>Also note that on an Exception, the index may still
++   * have been partially or fully optimized even though none
++   * of the input indexes were added. </p>
++   *
++   * <p>Note that this requires temporary free space in the
++   * Directory up to 2X the sum of all input indexes
++   * (including the starting index).  Exact usage could be
++   * less but will depend on many factors.</p>
++   *
++   * <p>See <a target="_top"
++   * href="http://issues.apache.org/jira/browse/LUCENE-702">LUCENE-702</a>
++   * for details.</p>
++   */
+   public synchronized void addIndexes(Directory[] dirs)
+-      throws IOException {
++    throws IOException {
++
+     optimize();					  // start with zero or 1 seg
+ 
+     int start = segmentInfos.size();
+ 
+-    for (int i = 0; i < dirs.length; i++) {
+-      SegmentInfos sis = new SegmentInfos();	  // read infos from dir
+-      sis.read(dirs[i]);
+-      for (int j = 0; j < sis.size(); j++) {
+-        segmentInfos.addElement(sis.info(j));	  // add each info
++    boolean success = false;
++
++    startTransaction();
++
++    try {
++      for (int i = 0; i < dirs.length; i++) {
++        SegmentInfos sis = new SegmentInfos();	  // read infos from dir
++        sis.read(dirs[i]);
++        for (int j = 0; j < sis.size(); j++) {
++          segmentInfos.addElement(sis.info(j));	  // add each info
++        }
+       }
+-    }
+ 
+-    // merge newly added segments in log(n) passes
+-    while (segmentInfos.size() > start+mergeFactor) {
+-      for (int base = start; base < segmentInfos.size(); base++) {
+-        int end = Math.min(segmentInfos.size(), base+mergeFactor);
+-        if (end-base > 1)
+-          mergeSegments(segmentInfos, base, end);
++      // merge newly added segments in log(n) passes
++      while (segmentInfos.size() > start+mergeFactor) {
++        for (int base = start; base < segmentInfos.size(); base++) {
++          int end = Math.min(segmentInfos.size(), base+mergeFactor);
++          if (end-base > 1) {
++            mergeSegments(segmentInfos, base, end);
++          }
++        }
++      }
++      success = true;
++    } finally {
++      if (success) {
++        commitTransaction();
++      } else {
++        rollbackTransaction();
+       }
+     }
+ 
+@@ -623,6 +771,11 @@ public class IndexWriter {
+    * <p>
+    * This requires this index not be among those to be added, and the
+    * upper bound* of those segment doc counts not exceed maxMergeDocs.
++   *
++   * <p>See {@link #addIndexes(Directory[])} for
++   * details on transactional semantics, temporary free
++   * space required in the Directory, and non-CFS segments
++   * on an Exception.</p>
+    */
+   public synchronized void addIndexesNoOptimize(Directory[] dirs)
+       throws IOException {
+@@ -651,96 +804,114 @@ public class IndexWriter {
+     // and target may use compound file or not. So we use mergeSegments() to
+     // copy a segment, which may cause doc count to change because deleted
+     // docs are garbage collected.
+-    //
+-    // In current addIndexes(Directory[]), segment infos in S are added to
+-    // T's "segmentInfos" upfront. Then segments in S are merged to T several
+-    // at a time. Every merge is committed with T's "segmentInfos". So if
+-    // a reader is opened on T while addIndexes() is going on, it could see
+-    // an inconsistent index. AddIndexesNoOptimize() has a similar behaviour.
+ 
+     // 1 flush ram segments
++
+     flushRamSegments();
+ 
+     // 2 copy segment infos and find the highest level from dirs
+     int start = segmentInfos.size();
+     int startUpperBound = minMergeDocs;
+ 
++    boolean success = false;
++
++    startTransaction();
++
+     try {
+-      for (int i = 0; i < dirs.length; i++) {
+-        if (directory == dirs[i]) {
+-          // cannot add this index: segments may be deleted in merge before added
+-          throw new IllegalArgumentException("Cannot add this index to itself");
+-        }
+ 
+-        SegmentInfos sis = new SegmentInfos(); // read infos from dir
+-        sis.read(dirs[i]);
+-        for (int j = 0; j < sis.size(); j++) {
+-          SegmentInfo info = sis.info(j);
+-          segmentInfos.addElement(info); // add each info
+-
+-          while (startUpperBound < info.docCount) {
+-            startUpperBound *= mergeFactor; // find the highest level from dirs
+-            if (startUpperBound > maxMergeDocs) {
+-              // upper bound cannot exceed maxMergeDocs
+-              throw new IllegalArgumentException("Upper bound cannot exceed maxMergeDocs");
++      try {
++        for (int i = 0; i < dirs.length; i++) {
++          if (directory == dirs[i]) {
++            // cannot add this index: segments may be deleted in merge before added
++            throw new IllegalArgumentException("Cannot add this index to itself");
++          }
++
++          SegmentInfos sis = new SegmentInfos(); // read infos from dir
++          sis.read(dirs[i]);
++          for (int j = 0; j < sis.size(); j++) {
++            SegmentInfo info = sis.info(j);
++            segmentInfos.addElement(info); // add each info
++
++            while (startUpperBound < info.docCount) {
++              startUpperBound *= mergeFactor; // find the highest level from dirs
++              if (startUpperBound > maxMergeDocs) {
++                // upper bound cannot exceed maxMergeDocs
++                throw new IllegalArgumentException("Upper bound cannot exceed maxMergeDocs");
++              }
+             }
+           }
+         }
++      } catch (IllegalArgumentException e) {
++        for (int i = segmentInfos.size() - 1; i >= start; i--) {
++          segmentInfos.remove(i);
++        }
++        throw e;
+       }
+-    } catch (IllegalArgumentException e) {
+-      for (int i = segmentInfos.size() - 1; i >= start; i--) {
+-        segmentInfos.remove(i);
+-      }
+-      throw e;
+-    }
+ 
+-    // 3 maybe merge segments starting from the highest level from dirs
+-    maybeMergeSegments(startUpperBound);
++      // 3 maybe merge segments starting from the highest level from dirs
++      maybeMergeSegments(startUpperBound);
+ 
+-    // get the tail segments whose levels <= h
+-    int segmentCount = segmentInfos.size();
+-    int numTailSegments = 0;
+-    while (numTailSegments < segmentCount
+-        && startUpperBound >= segmentInfos.info(segmentCount - 1 - numTailSegments).docCount) {
+-      numTailSegments++;
+-    }
+-    if (numTailSegments == 0) {
+-      return;
+-    }
+-
+-    // 4 make sure invariants hold for the tail segments whose levels <= h
+-    if (checkNonDecreasingLevels(segmentCount - numTailSegments)) {
+-      // identify the segments from S to be copied (not merged in 3)
+-      int numSegmentsToCopy = 0;
+-      while (numSegmentsToCopy < segmentCount
+-          && directory != segmentInfos.info(segmentCount - 1 - numSegmentsToCopy).dir) {
+-        numSegmentsToCopy++;
++      // get the tail segments whose levels <= h
++      int segmentCount = segmentInfos.size();
++      int numTailSegments = 0;
++      while (numTailSegments < segmentCount
++             && startUpperBound >= segmentInfos.info(segmentCount - 1 - numTailSegments).docCount) {
++        numTailSegments++;
+       }
+-      if (numSegmentsToCopy == 0) {
++      if (numTailSegments == 0) {
++        success = true;
+         return;
+       }
+ 
+-      // copy those segments from S
+-      for (int i = segmentCount - numSegmentsToCopy; i < segmentCount; i++) {
+-        mergeSegments(segmentInfos, i, i + 1);
+-      }
+-      if (checkNonDecreasingLevels(segmentCount - numSegmentsToCopy)) {
+-        return;
++      // 4 make sure invariants hold for the tail segments whose levels <= h
++      if (checkNonDecreasingLevels(segmentCount - numTailSegments)) {
++        // identify the segments from S to be copied (not merged in 3)
++        int numSegmentsToCopy = 0;
++        while (numSegmentsToCopy < segmentCount
++               && directory != segmentInfos.info(segmentCount - 1 - numSegmentsToCopy).dir) {
++          numSegmentsToCopy++;
++        }
++        if (numSegmentsToCopy == 0) {
++          success = true;
++          return;
++        }
++
++        // copy those segments from S
++        for (int i = segmentCount - numSegmentsToCopy; i < segmentCount; i++) {
++          mergeSegments(segmentInfos, i, i + 1);
++        }
++        if (checkNonDecreasingLevels(segmentCount - numSegmentsToCopy)) {
++          success = true;
++          return;
++        }
+       }
+-    }
+ 
+-    // invariants do not hold, simply merge those segments
+-    mergeSegments(segmentInfos, segmentCount - numTailSegments, segmentCount);
++      // invariants do not hold, simply merge those segments
++      mergeSegments(segmentInfos, segmentCount - numTailSegments, segmentCount);
++
++      // maybe merge segments again if necessary
++      if (segmentInfos.info(segmentInfos.size() - 1).docCount > startUpperBound) {
++        maybeMergeSegments(startUpperBound * mergeFactor);
++      }
+ 
+-    // maybe merge segments again if necessary
+-    if (segmentInfos.info(segmentInfos.size() - 1).docCount > startUpperBound) {
+-      maybeMergeSegments(startUpperBound * mergeFactor);
++      success = true;
++    } finally {
++      if (success) {
++        commitTransaction();
++      } else {
++        rollbackTransaction();
++      }
+     }
+   }
+ 
+   /** Merges the provided indexes into this index.
+    * <p>After this completes, the index is optimized. </p>
+    * <p>The provided IndexReaders are not closed.</p>
++
++   * <p>See {@link #addIndexes(Directory[])} for
++   * details on transactional semantics, temporary free
++   * space required in the Directory, and non-CFS segments
++   * on an Exception.</p>
+    */
+   public synchronized void addIndexes(IndexReader[] readers)
+     throws IOException {
+@@ -761,26 +932,61 @@ public class IndexWriter {
+     for (int i = 0; i < readers.length; i++)      // add new indexes
+       merger.add(readers[i]);
+ 
+-    int docCount = merger.merge();                // merge 'em
++    SegmentInfo info;
++
++    String segmentsInfosFileName = segmentInfos.getCurrentSegmentFileName();
++
++    boolean success = false;
++
++    startTransaction();
+ 
+-    segmentInfos.setSize(0);                      // pop old infos & add new
+-    SegmentInfo info = new SegmentInfo(mergedName, docCount, directory, false);
+-    segmentInfos.addElement(info);
++    try {
++      int docCount = merger.merge();                // merge 'em
+ 
+-    if(sReader != null)
++      segmentInfos.setSize(0);                      // pop old infos & add new
++      info = new SegmentInfo(mergedName, docCount, directory, false);
++      segmentInfos.addElement(info);
++      commitPending = true;
++
++      if(sReader != null)
+         sReader.close();
+ 
+-    String segmentsInfosFileName = segmentInfos.getCurrentSegmentFileName();
+-    segmentInfos.write(directory);         // commit changes
++      success = true;
++
++    } finally {
++      if (!success) {
++        rollbackTransaction();
++      } else {
++        commitTransaction();
++      }
++    }
+ 
+     deleter.deleteFile(segmentsInfosFileName);    // delete old segments_N file
+     deleter.deleteSegments(segmentsToDelete);     // delete now-unused segments
+ 
+     if (useCompoundFile) {
+-      Vector filesToDelete = merger.createCompoundFile(mergedName + ".cfs");
++      success = false;
++
+       segmentsInfosFileName = segmentInfos.getCurrentSegmentFileName();
+-      info.setUseCompoundFile(true);
+-      segmentInfos.write(directory);     // commit again so readers know we've switched this segment to a compound file
++      Vector filesToDelete;
++
++      startTransaction();
++
++      try {
++
++        filesToDelete = merger.createCompoundFile(mergedName + ".cfs");
++
++        info.setUseCompoundFile(true);
++        commitPending = true;
++        success = true;
++
++      } finally {
++        if (!success) {
++          rollbackTransaction();
++        } else {
++          commitTransaction();
++        }
++      }
+ 
+       deleter.deleteFile(segmentsInfosFileName);  // delete old segments_N file
+       deleter.deleteFiles(filesToDelete); // delete now unused files of segment 
+@@ -884,6 +1090,7 @@ public class IndexWriter {
+         // mergeFactor and/or maxBufferedDocs change(s)
+         while (numSegments >= mergeFactor) {
+           // merge the leftmost* mergeFactor segments
++
+           int docCount = mergeSegments(segmentInfos, minSegment, minSegment + mergeFactor);
+           numSegments -= mergeFactor;
+ 
+@@ -921,51 +1128,154 @@ public class IndexWriter {
+     SegmentMerger merger = new SegmentMerger(this, mergedName);
+     
+     final Vector segmentsToDelete = new Vector();
+-    for (int i = minSegment; i < end; i++) {
+-      SegmentInfo si = sourceSegments.info(i);
+-      if (infoStream != null)
+-        infoStream.print(" " + si.name + " (" + si.docCount + " docs)");
+-      IndexReader reader = SegmentReader.get(si);
+-      merger.add(reader);
+-      if ((reader.directory() == this.directory) || // if we own the directory
+-          (reader.directory() == this.ramDirectory))
+-        segmentsToDelete.addElement(reader);   // queue segment for deletion
+-    }
+ 
+-    int mergedDocCount = merger.merge();
++    String segmentsInfosFileName = segmentInfos.getCurrentSegmentFileName();
++    String nextSegmentsFileName = segmentInfos.getNextSegmentFileName();
++
++    SegmentInfo newSegment = null;
++
++    int mergedDocCount;
++
++    // This is try/finally to make sure merger's readers are closed:
++    try {
++
++      for (int i = minSegment; i < end; i++) {
++        SegmentInfo si = sourceSegments.info(i);
++        if (infoStream != null)
++          infoStream.print(" " + si.name + " (" + si.docCount + " docs)");
++        IndexReader reader = SegmentReader.get(si);
++        merger.add(reader);
++        if ((reader.directory() == this.directory) || // if we own the directory
++            (reader.directory() == this.ramDirectory))
++          segmentsToDelete.addElement(reader);   // queue segment for deletion
++      }
++
++      SegmentInfos rollback = null;
++      boolean success = false;
++
++      // This is try/finally to rollback our internal state
++      // if we hit exception when doing the merge:
++      try {
++
++        mergedDocCount = merger.merge();
+ 
+-    if (infoStream != null) {
+-      infoStream.println(" into "+mergedName+" ("+mergedDocCount+" docs)");
++        if (infoStream != null) {
++          infoStream.println(" into "+mergedName+" ("+mergedDocCount+" docs)");
++        }
++
++        newSegment = new SegmentInfo(mergedName, mergedDocCount,
++                                     directory, false);
++
++
++        if (sourceSegments == ramSegmentInfos) {
++          segmentInfos.addElement(newSegment);
++        } else {
++
++          if (!inTransaction) {
++            // Now save the SegmentInfo instances that
++            // we are replacing:
++            rollback = (SegmentInfos) segmentInfos.clone();
++          }
++
++          for (int i = end-1; i > minSegment; i--)     // remove old infos & add new
++            sourceSegments.remove(i);
++
++          segmentInfos.set(minSegment, newSegment);
++        }
++
++        if (!inTransaction) {
++          segmentInfos.write(directory);     // commit before deleting
++        } else {
++          commitPending = true;
++        }
++
++        success = true;
++
++      } finally {
++
++        if (success) {
++          // The non-ram-segments case is already committed
++          // (above), so all the remains for ram segments case
++          // is to clear the ram segments:
++          if (sourceSegments == ramSegmentInfos) {
++            ramSegmentInfos.removeAllElements();
++          }
++        } else if (!inTransaction) {  
++
++          // Must rollback so our state matches index:
++
++          if (sourceSegments == ramSegmentInfos) {
++            // Simple case: newSegment may or may not have
++            // been added to the end of our segment infos,
++            // so just check & remove if so:
++            if (newSegment != null && 
++                segmentInfos.size() > 0 && 
++                segmentInfos.info(segmentInfos.size()-1) == newSegment) {
++              segmentInfos.remove(segmentInfos.size()-1);
++            }
++          } else if (rollback != null) {
++            // Rollback the individual SegmentInfo
++            // instances, but keep original SegmentInfos
++            // instance (so we don't try to write again the
++            // same segments_N file -- write once):
++            segmentInfos.clear();
++            segmentInfos.addAll(rollback);
++          }
++
++          // Delete any partially created files:
++          deleter.deleteFile(nextSegmentsFileName);
++          deleter.findDeletableFiles();
++          deleter.deleteFiles();
++        }
++      }
++    } finally {
++      // close readers before we attempt to delete now-obsolete segments
++      merger.closeReaders();
+     }
+ 
+-    SegmentInfo newSegment = new SegmentInfo(mergedName, mergedDocCount,
+-                                             directory, false);
+-    if (sourceSegments == ramSegmentInfos) {
+-      sourceSegments.removeAllElements();
+-      segmentInfos.addElement(newSegment);
++    if (!inTransaction) {
++      deleter.deleteFile(segmentsInfosFileName);    // delete old segments_N file
++      deleter.deleteSegments(segmentsToDelete);     // delete now-unused segments
+     } else {
+-      for (int i = end-1; i > minSegment; i--)     // remove old infos & add new
+-        sourceSegments.remove(i);
+-      segmentInfos.set(minSegment, newSegment);
++      deleter.addPendingFile(segmentsInfosFileName);    // delete old segments_N file
++      deleter.deleteSegments(segmentsToDelete, protectedSegments);     // delete now-unused segments
+     }
+ 
+-    // close readers before we attempt to delete now-obsolete segments
+-    merger.closeReaders();
++    if (useCompoundFile) {
+ 
+-    String segmentsInfosFileName = segmentInfos.getCurrentSegmentFileName();
+-    segmentInfos.write(directory);     // commit before deleting
++      segmentsInfosFileName = nextSegmentsFileName;
++      nextSegmentsFileName = segmentInfos.getNextSegmentFileName();
+ 
+-    deleter.deleteFile(segmentsInfosFileName);    // delete old segments_N file
+-    deleter.deleteSegments(segmentsToDelete);     // delete now-unused segments
++      Vector filesToDelete;
+ 
+-    if (useCompoundFile) {
+-      Vector filesToDelete = merger.createCompoundFile(mergedName + ".cfs");
++      boolean success = false;
+ 
+-      segmentsInfosFileName = segmentInfos.getCurrentSegmentFileName();
+-      newSegment.setUseCompoundFile(true);
+-      segmentInfos.write(directory);     // commit again so readers know we've switched this segment to a compound file
++      try {
+ 
+-      deleter.deleteFile(segmentsInfosFileName);  // delete old segments_N file
++        filesToDelete = merger.createCompoundFile(mergedName + ".cfs");
++        newSegment.setUseCompoundFile(true);
++        if (!inTransaction) {
++          segmentInfos.write(directory);     // commit again so readers know we've switched this segment to a compound file
++        }
++        success = true;
++
++      } finally {
++        if (!success && !inTransaction) {  
++          // Must rollback:
++          newSegment.setUseCompoundFile(false);
++          deleter.deleteFile(mergedName + ".cfs");
++          deleter.deleteFile(nextSegmentsFileName);
++        }
++      }
++
++      if (!inTransaction) {
++        deleter.deleteFile(segmentsInfosFileName);  // delete old segments_N file
++      }
++
++      // We can delete these segments whether or not we are
++      // in a transaction because we had just written them
++      // above so they can't need protection by the
++      // transaction:
+       deleter.deleteFiles(filesToDelete);  // delete now-unused segments
+     }
+ 
+diff --git a/src/java/org/apache/lucene/index/MultiReader.java b/src/java/org/apache/lucene/index/MultiReader.java
+index 7c53cbe..5a9199e 100644
+--- a/src/java/org/apache/lucene/index/MultiReader.java
++++ b/src/java/org/apache/lucene/index/MultiReader.java
+@@ -230,6 +230,20 @@ public class MultiReader extends IndexReader {
+       subReaders[i].commit();
+   }
+ 
++  void startCommit() {
++    super.startCommit();
++    for (int i = 0; i < subReaders.length; i++) {
++      subReaders[i].startCommit();
++    }
++  }
++
++  void rollbackCommit() {
++    super.rollbackCommit();
++    for (int i = 0; i < subReaders.length; i++) {
++      subReaders[i].rollbackCommit();
++    }
++  }
++
+   protected synchronized void doClose() throws IOException {
+     for (int i = 0; i < subReaders.length; i++)
+       subReaders[i].close();
+diff --git a/src/java/org/apache/lucene/index/SegmentInfo.java b/src/java/org/apache/lucene/index/SegmentInfo.java
+index 9bffc1e..e1860c0 100644
+--- a/src/java/org/apache/lucene/index/SegmentInfo.java
++++ b/src/java/org/apache/lucene/index/SegmentInfo.java
+@@ -62,6 +62,23 @@ final class SegmentInfo {
+     preLockless = false;
+   }
+ 
++  /**
++   * Copy everything from src SegmentInfo into our instance.
++   */
++  void reset(SegmentInfo src) {
++    name = src.name;
++    docCount = src.docCount;
++    dir = src.dir;
++    preLockless = src.preLockless;
++    delGen = src.delGen;
++    if (src.normGen == null) {
++      normGen = null;
++    } else {
++      normGen = new long[src.normGen.length];
++      System.arraycopy(src.normGen, 0, normGen, 0, src.normGen.length);
++    }
++    isCompoundFile = src.isCompoundFile;
++  }
+ 
+   /**
+    * Construct a new SegmentInfo instance by reading a
+@@ -151,6 +168,17 @@ final class SegmentInfo {
+     delGen = -1;
+   }
+ 
++  public Object clone () {
++    SegmentInfo si = new SegmentInfo(name, docCount, dir);
++    si.isCompoundFile = isCompoundFile;
++    si.delGen = delGen;
++    si.preLockless = preLockless;
++    if (normGen != null) {
++      si.normGen = (long[]) normGen.clone();
++    }
++    return si;
++  }
++
+   String getDelFileName() {
+     if (delGen == -1) {
+       // In this case we know there is no deletion filename
+diff --git a/src/java/org/apache/lucene/index/SegmentInfos.java b/src/java/org/apache/lucene/index/SegmentInfos.java
+index e9d3e51..bebb83d 100644
+--- a/src/java/org/apache/lucene/index/SegmentInfos.java
++++ b/src/java/org/apache/lucene/index/SegmentInfos.java
+@@ -50,7 +50,11 @@ public final class SegmentInfos extends Vector {
+    * starting with the current time in milliseconds forces to create unique version numbers.
+    */
+   private long version = System.currentTimeMillis();
+-  private long generation = 0;             // generation of the "segments_N" file we read
++
++  private long generation = 0;     // generation of the "segments_N" for the next commit
++  private long lastGeneration = 0; // generation of the "segments_N" file we last successfully read
++                                   // or wrote; this is normally the same as generation except if
++                                   // there was an IOException that had interrupted a commit
+ 
+   /**
+    * If non-null, information about loading segments_N files
+@@ -132,12 +136,28 @@ public final class SegmentInfos extends Vector {
+   }
+ 
+   /**
+-   * Get the segment_N filename in use by this segment infos.
++   * Get the segments_N filename in use by this segment infos.
+    */
+   public String getCurrentSegmentFileName() {
+     return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                  "",
+-                                                 generation);
++                                                 lastGeneration);
++  }
++
++  /**
++   * Get the next segments_N filename that will be written.
++   */
++  public String getNextSegmentFileName() {
++    long nextGeneration;
++
++    if (generation == -1) {
++      nextGeneration = 1;
++    } else {
++      nextGeneration = generation+1;
++    }
++    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
++                                                 "",
++                                                 nextGeneration);
+   }
+ 
+   /**
+@@ -158,6 +178,7 @@ public final class SegmentInfos extends Vector {
+       generation = Long.parseLong(segmentFileName.substring(1+IndexFileNames.SEGMENTS.length()),
+                                   Character.MAX_RADIX);
+     }
++    lastGeneration = generation;
+ 
+     try {
+       int format = input.readInt();
+@@ -199,7 +220,7 @@ public final class SegmentInfos extends Vector {
+    */
+   public final void read(Directory directory) throws IOException {
+ 
+-    generation = -1;
++    generation = lastGeneration = -1;
+ 
+     new FindSegmentsFile(directory) {
+ 
+@@ -212,6 +233,8 @@ public final class SegmentInfos extends Vector {
+ 
+   public final void write(Directory directory) throws IOException {
+ 
++    String segmentFileName = getNextSegmentFileName();
++
+     // Always advance the generation on write:
+     if (generation == -1) {
+       generation = 1;
+@@ -219,7 +242,6 @@ public final class SegmentInfos extends Vector {
+       generation++;
+     }
+ 
+-    String segmentFileName = getCurrentSegmentFileName();
+     IndexOutput output = directory.createOutput(segmentFileName);
+ 
+     try {
+@@ -229,8 +251,7 @@ public final class SegmentInfos extends Vector {
+       output.writeInt(counter); // write counter
+       output.writeInt(size()); // write infos
+       for (int i = 0; i < size(); i++) {
+-        SegmentInfo si = info(i);
+-        si.write(output);
++        info(i).write(output);
+       }         
+     }
+     finally {
+@@ -247,6 +268,21 @@ public final class SegmentInfos extends Vector {
+       // It's OK if we fail to write this file since it's
+       // used only as one of the retry fallbacks.
+     }
++    
++    lastGeneration = generation;
++  }
++
++  /**
++   * Returns a copy of this instance, also copying each
++   * SegmentInfo.
++   */
++  
++  public Object clone() {
++    SegmentInfos sis = (SegmentInfos) super.clone();
++    for(int i=0;i<sis.size();i++) {
++      sis.setElementAt(((SegmentInfo) sis.elementAt(i)).clone(), i);
++    }
++    return sis;
+   }
+ 
+   /**
+@@ -496,7 +532,7 @@ public final class SegmentInfos extends Vector {
+           if (genLookaheadCount < defaultGenLookaheadCount) {
+             gen++;
+             genLookaheadCount++;
+-            message("look ahead incremenent gen to " + gen);
++            message("look ahead increment gen to " + gen);
+           }
+         }
+ 
+diff --git a/src/java/org/apache/lucene/index/SegmentReader.java b/src/java/org/apache/lucene/index/SegmentReader.java
+index 091e789..299159f 100644
+--- a/src/java/org/apache/lucene/index/SegmentReader.java
++++ b/src/java/org/apache/lucene/index/SegmentReader.java
+@@ -47,6 +47,10 @@ class SegmentReader extends IndexReader {
+   private boolean normsDirty = false;
+   private boolean undeleteAll = false;
+ 
++  private boolean rollbackDeletedDocsDirty = false;
++  private boolean rollbackNormsDirty = false;
++  private boolean rollbackUndeleteAll = false;
++
+   IndexInput freqStream;
+   IndexInput proxStream;
+ 
+@@ -64,6 +68,7 @@ class SegmentReader extends IndexReader {
+     private byte[] bytes;
+     private boolean dirty;
+     private int number;
++    private boolean rollbackDirty;
+ 
+     private void reWrite(SegmentInfo si) throws IOException {
+       // NOTE: norms are re-written in regular directory, not cfs
+@@ -545,4 +550,39 @@ class SegmentReader extends IndexReader {
+     
+     return termVectorsReader.get(docNumber);
+   }
++
++  /**
++   * Return the name of the segment this reader is reading.
++   */
++  String getSegmentName() {
++    return segment;
++  }
++
++  void setSegmentInfo(SegmentInfo info) {
++    si = info;
++  }
++
++  void startCommit() {
++    super.startCommit();
++    rollbackDeletedDocsDirty = deletedDocsDirty;
++    rollbackNormsDirty = normsDirty;
++    rollbackUndeleteAll = undeleteAll;
++    Enumeration values = norms.elements();
++    while (values.hasMoreElements()) {
++      Norm norm = (Norm) values.nextElement();
++      norm.rollbackDirty = norm.dirty;
++    }
++  }
++
++  void rollbackCommit() {
++    super.rollbackCommit();
++    deletedDocsDirty = rollbackDeletedDocsDirty;
++    normsDirty = rollbackNormsDirty;
++    undeleteAll = rollbackUndeleteAll;
++    Enumeration values = norms.elements();
++    while (values.hasMoreElements()) {
++      Norm norm = (Norm) values.nextElement();
++      norm.dirty = norm.rollbackDirty;
++    }
++  }
+ }
+diff --git a/src/java/org/apache/lucene/store/RAMDirectory.java b/src/java/org/apache/lucene/store/RAMDirectory.java
+index dd90827..357c3ae 100644
+--- a/src/java/org/apache/lucene/store/RAMDirectory.java
++++ b/src/java/org/apache/lucene/store/RAMDirectory.java
+@@ -34,13 +34,13 @@ import java.util.Set;
+  *
+  * @version $Id$
+  */
+-public final class RAMDirectory extends Directory implements Serializable {
++public class RAMDirectory extends Directory implements Serializable {
+ 
+   private static final long serialVersionUID = 1l;
+ 
+-  private HashMap fileMap = new HashMap();
++  HashMap fileMap = new HashMap();
+   private Set fileNames = fileMap.keySet();
+-  private Collection files = fileMap.values();
++  Collection files = fileMap.values();
+   long sizeInBytes = 0;
+   
+   // *****
+@@ -178,20 +178,13 @@ public final class RAMDirectory extends Directory implements Serializable {
+     return file.getLength();
+   }
+   
+-  /** Return total size in bytes of all files in this directory */
++  /** Return total size in bytes of all files in this
++   * directory.  This is currently quantized to
++   * BufferedIndexOutput.BUFFER_SIZE. */
+   public synchronized final long sizeInBytes() {
+     return sizeInBytes;
+   }
+   
+-  /** Provided for testing purposes.  Use sizeInBytes() instead. */
+-  public synchronized final long getRecomputedSizeInBytes() {
+-    long size = 0;
+-    Iterator it = files.iterator();
+-    while (it.hasNext())
+-      size += ((RAMFile) it.next()).getSizeInBytes();
+-    return size;
+-  }
+-
+   /** Removes an existing file in the directory.
+    * @throws IOException if the file does not exist
+    */
+@@ -222,7 +215,7 @@ public final class RAMDirectory extends Directory implements Serializable {
+   }
+ 
+   /** Creates a new, empty file in the directory with the given name. Returns a stream writing this file. */
+-  public final IndexOutput createOutput(String name) {
++  public IndexOutput createOutput(String name) {
+     RAMFile file = new RAMFile(this);
+     synchronized (this) {
+       RAMFile existing = (RAMFile)fileMap.get(name);
+diff --git a/src/java/org/apache/lucene/store/RAMOutputStream.java b/src/java/org/apache/lucene/store/RAMOutputStream.java
+index 8ccd8f7..bda95c1 100644
+--- a/src/java/org/apache/lucene/store/RAMOutputStream.java
++++ b/src/java/org/apache/lucene/store/RAMOutputStream.java
+@@ -66,7 +66,7 @@ public class RAMOutputStream extends BufferedIndexOutput {
+     file.setLength(0);
+   }
+ 
+-  public void flushBuffer(byte[] src, int len) {
++  public void flushBuffer(byte[] src, int len) throws IOException {
+     byte[] buffer;
+     int bufferPos = 0;
+     while (bufferPos != len) {
+diff --git a/src/test/org/apache/lucene/index/TestIndexFileDeleter.java b/src/test/org/apache/lucene/index/TestIndexFileDeleter.java
+index 5b924d2..833acce 100644
+--- a/src/test/org/apache/lucene/index/TestIndexFileDeleter.java
++++ b/src/test/org/apache/lucene/index/TestIndexFileDeleter.java
+@@ -34,7 +34,12 @@ public class TestIndexFileDeleter extends TestCase
+     Directory dir = new RAMDirectory();
+ 
+     IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true);
+-    for(int i=0;i<35;i++) {
++    int i;
++    for(i=0;i<35;i++) {
++      addDoc(writer, i);
++    }
++    writer.setUseCompoundFile(false);
++    for(;i<45;i++) {
+       addDoc(writer, i);
+     }
+     writer.close();
+@@ -68,7 +73,7 @@ public class TestIndexFileDeleter extends TestCase
+     CompoundFileReader cfsReader = new CompoundFileReader(dir, "_2.cfs");
+     FieldInfos fieldInfos = new FieldInfos(cfsReader, "_2.fnm");
+     int contentFieldIndex = -1;
+-    for(int i=0;i<fieldInfos.size();i++) {
++    for(i=0;i<fieldInfos.size();i++) {
+       FieldInfo fi = fieldInfos.fieldInfo(i);
+       if (fi.name.equals("content")) {
+         contentFieldIndex = i;
+@@ -125,6 +130,9 @@ public class TestIndexFileDeleter extends TestCase
+     copyFile(dir, "segments_a", "segments");
+     copyFile(dir, "segments_a", "segments_2");
+ 
++    // Create a bogus cfs file shadowing a non-cfs segment:
++    copyFile(dir, "_2.cfs", "_3.cfs");
++
+     String[] filesPre = dir.list();
+ 
+     // Open & close a writer: it should delete the above 4
+diff --git a/src/test/org/apache/lucene/index/TestIndexReader.java b/src/test/org/apache/lucene/index/TestIndexReader.java
+index 4be3955..69a078c 100644
+--- a/src/test/org/apache/lucene/index/TestIndexReader.java
++++ b/src/test/org/apache/lucene/index/TestIndexReader.java
+@@ -30,11 +30,18 @@ import org.apache.lucene.analysis.WhitespaceAnalyzer;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ 
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Hits;
++import org.apache.lucene.search.TermQuery;
++
+ import java.util.Collection;
++import java.util.Arrays;
+ import java.io.IOException;
+ import java.io.FileNotFoundException;
+ import java.io.File;
+ 
++import org.apache.lucene.store.MockRAMDirectory;
++
+ public class TestIndexReader extends TestCase
+ {
+     /** Main for running test case by itself. */
+@@ -547,7 +554,213 @@ public class TestIndexReader extends TestCase
+     public void testDeleteReaderReaderConflictOptimized() throws IOException{
+       deleteReaderReaderConflict(true);
+     }
++
++    /**
++     * Make sure if reader tries to commit but hits disk
++     * full that reader remains consistent and usable.
++     */
++    public void testDiskFull() throws IOException {
++
++      boolean debug = false;
++      Term searchTerm = new Term("content", "aaa");
++      int START_COUNT = 157;
++      int END_COUNT = 144;
++      
++      // First build up a starting index:
++      RAMDirectory startDir = new RAMDirectory();
++      IndexWriter writer = new IndexWriter(startDir, new WhitespaceAnalyzer(), true);
++      for(int i=0;i<157;i++) {
++        Document d = new Document();
++        d.add(new Field("id", Integer.toString(i), Field.Store.YES, Field.Index.UN_TOKENIZED));
++        d.add(new Field("content", "aaa " + i, Field.Store.NO, Field.Index.TOKENIZED));
++        writer.addDocument(d);
++      }
++      writer.close();
++
++      long diskUsage = startDir.sizeInBytes();
++      long diskFree = diskUsage+100;      
++
++      IOException err = null;
++
++      boolean done = false;
++
++      // Iterate w/ ever increasing free disk space:
++      while(!done) {
++        MockRAMDirectory dir = new MockRAMDirectory(startDir);
++        IndexReader reader = IndexReader.open(dir);
++
++        // For each disk size, first try to commit against
++        // dir that will hit random IOExceptions & disk
++        // full; after, give it infinite disk space & turn
++        // off random IOExceptions & retry w/ same reader:
++        boolean success = false;
++
++        for(int x=0;x<2;x++) {
++
++          double rate = 0.05;
++          double diskRatio = ((double) diskFree)/diskUsage;
++          long thisDiskFree;
++          String testName;
++
++          if (0 == x) {
++            thisDiskFree = diskFree;
++            if (diskRatio >= 2.0) {
++              rate /= 2;
++            }
++            if (diskRatio >= 4.0) {
++              rate /= 2;
++            }
++            if (diskRatio >= 6.0) {
++              rate = 0.0;
++            }
++            if (debug) {
++              System.out.println("\ncycle: " + diskFree + " bytes");
++            }
++            testName = "disk full during reader.close() @ " + thisDiskFree + " bytes";
++          } else {
++            thisDiskFree = 0;
++            rate = 0.0;
++            if (debug) {
++              System.out.println("\ncycle: same writer: unlimited disk space");
++            }
++            testName = "reader re-use after disk full";
++          }
++
++          dir.setMaxSizeInBytes(thisDiskFree);
++          dir.setRandomIOExceptionRate(rate, diskFree);
++
++          try {
++            if (0 == x) {
++              int docId = 12;
++              for(int i=0;i<13;i++) {
++                reader.deleteDocument(docId);
++                reader.setNorm(docId, "contents", (float) 2.0);
++                docId += 12;
++              }
++            }
++            reader.close();
++            success = true;
++            if (0 == x) {
++              done = true;
++            }
++          } catch (IOException e) {
++            if (debug) {
++              System.out.println("  hit IOException: " + e);
++            }
++            err = e;
++            if (1 == x) {
++              e.printStackTrace();
++              fail(testName + " hit IOException after disk space was freed up");
++            }
++          }
++
++          // Whether we succeeded or failed, check that all
++          // un-referenced files were in fact deleted (ie,
++          // we did not create garbage).  Just create a
++          // new IndexFileDeleter, have it delete
++          // unreferenced files, then verify that in fact
++          // no files were deleted:
++          String[] startFiles = dir.list();
++          SegmentInfos infos = new SegmentInfos();
++          infos.read(dir);
++          IndexFileDeleter d = new IndexFileDeleter(infos, dir);
++          d.findDeletableFiles();
++          d.deleteFiles();
++          String[] endFiles = dir.list();
++
++          Arrays.sort(startFiles);
++          Arrays.sort(endFiles);
++
++          //for(int i=0;i<startFiles.length;i++) {
++          //  System.out.println("  startFiles: " + i + ": " + startFiles[i]);
++          //}
++
++          if (!Arrays.equals(startFiles, endFiles)) {
++            String successStr;
++            if (success) {
++              successStr = "success";
++            } else {
++              successStr = "IOException";
++              err.printStackTrace();
++            }
++            fail("reader.close() failed to delete unreferenced files after " + successStr + " (" + diskFree + " bytes): before delete:\n    " + arrayToString(startFiles) + "\n  after delete:\n    " + arrayToString(endFiles));
++          }
++
++          // Finally, verify index is not corrupt, and, if
++          // we succeeded, we see all docs changed, and if
++          // we failed, we see either all docs or no docs
++          // changed (transactional semantics):
++          IndexReader newReader = null;
++          try {
++            newReader = IndexReader.open(dir);
++          } catch (IOException e) {
++            e.printStackTrace();
++            fail(testName + ":exception when creating IndexReader after disk full during close: " + e);
++          }
++          /*
++          int result = newReader.docFreq(searchTerm);
++          if (success) {
++            if (result != END_COUNT) {
++              fail(testName + ": method did not throw exception but docFreq('aaa') is " + result + " instead of expected " + END_COUNT);
++            }
++          } else {
++            // On hitting exception we still may have added
++            // all docs:
++            if (result != START_COUNT && result != END_COUNT) {
++              err.printStackTrace();
++              fail(testName + ": method did throw exception but docFreq('aaa') is " + result + " instead of expected " + START_COUNT + " or " + END_COUNT);
++            }
++          }
++          */
++
++          IndexSearcher searcher = new IndexSearcher(newReader);
++          Hits hits = null;
++          try {
++            hits = searcher.search(new TermQuery(searchTerm));
++          } catch (IOException e) {
++            e.printStackTrace();
++            fail(testName + ": exception when searching: " + e);
++          }
++          int result2 = hits.length();
++          if (success) {
++            if (result2 != END_COUNT) {
++              fail(testName + ": method did not throw exception but hits.length for search on term 'aaa' is " + result2 + " instead of expected " + END_COUNT);
++            }
++          } else {
++            // On hitting exception we still may have added
++            // all docs:
++            if (result2 != START_COUNT && result2 != END_COUNT) {
++              err.printStackTrace();
++              fail(testName + ": method did throw exception but hits.length for search on term 'aaa' is " + result2 + " instead of expected " + START_COUNT);
++            }
++          }
++
++          searcher.close();
++          newReader.close();
++
++          if (result2 == END_COUNT) {
++            break;
++          }
++        }
++
++        dir.close();
++
++        // Try again with 10 more bytes of free space:
++        diskFree += 10;
++      }
++    }
+     
++    private String arrayToString(String[] l) {
++      String s = "";
++      for(int i=0;i<l.length;i++) {
++        if (i > 0) {
++          s += "\n    ";
++        }
++        s += l[i];
++      }
++      return s;
++    }
++
+     private void deleteReaderReaderConflict(boolean optimize) throws IOException
+     {
+         Directory dir = getDirectory(true);
+@@ -697,4 +910,6 @@ public class TestIndexReader extends TestCase
+         }
+         dir.delete();
+     }
++
++    
+ }
+diff --git a/src/test/org/apache/lucene/index/TestIndexWriter.java b/src/test/org/apache/lucene/index/TestIndexWriter.java
+index 6ee6c14..d94f63d 100644
+--- a/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -2,6 +2,7 @@ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
+ import java.io.File;
++import java.util.Arrays;
+ 
+ import junit.framework.TestCase;
+ 
+@@ -10,12 +11,16 @@ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Hits;
++import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.FSDirectory;
+ import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.store.IndexOutput;
+ 
++import org.apache.lucene.store.MockRAMDirectory;
+ 
+ /**
+  * @author goller
+@@ -88,6 +93,350 @@ public class TestIndexWriter extends TestCase
+         writer.addDocument(doc);
+     }
+ 
++    private void addDocWithIndex(IndexWriter writer, int index) throws IOException
++    {
++        Document doc = new Document();
++        doc.add(new Field("content", "aaa " + index, Field.Store.YES, Field.Index.TOKENIZED));
++        doc.add(new Field("id", "" + index, Field.Store.YES, Field.Index.TOKENIZED));
++        writer.addDocument(doc);
++    }
++
++    /*
++      Test: make sure when we run out of disk space or hit
++      random IOExceptions in any of the addIndexes(*) calls
++      that 1) index is not corrupt (searcher can open/search
++      it) and 2) transactional semantics are followed:
++      either all or none of the incoming documents were in
++      fact added.
++    */
++    public void testAddIndexOnDiskFull() throws IOException
++    {
++
++      int START_COUNT = 57;
++      int NUM_DIR = 50;
++      int END_COUNT = START_COUNT + NUM_DIR*25;
++
++      boolean debug = false;
++
++      // Build up a bunch of dirs that have indexes which we
++      // will then merge together by calling addIndexes(*):
++      Directory[] dirs = new Directory[NUM_DIR];
++      long inputDiskUsage = 0;
++      for(int i=0;i<NUM_DIR;i++) {
++        dirs[i] = new RAMDirectory();
++        IndexWriter writer  = new IndexWriter(dirs[i], new WhitespaceAnalyzer(), true);
++        for(int j=0;j<25;j++) {
++          addDocWithIndex(writer, 25*i+j);
++        }
++        writer.close();
++        String[] files = dirs[i].list();
++        for(int j=0;j<files.length;j++) {
++          inputDiskUsage += dirs[i].fileLength(files[j]);
++        }
++      }
++
++      // Now, build a starting index that has START_COUNT docs.  We
++      // will then try to addIndexes into a copy of this:
++      RAMDirectory startDir = new RAMDirectory();
++      IndexWriter writer = new IndexWriter(startDir, new WhitespaceAnalyzer(), true);        
++      for(int j=0;j<START_COUNT;j++) {
++        addDocWithIndex(writer, j);
++      }
++      writer.close();
++
++      // Make sure starting index seems to be working properly:
++      Term searchTerm = new Term("content", "aaa");        
++      IndexReader reader = IndexReader.open(startDir);
++      assertEquals("first docFreq", 57, reader.docFreq(searchTerm));
++
++      IndexSearcher searcher = new IndexSearcher(reader);
++      Hits hits = searcher.search(new TermQuery(searchTerm));
++      assertEquals("first number of hits", 57, hits.length());
++      searcher.close();
++      reader.close();
++
++      // Iterate with larger and larger amounts of free
++      // disk space.  With little free disk space,
++      // addIndexes will certainly run out of space &
++      // fail.  Verify that when this happens, index is
++      // not corrupt and index in fact has added no
++      // documents.  Then, we increase disk space by 1000
++      // bytes each iteration.  At some point there is
++      // enough free disk space and addIndexes should
++      // succeed and index should show all documents were
++      // added.
++
++      // String[] files = startDir.list();
++      long diskUsage = startDir.sizeInBytes();
++
++      long startDiskUsage = 0;
++      String[] files = startDir.list();
++      for(int i=0;i<files.length;i++) {
++        startDiskUsage += startDir.fileLength(files[i]);
++      }
++
++      for(int method=0;method<3;method++) {
++
++        // Start with 100 bytes more than we are currently using:
++        long diskFree = diskUsage+100;
++
++        boolean success = false;
++        boolean done = false;
++
++        String methodName;
++        if (0 == method) {
++          methodName = "addIndexes(Directory[])";
++        } else if (1 == method) {
++          methodName = "addIndexes(IndexReader[])";
++        } else {
++          methodName = "addIndexesNoOptimize(Directory[])";
++        }
++
++        String testName = "disk full test for method " + methodName + " with disk full at " + diskFree + " bytes";
++
++        int cycleCount = 0;
++
++        while(!done) {
++
++          cycleCount++;
++
++          // Make a new dir that will enforce disk usage:
++          MockRAMDirectory dir = new MockRAMDirectory(startDir);
++          writer = new IndexWriter(dir, new WhitespaceAnalyzer(), false);
++          IOException err = null;
++
++          for(int x=0;x<2;x++) {
++
++            // Two loops: first time, limit disk space &
++            // throw random IOExceptions; second time, no
++            // disk space limit:
++
++            double rate = 0.05;
++            double diskRatio = ((double) diskFree)/diskUsage;
++            long thisDiskFree;
++
++            if (0 == x) {
++              thisDiskFree = diskFree;
++              if (diskRatio >= 2.0) {
++                rate /= 2;
++              }
++              if (diskRatio >= 4.0) {
++                rate /= 2;
++              }
++              if (diskRatio >= 6.0) {
++                rate = 0.0;
++              }
++              if (debug) {
++                System.out.println("\ncycle: " + methodName + ": " + diskFree + " bytes");
++              }
++            } else {
++              thisDiskFree = 0;
++              rate = 0.0;
++              if (debug) {
++                System.out.println("\ncycle: " + methodName + ", same writer: unlimited disk space");
++              }
++            }
++
++            dir.setMaxSizeInBytes(thisDiskFree);
++            dir.setRandomIOExceptionRate(rate, diskFree);
++
++            try {
++
++              if (0 == method) {
++                writer.addIndexes(dirs);
++              } else if (1 == method) {
++                IndexReader readers[] = new IndexReader[dirs.length];
++                for(int i=0;i<dirs.length;i++) {
++                  readers[i] = IndexReader.open(dirs[i]);
++                }
++                try {
++                  writer.addIndexes(readers);
++                } finally {
++                  for(int i=0;i<dirs.length;i++) {
++                    readers[i].close();
++                  }
++                }
++              } else {
++                writer.addIndexesNoOptimize(dirs);
++              }
++
++              success = true;
++              if (debug) {
++                System.out.println("  success!");
++              }
++
++              if (0 == x) {
++                done = true;
++              }
++
++            } catch (IOException e) {
++              success = false;
++              err = e;
++              if (debug) {
++                System.out.println("  hit IOException: " + e);
++              }
++
++              if (1 == x) {
++                e.printStackTrace();
++                fail(methodName + " hit IOException after disk space was freed up");
++              }
++            }
++
++            // Whether we succeeded or failed, check that all
++            // un-referenced files were in fact deleted (ie,
++            // we did not create garbage).  Just create a
++            // new IndexFileDeleter, have it delete
++            // unreferenced files, then verify that in fact
++            // no files were deleted:
++            String[] startFiles = dir.list();
++            SegmentInfos infos = new SegmentInfos();
++            infos.read(dir);
++            IndexFileDeleter d = new IndexFileDeleter(infos, dir);
++            d.findDeletableFiles();
++            d.deleteFiles();
++            String[] endFiles = dir.list();
++
++            Arrays.sort(startFiles);
++            Arrays.sort(endFiles);
++
++            /*
++              for(int i=0;i<startFiles.length;i++) {
++              System.out.println("  " + i + ": " + startFiles[i]);
++              }
++            */
++
++            if (!Arrays.equals(startFiles, endFiles)) {
++              String successStr;
++              if (success) {
++                successStr = "success";
++              } else {
++                successStr = "IOException";
++                err.printStackTrace();
++              }
++              fail(methodName + " failed to delete unreferenced files after " + successStr + " (" + diskFree + " bytes): before delete:\n    " + arrayToString(startFiles) + "\n  after delete:\n    " + arrayToString(endFiles));
++            }
++
++            if (debug) {
++              System.out.println("  now test readers");
++            }
++
++            // Finally, verify index is not corrupt, and, if
++            // we succeeded, we see all docs added, and if we
++            // failed, we see either all docs or no docs added
++            // (transactional semantics):
++            try {
++              reader = IndexReader.open(dir);
++            } catch (IOException e) {
++              e.printStackTrace();
++              fail(testName + ": exception when creating IndexReader: " + e);
++            }
++            int result = reader.docFreq(searchTerm);
++            if (success) {
++              if (result != END_COUNT) {
++                fail(testName + ": method did not throw exception but docFreq('aaa') is " + result + " instead of expected " + END_COUNT);
++              }
++            } else {
++              // On hitting exception we still may have added
++              // all docs:
++              if (result != START_COUNT && result != END_COUNT) {
++                err.printStackTrace();
++                fail(testName + ": method did throw exception but docFreq('aaa') is " + result + " instead of expected " + START_COUNT + " or " + END_COUNT);
++              }
++            }
++
++            searcher = new IndexSearcher(reader);
++            try {
++              hits = searcher.search(new TermQuery(searchTerm));
++            } catch (IOException e) {
++              e.printStackTrace();
++              fail(testName + ": exception when searching: " + e);
++            }
++            int result2 = hits.length();
++            if (success) {
++              if (result2 != result) {
++                fail(testName + ": method did not throw exception but hits.length for search on term 'aaa' is " + result2 + " instead of expected " + result);
++              }
++            } else {
++              // On hitting exception we still may have added
++              // all docs:
++              if (result2 != result) {
++                err.printStackTrace();
++                fail(testName + ": method did throw exception but hits.length for search on term 'aaa' is " + result2 + " instead of expected " + result);
++              }
++            }
++
++            searcher.close();
++            reader.close();
++            if (debug) {
++              System.out.println("  count is " + result);
++            }
++
++            if (result == END_COUNT) {
++              break;
++            }
++          }
++
++          // Javadocs state that temp free Directory space
++          // required is at most 2X total input size of
++          // indices so let's make sure:
++          assertTrue("max free Directory space required exceeded 1X the total input index sizes during " + methodName +
++                     ": max temp usage = " + (dir.getMaxUsedSizeInBytes()-startDiskUsage) + " bytes; " +
++                     "starting disk usage = " + startDiskUsage + " bytes; " +
++                     "input index disk usage = " + inputDiskUsage + " bytes",
++                     (dir.getMaxUsedSizeInBytes()-startDiskUsage) < 2*(startDiskUsage + inputDiskUsage));
++
++          writer.close();
++          dir.close();
++
++          // Try again with 1000 more bytes of free space:
++          diskFree += 1000;
++        }
++      }
++
++      startDir.close();
++    }
++
++    /**
++     * Make sure optimize doesn't use any more than 1X
++     * starting index size as its temporary free space
++     * required.
++     */
++    public void testOptimizeTempSpaceUsage() throws IOException {
++    
++      MockRAMDirectory dir = new MockRAMDirectory();
++      IndexWriter writer  = new IndexWriter(dir, new WhitespaceAnalyzer(), true);
++      for(int j=0;j<500;j++) {
++        addDocWithIndex(writer, j);
++      }
++      writer.close();
++
++      long startDiskUsage = 0;
++      String[] files = dir.list();
++      for(int i=0;i<files.length;i++) {
++        startDiskUsage += dir.fileLength(files[i]);
++      }
++
++      dir.resetMaxUsedSizeInBytes();
++      writer  = new IndexWriter(dir, new WhitespaceAnalyzer(), false);
++      writer.optimize();
++      writer.close();
++      long maxDiskUsage = dir.getMaxUsedSizeInBytes();
++
++      assertTrue("optimized used too much temporary space: starting usage was " + startDiskUsage + " bytes; max temp usage was " + maxDiskUsage + " but should have been " + (2*startDiskUsage) + " (= 2X starting usage)",
++                 maxDiskUsage <= 2*startDiskUsage);
++    }
++
++    private String arrayToString(String[] l) {
++      String s = "";
++      for(int i=0;i<l.length;i++) {
++        if (i > 0) {
++          s += "\n    ";
++        }
++        s += l[i];
++      }
++      return s;
++    }
++
+     // Make sure we can open an index for create even when a
+     // reader holds it open (this fails pre lock-less
+     // commits on windows):
+@@ -276,3 +625,5 @@ public class TestIndexWriter extends TestCase
+         dir.delete();
+     }
+ }
++
++
+diff --git a/src/test/org/apache/lucene/index/store/TestRAMDirectory.java b/src/test/org/apache/lucene/index/store/TestRAMDirectory.java
+index 967cfef..3e692a1 100644
+--- a/src/test/org/apache/lucene/index/store/TestRAMDirectory.java
++++ b/src/test/org/apache/lucene/index/store/TestRAMDirectory.java
+@@ -33,6 +33,8 @@ import org.apache.lucene.store.FSDirectory;
+ import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.util.English;
+ 
++import org.apache.lucene.store.MockRAMDirectory;
++
+ /**
+  * JUnit testcase to test RAMDirectory. RAMDirectory itself is used in many testcases,
+  * but not one of them uses an different constructor other than the default constructor.
+@@ -70,7 +72,7 @@ public class TestRAMDirectory extends TestCase {
+   public void testRAMDirectory () throws IOException {
+     
+     Directory dir = FSDirectory.getDirectory(indexDir, false);
+-    RAMDirectory ramDir = new RAMDirectory(dir);
++    MockRAMDirectory ramDir = new MockRAMDirectory(dir);
+     
+     // close the underlaying directory
+     dir.close();
+@@ -98,7 +100,7 @@ public class TestRAMDirectory extends TestCase {
+ 
+   public void testRAMDirectoryFile () throws IOException {
+     
+-    RAMDirectory ramDir = new RAMDirectory(indexDir);
++    MockRAMDirectory ramDir = new MockRAMDirectory(indexDir);
+     
+     // Check size
+     assertEquals(ramDir.sizeInBytes(), ramDir.getRecomputedSizeInBytes());
+@@ -123,7 +125,7 @@ public class TestRAMDirectory extends TestCase {
+   
+   public void testRAMDirectoryString () throws IOException {
+     
+-    RAMDirectory ramDir = new RAMDirectory(indexDir.getCanonicalPath());
++    MockRAMDirectory ramDir = new MockRAMDirectory(indexDir.getCanonicalPath());
+     
+     // Check size
+     assertEquals(ramDir.sizeInBytes(), ramDir.getRecomputedSizeInBytes());
+@@ -151,7 +153,7 @@ public class TestRAMDirectory extends TestCase {
+   
+   public void testRAMDirectorySize() throws IOException, InterruptedException {
+       
+-    final RAMDirectory ramDir = new RAMDirectory(indexDir.getCanonicalPath());
++    final MockRAMDirectory ramDir = new MockRAMDirectory(indexDir.getCanonicalPath());
+     final IndexWriter writer  = new IndexWriter(ramDir, new WhitespaceAnalyzer(), false);
+     writer.optimize();
+     
+diff --git a/src/test/org/apache/lucene/store/MockRAMDirectory.java b/src/test/org/apache/lucene/store/MockRAMDirectory.java
+new file mode 100644
+index 0000000..0333526
+--- /dev/null
++++ b/src/test/org/apache/lucene/store/MockRAMDirectory.java
+@@ -0,0 +1,130 @@
++package org.apache.lucene.store;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.io.File;
++import java.util.Iterator;
++import java.util.Random;
++
++/**
++ * This is a subclass of RAMDirectory that adds methods
++ * intented to be used only by unit tests.
++ * @version $Id: RAMDirectory.java 437897 2006-08-29 01:13:10Z yonik $
++ */
++
++public class MockRAMDirectory extends RAMDirectory {
++  long maxSize;
++
++  // Max actual bytes used. This is set by MockRAMOutputStream:
++  long maxUsedSize;
++  double randomIOExceptionRate;
++  Random randomState;
++
++  public MockRAMDirectory() throws IOException {
++    super();
++  }
++  public MockRAMDirectory(String dir) throws IOException {
++    super(dir);
++  }
++  public MockRAMDirectory(Directory dir) throws IOException {
++    super(dir);
++  }
++  public MockRAMDirectory(File dir) throws IOException {
++    super(dir);
++  }
++
++  public void setMaxSizeInBytes(long maxSize) {
++    this.maxSize = maxSize;
++  }
++  public long getMaxSizeInBytes() {
++    return this.maxSize;
++  }
++
++  /**
++   * Returns the peek actual storage used (bytes) in this
++   * directory.
++   */
++  public long getMaxUsedSizeInBytes() {
++    return this.maxUsedSize;
++  }
++  public void resetMaxUsedSizeInBytes() {
++    this.maxUsedSize = getRecomputedActualSizeInBytes();
++  }
++
++  /**
++   * If 0.0, no exceptions will be thrown.  Else this should
++   * be a double 0.0 - 1.0.  We will randomly throw an
++   * IOException on the first write to an OutputStream based
++   * on this probability.
++   */
++  public void setRandomIOExceptionRate(double rate, long seed) {
++    randomIOExceptionRate = rate;
++    // seed so we have deterministic behaviour:
++    randomState = new Random(seed);
++  }
++  public double getRandomIOExceptionRate() {
++    return randomIOExceptionRate;
++  }
++
++  void maybeThrowIOException() throws IOException {
++    if (randomIOExceptionRate > 0.0) {
++      int number = Math.abs(randomState.nextInt() % 1000);
++      if (number < randomIOExceptionRate*1000) {
++        throw new IOException("a random IOException");
++      }
++    }
++  }
++
++  public IndexOutput createOutput(String name) {
++    RAMFile file = new RAMFile(this);
++    synchronized (this) {
++      RAMFile existing = (RAMFile)fileMap.get(name);
++      if (existing!=null) {
++        sizeInBytes -= existing.sizeInBytes;
++        existing.directory = null;
++      }
++      fileMap.put(name, file);
++    }
++
++    return new MockRAMOutputStream(this, file);
++  }
++
++  /** Provided for testing purposes.  Use sizeInBytes() instead. */
++  public synchronized final long getRecomputedSizeInBytes() {
++    long size = 0;
++    Iterator it = files.iterator();
++    while (it.hasNext())
++      size += ((RAMFile) it.next()).getSizeInBytes();
++    return size;
++  }
++
++  /** Like getRecomputedSizeInBytes(), but, uses actual file
++   * lengths rather than buffer allocations (which are
++   * quantized up to nearest
++   * BufferedIndexOutput.BUFFER_SIZE (now 1024) bytes.
++   */
++
++  final long getRecomputedActualSizeInBytes() {
++    long size = 0;
++    Iterator it = files.iterator();
++    while (it.hasNext())
++      size += ((RAMFile) it.next()).length;
++    return size;
++  }
++}
+diff --git a/src/test/org/apache/lucene/store/MockRAMOutputStream.java b/src/test/org/apache/lucene/store/MockRAMOutputStream.java
+new file mode 100644
+index 0000000..45425e8
+--- /dev/null
++++ b/src/test/org/apache/lucene/store/MockRAMOutputStream.java
+@@ -0,0 +1,83 @@
++package org.apache.lucene.store;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Iterator;
++
++/**
++ * Used by MockRAMDirectory to create an output stream that
++ * will throw an IOException on fake disk full, track max
++ * disk space actually used, and maybe throw random
++ * IOExceptions.
++ */
++
++public class MockRAMOutputStream extends RAMOutputStream {
++  private MockRAMDirectory dir;
++  private boolean first=true;
++
++  /** Construct an empty output buffer. */
++  public MockRAMOutputStream(MockRAMDirectory dir, RAMFile f) {
++    super(f);
++    this.dir = dir;
++  }
++
++  public void close() throws IOException {
++    super.close();
++
++    // Now compute actual disk usage & track the maxUsedSize
++    // in the MockRAMDirectory:
++    long size = dir.getRecomputedActualSizeInBytes();
++    if (size > dir.maxUsedSize) {
++      dir.maxUsedSize = size;
++    }
++  }
++
++  public void flushBuffer(byte[] src, int len) throws IOException {
++    long freeSpace = dir.maxSize - dir.sizeInBytes();
++    long realUsage = 0;
++
++    // Enforce disk full:
++    if (dir.maxSize != 0 && freeSpace <= len) {
++      // Compute the real disk free.  This will greatly slow
++      // down our test but makes it more accurate:
++      realUsage = dir.getRecomputedActualSizeInBytes();
++      freeSpace = dir.maxSize - realUsage;
++    }
++
++    if (dir.maxSize != 0 && freeSpace <= len) {
++      if (freeSpace > 0 && freeSpace < len) {
++        realUsage += freeSpace;
++        super.flushBuffer(src, (int) freeSpace);
++      }
++      if (realUsage > dir.maxUsedSize) {
++        dir.maxUsedSize = realUsage;
++      }
++      throw new IOException("fake disk full at " + dir.sizeInBytes() + " bytes");
++    } else {
++      super.flushBuffer(src, len);
++    }
++
++    if (first) {
++      // Maybe throw random exception; only do this on first
++      // write to a new file:
++      first = false;
++      dir.maybeThrowIOException();
++    }
++  }
++}
+

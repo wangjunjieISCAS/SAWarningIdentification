@@ -1,0 +1,408 @@
+GitDiffStart: 664e39292bd0a90ed6f20debc872ab74a1d7294f | Sun Jun 12 16:56:54 2016 -0400
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 64be39a..5a83c31 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -36,6 +36,10 @@ Improvements
+   IndexWriter.setIndexSort, and now works with dimensional points.
+   (Adrien Grand, Mike McCandless)
+ 
++* LUCENE-5931: Detect when an application tries to reopen an
++  IndexReader after (illegally) removing the old index and
++  reindexing (Vitaly Funstein, Robert Muir, Mike McCandless)
++
+ Other
+ 
+ * LUCENE-4787: Fixed some highlighting javadocs. (Michael Dodsworth via Adrien
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SegmentReader.java b/lucene/core/src/java/org/apache/lucene/index/SegmentReader.java
+index e68f818..ed0a06e 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SegmentReader.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SegmentReader.java
+@@ -52,6 +52,9 @@ public final class SegmentReader extends CodecReader {
+ 
+   final SegmentCoreReaders core;
+   final SegmentDocValues segDocValues;
++
++  /** True if we are holding RAM only liveDocs or DV updates, i.e. the SegmentCommitInfo delGen doesn't match our liveDocs. */
++  final boolean isNRT;
+   
+   final DocValuesProducer docValuesProducer;
+   final FieldInfos fieldInfos;
+@@ -64,6 +67,10 @@ public final class SegmentReader extends CodecReader {
+   // TODO: why is this public?
+   public SegmentReader(SegmentCommitInfo si, IOContext context) throws IOException {
+     this.si = si;
++
++    // We pull liveDocs/DV updates from disk:
++    this.isNRT = false;
++    
+     core = new SegmentCoreReaders(si.info.dir, si, context);
+     segDocValues = new SegmentDocValues();
+     
+@@ -100,8 +107,8 @@ public final class SegmentReader extends CodecReader {
+    *  deletes file.  Used by openIfChanged. */
+   SegmentReader(SegmentCommitInfo si, SegmentReader sr) throws IOException {
+     this(si, sr,
+-         si.info.getCodec().liveDocsFormat().readLiveDocs(si.info.dir, si, IOContext.READONCE),
+-         si.info.maxDoc() - si.getDelCount());
++         si.hasDeletions() ? si.info.getCodec().liveDocsFormat().readLiveDocs(si.info.dir, si, IOContext.READONCE) : null,
++         si.info.maxDoc() - si.getDelCount(), false);
+   }
+ 
+   /** Create new SegmentReader sharing core from a previous
+@@ -109,6 +116,13 @@ public final class SegmentReader extends CodecReader {
+    *  liveDocs.  Used by IndexWriter to provide a new NRT
+    *  reader */
+   SegmentReader(SegmentCommitInfo si, SegmentReader sr, Bits liveDocs, int numDocs) throws IOException {
++    this(si, sr, liveDocs, numDocs, true);
++  }
++    
++  /** Create new SegmentReader sharing core from a previous
++   *  SegmentReader and using the provided liveDocs, and recording
++   *  whether those liveDocs were carried in ram (isNRT=true). */
++  SegmentReader(SegmentCommitInfo si, SegmentReader sr, Bits liveDocs, int numDocs, boolean isNRT) throws IOException {
+     if (numDocs > si.info.maxDoc()) {
+       throw new IllegalArgumentException("numDocs=" + numDocs + " but maxDoc=" + si.info.maxDoc());
+     }
+@@ -117,6 +131,7 @@ public final class SegmentReader extends CodecReader {
+     }
+     this.si = si;
+     this.liveDocs = liveDocs;
++    this.isNRT = isNRT;
+     this.numDocs = numDocs;
+     this.core = sr.core;
+     core.incRef();
+diff --git a/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java b/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+index e2f81da..7ac059e 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
++++ b/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+@@ -19,6 +19,7 @@ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -152,7 +153,6 @@ public final class StandardDirectoryReader extends DirectoryReader {
+     }
+     
+     SegmentReader[] newReaders = new SegmentReader[infos.size()];
+-    
+     for (int i = infos.size() - 1; i>=0; i--) {
+       SegmentCommitInfo commitInfo = infos.info(i);
+ 
+@@ -167,6 +167,12 @@ public final class StandardDirectoryReader extends DirectoryReader {
+         oldReader = (SegmentReader) oldReaders.get(oldReaderIndex.intValue());
+       }
+ 
++      // Make a best effort to detect when the app illegally "rm -rf" their
++      // index while a reader was open, and then called openIfChanged:
++      if (oldReader != null && Arrays.equals(commitInfo.info.getId(), oldReader.getSegmentInfo().info.getId()) == false) {
++        throw new IllegalStateException("same segment " + commitInfo.info.name + " has invalid doc count change; likely you are re-opening a reader after illegally removing index files yourself and building a new index in their place.  Use IndexWriter.deleteAll or open a new IndexWriter using OpenMode.CREATE instead");
++      }
++
+       boolean success = false;
+       try {
+         SegmentReader newReader;
+@@ -176,35 +182,29 @@ public final class StandardDirectoryReader extends DirectoryReader {
+           newReader = new SegmentReader(commitInfo, IOContext.READ);
+           newReaders[i] = newReader;
+         } else {
+-          if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()
+-              && oldReader.getSegmentInfo().getFieldInfosGen() == commitInfo.getFieldInfosGen()) {
+-            // No change; this reader will be shared between
+-            // the old and the new one, so we must incRef
+-            // it:
+-            oldReader.incRef();
+-            newReaders[i] = oldReader;
++          if (oldReader.isNRT) {
++            // We must load liveDocs/DV updates from disk:
++            newReaders[i] = new SegmentReader(commitInfo, oldReader);
+           } else {
+-            // Steal the ref returned by SegmentReader ctor:
+-            assert commitInfo.info.dir == oldReader.getSegmentInfo().info.dir;
+-
+-            // Make a best effort to detect when the app illegally "rm -rf" their
+-            // index while a reader was open, and then called openIfChanged:
+-            boolean illegalDocCountChange = commitInfo.info.maxDoc() != oldReader.getSegmentInfo().info.maxDoc();
+             
+-            boolean hasNeitherDeletionsNorUpdates = commitInfo.hasDeletions()== false && commitInfo.hasFieldUpdates() == false;
+-
+-            boolean deletesWereLost = commitInfo.getDelGen() == -1 && oldReader.getSegmentInfo().getDelGen() != -1;
+-
+-            if (illegalDocCountChange || hasNeitherDeletionsNorUpdates || deletesWereLost) {
+-              throw new IllegalStateException("same segment " + commitInfo.info.name + " has invalid changes; likely you are re-opening a reader after illegally removing index files yourself and building a new index in their place.  Use IndexWriter.deleteAll or OpenMode.CREATE instead");
+-            }
+-
+-            if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()) {
+-              // only DV updates
+-              newReaders[i] = new SegmentReader(commitInfo, oldReader, oldReader.getLiveDocs(), oldReader.numDocs());
++            if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()
++                && oldReader.getSegmentInfo().getFieldInfosGen() == commitInfo.getFieldInfosGen()) {
++              // No change; this reader will be shared between
++              // the old and the new one, so we must incRef
++              // it:
++              oldReader.incRef();
++              newReaders[i] = oldReader;
+             } else {
+-              // both DV and liveDocs have changed
+-              newReaders[i] = new SegmentReader(commitInfo, oldReader);
++              // Steal the ref returned by SegmentReader ctor:
++              assert commitInfo.info.dir == oldReader.getSegmentInfo().info.dir;
++
++              if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()) {
++                // only DV updates
++                newReaders[i] = new SegmentReader(commitInfo, oldReader, oldReader.getLiveDocs(), oldReader.numDocs());
++              } else {
++                // both DV and liveDocs have changed
++                newReaders[i] = new SegmentReader(commitInfo, oldReader);
++              }
+             }
+           }
+         }
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java b/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
+index 6afa091..e2102cb 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
+@@ -33,6 +33,7 @@ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.FieldType;
+ import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.StringField;
+ import org.apache.lucene.document.TextField;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.search.IndexSearcher;
+@@ -772,4 +773,231 @@ public class TestDirectoryReaderReopen extends LuceneTestCase {
+     r.close();
+     dir.close();
+   }
++
++  /** test reopening backwards from a non-NRT reader (with document deletes) */
++  public void testNRTMdeletes() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    SnapshotDeletionPolicy snapshotter = new SnapshotDeletionPolicy(new KeepOnlyLastCommitDeletionPolicy());
++    iwc.setIndexDeletionPolicy(snapshotter);
++    IndexWriter writer = new IndexWriter(dir, iwc);
++    writer.commit(); // make sure all index metadata is written out
++  
++    Document doc = new Document();
++    doc.add(new StringField("key", "value1", Field.Store.YES));
++    writer.addDocument(doc);
++ 
++    doc = new Document();
++    doc.add(new StringField("key", "value2", Field.Store.YES));
++    writer.addDocument(doc);
++    
++    writer.commit();
++    
++    IndexCommit ic1 = snapshotter.snapshot();
++    
++    doc = new Document();
++    doc.add(new StringField("key", "value3", Field.Store.YES));
++    writer.updateDocument(new Term("key", "value1"), doc);
++    
++    writer.commit();
++    
++    IndexCommit ic2 = snapshotter.snapshot();
++    DirectoryReader latest = DirectoryReader.open(ic2);
++    assertEquals(2, latest.leaves().size());
++    
++    // This reader will be used for searching against commit point 1
++    DirectoryReader oldest = DirectoryReader.openIfChanged(latest, ic1);
++    assertEquals(1, oldest.leaves().size());
++    
++    // sharing same core
++    assertSame(latest.leaves().get(0).reader().getCoreCacheKey(), oldest.leaves().get(0).reader().getCoreCacheKey());
++    
++    latest.close();
++    oldest.close();
++    
++    snapshotter.release(ic1);
++    snapshotter.release(ic2);
++    writer.close();
++    dir.close();
++  }
++  
++  /** test reopening backwards from an NRT reader (with document deletes) */
++  public void testNRTMdeletes2() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    SnapshotDeletionPolicy snapshotter = new SnapshotDeletionPolicy(new KeepOnlyLastCommitDeletionPolicy());
++    iwc.setIndexDeletionPolicy(snapshotter);
++    IndexWriter writer = new IndexWriter(dir, iwc);
++    writer.commit(); // make sure all index metadata is written out
++  
++    Document doc = new Document();
++    doc.add(new StringField("key", "value1", Field.Store.YES));
++    writer.addDocument(doc);
++ 
++    doc = new Document();
++    doc.add(new StringField("key", "value2", Field.Store.YES));
++    writer.addDocument(doc);
++    
++    writer.commit();
++    
++    IndexCommit ic1 = snapshotter.snapshot();
++    
++    doc = new Document();
++    doc.add(new StringField("key", "value3", Field.Store.YES));
++    writer.updateDocument(new Term("key", "value1"), doc);
++    
++    DirectoryReader latest = DirectoryReader.open(writer);
++    assertEquals(2, latest.leaves().size());
++    
++    // This reader will be used for searching against commit point 1
++    DirectoryReader oldest = DirectoryReader.openIfChanged(latest, ic1);
++    
++    // This reader should not see the deletion:
++    assertEquals(2, oldest.numDocs());
++    assertFalse(oldest.hasDeletions());
++ 
++    snapshotter.release(ic1);
++    assertEquals(1, oldest.leaves().size());
++    
++    // sharing same core
++    assertSame(latest.leaves().get(0).reader().getCoreCacheKey(), oldest.leaves().get(0).reader().getCoreCacheKey());
++    
++    latest.close();
++    oldest.close();
++    
++    writer.close();
++    dir.close();
++  }
++ 
++  /** test reopening backwards from a non-NRT reader with DV updates */
++  public void testNRTMupdates() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    SnapshotDeletionPolicy snapshotter = new SnapshotDeletionPolicy(new KeepOnlyLastCommitDeletionPolicy());
++    iwc.setIndexDeletionPolicy(snapshotter);
++    IndexWriter writer = new IndexWriter(dir, iwc);
++    writer.commit(); // make sure all index metadata is written out
++  
++    Document doc = new Document();
++    doc.add(new StringField("key", "value1", Field.Store.YES));
++    doc.add(new NumericDocValuesField("dv", 1));
++    writer.addDocument(doc);
++    
++    writer.commit();
++    
++    IndexCommit ic1 = snapshotter.snapshot();
++    
++    writer.updateNumericDocValue(new Term("key", "value1"), "dv", 2);
++    
++    writer.commit();
++    
++    IndexCommit ic2 = snapshotter.snapshot();
++    DirectoryReader latest = DirectoryReader.open(ic2);
++    assertEquals(1, latest.leaves().size());
++    
++    // This reader will be used for searching against commit point 1
++    DirectoryReader oldest = DirectoryReader.openIfChanged(latest, ic1);
++    assertEquals(1, oldest.leaves().size());
++    
++    // sharing same core
++    assertSame(latest.leaves().get(0).reader().getCoreCacheKey(), oldest.leaves().get(0).reader().getCoreCacheKey());
++    
++    assertEquals(1, getOnlyLeafReader(oldest).getNumericDocValues("dv").get(0));
++    assertEquals(2, getOnlyLeafReader(latest).getNumericDocValues("dv").get(0));
++    
++    latest.close();
++    oldest.close();
++    
++    snapshotter.release(ic1);
++    snapshotter.release(ic2);
++    writer.close();
++    dir.close();
++  }
++ 
++  /** test reopening backwards from an NRT reader with DV updates */
++  public void testNRTMupdates2() throws Exception {
++    Directory dir = newDirectory();
++    IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
++    SnapshotDeletionPolicy snapshotter = new SnapshotDeletionPolicy(new KeepOnlyLastCommitDeletionPolicy());
++    iwc.setIndexDeletionPolicy(snapshotter);
++    IndexWriter writer = new IndexWriter(dir, iwc);
++    writer.commit(); // make sure all index metadata is written out
++  
++    Document doc = new Document();
++    doc.add(new StringField("key", "value1", Field.Store.YES));
++    doc.add(new NumericDocValuesField("dv", 1));
++    writer.addDocument(doc);
++    
++    writer.commit();
++    
++    IndexCommit ic1 = snapshotter.snapshot();
++    
++    writer.updateNumericDocValue(new Term("key", "value1"), "dv", 2);
++    
++    DirectoryReader latest = DirectoryReader.open(writer);
++    assertEquals(1, latest.leaves().size());
++    
++    // This reader will be used for searching against commit point 1
++    DirectoryReader oldest = DirectoryReader.openIfChanged(latest, ic1);
++    assertEquals(1, oldest.leaves().size());
++    
++    // sharing same core
++    assertSame(latest.leaves().get(0).reader().getCoreCacheKey(), oldest.leaves().get(0).reader().getCoreCacheKey());
++    
++    assertEquals(1, getOnlyLeafReader(oldest).getNumericDocValues("dv").get(0));
++    assertEquals(2, getOnlyLeafReader(latest).getNumericDocValues("dv").get(0));
++    
++    latest.close();
++    oldest.close();
++    
++    snapshotter.release(ic1);
++    writer.close();
++    dir.close();
++  }
++  
++  // LUCENE-5931: we make a "best effort" to catch this abuse and throw a clear(er)
++  // exception than what would otherwise look like hard to explain index corruption during searching
++  public void testDeleteIndexFilesWhileReaderStillOpen() throws Exception {
++    RAMDirectory dir = new RAMDirectory();
++    IndexWriter w = new IndexWriter(dir,
++                                    new IndexWriterConfig(new MockAnalyzer(random())));
++    Document doc = new Document();
++    doc.add(newStringField("field", "value", Field.Store.NO));
++    w.addDocument(doc);
++    // Creates single segment index:
++    w.close();
++ 
++    DirectoryReader r = DirectoryReader.open(dir);
++ 
++    // Abuse: remove all files while reader is open; one is supposed to use IW.deleteAll, or open a new IW with OpenMode.CREATE instead:
++    for(String file : dir.listAll()) {
++      dir.deleteFile(file);
++    }
++ 
++    w = new IndexWriter(dir,
++                        new IndexWriterConfig(new MockAnalyzer(random())));
++    doc = new Document();
++    doc.add(newStringField("field", "value", Field.Store.NO));
++    w.addDocument(doc);
++
++    doc = new Document();
++    doc.add(newStringField("field", "value2", Field.Store.NO));
++    w.addDocument(doc);
++
++    // Writes same segment, this time with two documents:
++    w.commit();
++
++    w.deleteDocuments(new Term("field", "value2"));
++
++    w.addDocument(doc);
++
++    // Writes another segments file, so openIfChanged sees that the index has in fact changed:
++    w.close();
++ 
++    expectThrows(IllegalStateException.class, () -> {
++      DirectoryReader.openIfChanged(r);
++    });
++  }
+ }
++
++
+

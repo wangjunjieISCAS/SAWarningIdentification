@@ -1,0 +1,410 @@
+GitDiffStart: a193836b8628f0273f96aae969e96e59e5d66cd7 | Mon Jan 27 17:03:09 2014 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index af7ea9f..86e0f7e 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -229,6 +229,9 @@ Bug Fixes
+ * SOLR-5663: example-DIH uses non-existing column for mapping (case-sensitive)
+   (steffkes)
+ 
++* SOLR-5666: Using the hdfs write cache can result in appearance of corrupted
++  index. (Mark Miller)
++
+ Optimizations
+ ----------------------
+ 
+diff --git a/solr/core/src/java/org/apache/solr/core/HdfsDirectoryFactory.java b/solr/core/src/java/org/apache/solr/core/HdfsDirectoryFactory.java
+index 341c811..466246c 100644
+--- a/solr/core/src/java/org/apache/solr/core/HdfsDirectoryFactory.java
++++ b/solr/core/src/java/org/apache/solr/core/HdfsDirectoryFactory.java
+@@ -128,12 +128,10 @@ public class HdfsDirectoryFactory extends CachingDirectoryFactory {
+           new Object[] {slabSize, bankCount,
+               ((long) bankCount * (long) slabSize)});
+       
+-      int _1024Size = params.getInt("solr.hdfs.blockcache.bufferstore.1024",
+-          8192);
+-      int _8192Size = params.getInt("solr.hdfs.blockcache.bufferstore.8192",
+-          8192);
++      int bufferSize = params.getInt("solr.hdfs.blockcache.bufferstore.buffersize", 128);
++      int bufferCount = params.getInt("solr.hdfs.blockcache.bufferstore.buffercount", 128 * 128);
+       
+-      BufferStore.init(_1024Size, _8192Size, metrics);
++      BufferStore.initNewBuffer(bufferSize, bufferCount);
+       long totalMemory = (long) bankCount * (long) numberOfBlocksPerBank
+           * (long) blockSize;
+       try {
+diff --git a/solr/core/src/java/org/apache/solr/store/blockcache/BlockDirectory.java b/solr/core/src/java/org/apache/solr/store/blockcache/BlockDirectory.java
+index d199002..9982197 100644
+--- a/solr/core/src/java/org/apache/solr/store/blockcache/BlockDirectory.java
++++ b/solr/core/src/java/org/apache/solr/store/blockcache/BlockDirectory.java
+@@ -138,33 +138,34 @@ public class BlockDirectory extends Directory {
+   }
+   
+   static class CachedIndexInput extends CustomBufferedIndexInput {
+-    
+-    private IndexInput _source;
+-    private int _blockSize;
+-    private long _fileLength;
+-    private String _cacheName;
+-    private Cache _cache;
++    private final Store store;
++    private IndexInput source;
++    private final int blockSize;
++    private final long fileLength;
++    private final String cacheName;
++    private final Cache cache;
+     
+     public CachedIndexInput(IndexInput source, int blockSize, String name,
+         String cacheName, Cache cache, int bufferSize) {
+       super(name, bufferSize);
+-      _source = source;
+-      _blockSize = blockSize;
+-      _fileLength = source.length();
+-      _cacheName = cacheName;
+-      _cache = cache;
++      this.source = source;
++      this.blockSize = blockSize;
++      fileLength = source.length();
++      this.cacheName = cacheName;
++      this.cache = cache;
++      store = BufferStore.instance(blockSize);
+     }
+     
+     @Override
+     public IndexInput clone() {
+       CachedIndexInput clone = (CachedIndexInput) super.clone();
+-      clone._source = (IndexInput) _source.clone();
++      clone.source = (IndexInput) source.clone();
+       return clone;
+     }
+     
+     @Override
+     public long length() {
+-      return _source.length();
++      return source.length();
+     }
+     
+     @Override
+@@ -186,7 +187,7 @@ public class BlockDirectory extends Directory {
+       // read whole block into cache and then provide needed data
+       long blockId = getBlock(position);
+       int blockOffset = (int) getPosition(position);
+-      int lengthToReadInBlock = Math.min(len, _blockSize - blockOffset);
++      int lengthToReadInBlock = Math.min(len, blockSize - blockOffset);
+       if (checkCache(blockId, blockOffset, b, off, lengthToReadInBlock)) {
+         return lengthToReadInBlock;
+       } else {
+@@ -199,25 +200,25 @@ public class BlockDirectory extends Directory {
+     private void readIntoCacheAndResult(long blockId, int blockOffset,
+         byte[] b, int off, int lengthToReadInBlock) throws IOException {
+       long position = getRealPosition(blockId, 0);
+-      int length = (int) Math.min(_blockSize, _fileLength - position);
+-      _source.seek(position);
++      int length = (int) Math.min(blockSize, fileLength - position);
++      source.seek(position);
+       
+-      byte[] buf = BufferStore.takeBuffer(_blockSize);
+-      _source.readBytes(buf, 0, length);
++      byte[] buf = store.takeBuffer(blockSize);
++      source.readBytes(buf, 0, length);
+       System.arraycopy(buf, blockOffset, b, off, lengthToReadInBlock);
+-      _cache.update(_cacheName, blockId, 0, buf, 0, _blockSize);
+-      BufferStore.putBuffer(buf);
++      cache.update(cacheName, blockId, 0, buf, 0, blockSize);
++      store.putBuffer(buf);
+     }
+     
+     private boolean checkCache(long blockId, int blockOffset, byte[] b,
+         int off, int lengthToReadInBlock) {
+-      return _cache.fetch(_cacheName, blockId, blockOffset, b, off,
++      return cache.fetch(cacheName, blockId, blockOffset, b, off,
+           lengthToReadInBlock);
+     }
+     
+     @Override
+     protected void closeInternal() throws IOException {
+-      _source.close();
++      source.close();
+     }
+   }
+   
+diff --git a/solr/core/src/java/org/apache/solr/store/blockcache/BufferStore.java b/solr/core/src/java/org/apache/solr/store/blockcache/BufferStore.java
+index 70ced2e..3e637d5 100644
+--- a/solr/core/src/java/org/apache/solr/store/blockcache/BufferStore.java
++++ b/solr/core/src/java/org/apache/solr/store/blockcache/BufferStore.java
+@@ -19,34 +19,50 @@ package org.apache.solr.store.blockcache;
+ 
+ import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.atomic.AtomicLong;
+-
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-public class BufferStore {
+-  
+-  public static Logger LOG = LoggerFactory.getLogger(BufferStore.class);
+-  
+-  private static BlockingQueue<byte[]> _1024 = setupBuffers(1024, 1);
+-  private static BlockingQueue<byte[]> _8192 = setupBuffers(8192, 1);
+-  public static AtomicLong shardBuffercacheLost = new AtomicLong();
+-  public static AtomicLong shardBuffercacheAllocate1024 = new AtomicLong();
+-  public static AtomicLong shardBuffercacheAllocate8192 = new AtomicLong();
+-  public static AtomicLong shardBuffercacheAllocateOther = new AtomicLong();
+-  
+-  public static void init(int _1024Size, int _8192Size, Metrics metrics) {
+-
+-    LOG.info("Initializing the 1024 buffers with [{}] buffers.", _1024Size);
+-    _1024 = setupBuffers(1024, _1024Size);
+-    LOG.info("Initializing the 8192 buffers with [{}] buffers.", _8192Size);
+-    _8192 = setupBuffers(8192, _8192Size);
+-    shardBuffercacheLost = metrics.shardBuffercacheLost;
+-    shardBuffercacheAllocate1024 = metrics.shardBuffercacheAllocate1024;
+-    shardBuffercacheAllocate8192 = metrics.shardBuffercacheAllocate8192;
+-    shardBuffercacheAllocateOther = metrics.shardBuffercacheAllocateOther;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++
++
++public class BufferStore implements Store {
++
++  private static final Store EMPTY = new Store() {
++
++    @Override
++    public byte[] takeBuffer(int bufferSize) {
++      return new byte[bufferSize];
++    }
++
++    @Override
++    public void putBuffer(byte[] buffer) {
++    }
++  };
++
++  private final static ConcurrentMap<Integer, BufferStore> bufferStores = new ConcurrentHashMap<Integer, BufferStore>();
++
++  private final BlockingQueue<byte[]> buffers;
++
++  private final int bufferSize;
++
++  public synchronized static void initNewBuffer(int bufferSize, long totalAmount) {
++    if (totalAmount == 0) {
++      return;
++    }
++    BufferStore bufferStore = bufferStores.get(bufferSize);
++    if (bufferStore == null) {
++      long count = totalAmount / bufferSize;
++      if (count > Integer.MAX_VALUE) {
++        count = Integer.MAX_VALUE;
++      }
++      BufferStore store = new BufferStore(bufferSize, (int) count);
++      bufferStores.put(bufferSize, store);
++    }
++  }
++
++  private BufferStore(int bufferSize, int count) {
++    this.bufferSize = bufferSize;
++    buffers = setupBuffers(bufferSize, count);
+   }
+-  
++
+   private static BlockingQueue<byte[]> setupBuffers(int bufferSize, int count) {
+     BlockingQueue<byte[]> queue = new ArrayBlockingQueue<byte[]>(count);
+     for (int i = 0; i < count; i++) {
+@@ -54,57 +70,44 @@ public class BufferStore {
+     }
+     return queue;
+   }
+-  
+-  public static byte[] takeBuffer(int bufferSize) {
+-    switch (bufferSize) {
+-      case 1024:
+-        return newBuffer1024(_1024.poll());
+-      case 8192:
+-        return newBuffer8192(_8192.poll());
+-      default:
+-        return newBuffer(bufferSize);
++
++  public static Store instance(int bufferSize) {
++    BufferStore bufferStore = bufferStores.get(bufferSize);
++    if (bufferStore == null) {
++      return EMPTY;
++    }
++    return bufferStore;
++  }
++
++  @Override
++  public byte[] takeBuffer(int bufferSize) {
++    if (this.bufferSize != bufferSize) {
++      throw new RuntimeException("Buffer with length [" + bufferSize + "] does not match buffer size of ["
++          + bufferSize + "]");
+     }
++    return newBuffer(buffers.poll());
+   }
+-  
+-  public static void putBuffer(byte[] buffer) {
++
++  @Override
++  public void putBuffer(byte[] buffer) {
+     if (buffer == null) {
+       return;
+     }
+-    int bufferSize = buffer.length;
+-    switch (bufferSize) {
+-      case 1024:
+-        checkReturn(_1024.offer(buffer));
+-        return;
+-      case 8192:
+-        checkReturn(_8192.offer(buffer));
+-        return;
+-    }
+-  }
+-  
+-  private static void checkReturn(boolean offer) {
+-    if (!offer) {
+-      shardBuffercacheLost.incrementAndGet();
++    if (buffer.length != bufferSize) {
++      throw new RuntimeException("Buffer with length [" + buffer.length + "] does not match buffer size of ["
++          + bufferSize + "]");
+     }
++    checkReturn(buffers.offer(buffer));
+   }
+-  
+-  private static byte[] newBuffer1024(byte[] buf) {
+-    if (buf != null) {
+-      return buf;
+-    }
+-    shardBuffercacheAllocate1024.incrementAndGet();
+-    return new byte[1024];
++
++  private void checkReturn(boolean offer) {
++
+   }
+-  
+-  private static byte[] newBuffer8192(byte[] buf) {
++
++  private byte[] newBuffer(byte[] buf) {
+     if (buf != null) {
+       return buf;
+     }
+-    shardBuffercacheAllocate8192.incrementAndGet();
+-    return new byte[8192];
+-  }
+-  
+-  private static byte[] newBuffer(int size) {
+-    shardBuffercacheAllocateOther.incrementAndGet();
+-    return new byte[size];
++    return new byte[bufferSize];
+   }
+ }
+diff --git a/solr/core/src/java/org/apache/solr/store/blockcache/CustomBufferedIndexInput.java b/solr/core/src/java/org/apache/solr/store/blockcache/CustomBufferedIndexInput.java
+index d8ce739..3e12b70 100644
+--- a/solr/core/src/java/org/apache/solr/store/blockcache/CustomBufferedIndexInput.java
++++ b/solr/core/src/java/org/apache/solr/store/blockcache/CustomBufferedIndexInput.java
+@@ -35,6 +35,8 @@ public abstract class CustomBufferedIndexInput extends IndexInput {
+   private int bufferLength = 0; // end of valid bytes
+   private int bufferPosition = 0; // next byte to read
+   
++  private Store store;
++  
+   @Override
+   public byte readByte() throws IOException {
+     if (bufferPosition >= bufferLength) refill();
+@@ -49,6 +51,7 @@ public abstract class CustomBufferedIndexInput extends IndexInput {
+     super(resourceDesc);
+     checkBufferSize(bufferSize);
+     this.bufferSize = bufferSize;
++    this.store = BufferStore.instance(bufferSize);
+   }
+   
+   private void checkBufferSize(int bufferSize) {
+@@ -179,7 +182,7 @@ public abstract class CustomBufferedIndexInput extends IndexInput {
+     if (newLength <= 0) throw new EOFException("read past EOF");
+     
+     if (buffer == null) {
+-      buffer = BufferStore.takeBuffer(bufferSize);
++      buffer = store.takeBuffer(bufferSize);
+       seekInternal(bufferStart);
+     }
+     readInternal(buffer, 0, newLength);
+@@ -191,7 +194,7 @@ public abstract class CustomBufferedIndexInput extends IndexInput {
+   @Override
+   public final void close() throws IOException {
+     closeInternal();
+-    BufferStore.putBuffer(buffer);
++    store.putBuffer(buffer);
+     buffer = null;
+   }
+   
+diff --git a/solr/core/src/java/org/apache/solr/store/blockcache/ReusedBufferedIndexOutput.java b/solr/core/src/java/org/apache/solr/store/blockcache/ReusedBufferedIndexOutput.java
+index 52b68dd..6b12c98 100644
+--- a/solr/core/src/java/org/apache/solr/store/blockcache/ReusedBufferedIndexOutput.java
++++ b/solr/core/src/java/org/apache/solr/store/blockcache/ReusedBufferedIndexOutput.java
+@@ -1,6 +1,6 @@
+ package org.apache.solr.store.blockcache;
+ 
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+  * this work for additional information regarding copyright ownership.
+@@ -38,6 +38,8 @@ public abstract class ReusedBufferedIndexOutput extends IndexOutput {
+   /** total length of the file */
+   private long fileLength = 0;
+   
++  private final Store store;
++  
+   public ReusedBufferedIndexOutput() {
+     this(BUFFER_SIZE);
+   }
+@@ -45,7 +47,8 @@ public abstract class ReusedBufferedIndexOutput extends IndexOutput {
+   public ReusedBufferedIndexOutput(int bufferSize) {
+     checkBufferSize(bufferSize);
+     this.bufferSize = bufferSize;
+-    buffer = BufferStore.takeBuffer(this.bufferSize);
++    store = BufferStore.instance(bufferSize);
++    buffer = store.takeBuffer(this.bufferSize);
+   }
+   
+   protected long getBufferStart() {
+@@ -80,7 +83,7 @@ public abstract class ReusedBufferedIndexOutput extends IndexOutput {
+   public void close() throws IOException {
+     flushBufferToCache();
+     closeInternal();
+-    BufferStore.putBuffer(buffer);
++    store.putBuffer(buffer);
+     buffer = null;
+   }
+   
+diff --git a/solr/core/src/java/org/apache/solr/store/blockcache/Store.java b/solr/core/src/java/org/apache/solr/store/blockcache/Store.java
+new file mode 100644
+index 0000000..3a491b3
+--- /dev/null
++++ b/solr/core/src/java/org/apache/solr/store/blockcache/Store.java
+@@ -0,0 +1,26 @@
++package org.apache.solr.store.blockcache;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++public interface Store {
++
++  byte[] takeBuffer(int bufferSize);
++
++  void putBuffer(byte[] buffer);
++
++}
+

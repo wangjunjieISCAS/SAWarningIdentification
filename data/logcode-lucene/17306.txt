@@ -1,0 +1,992 @@
+GitDiffStart: 5190ea52329ee12e634ea2b877795b81d51345f6 | Fri Oct 1 20:40:52 2010 +0000
+diff --git a/lucene/contrib/CHANGES.txt b/lucene/contrib/CHANGES.txt
+index eda238c..b9bfd73 100644
+--- a/lucene/contrib/CHANGES.txt
++++ b/lucene/contrib/CHANGES.txt
+@@ -28,6 +28,9 @@ New Features
+ 
+   * LUCENE-2608: Added the ability to specify the accuracy at method time in the SpellChecker.  The per class
+     method is also still available.  (Grant Ingersoll)
++    
++  * LUCENE-2507: Added DirectSpellChecker, which retrieves correction candidates directly 
++    from the term dictionary using levenshtein automata.  (Robert Muir)
+ 
+ API Changes
+ 
+diff --git a/lucene/contrib/spellchecker/src/java/org/apache/lucene/search/spell/DirectSpellChecker.java b/lucene/contrib/spellchecker/src/java/org/apache/lucene/search/spell/DirectSpellChecker.java
+new file mode 100644
+index 0000000..73eee46
+--- /dev/null
++++ b/lucene/contrib/spellchecker/src/java/org/apache/lucene/search/spell/DirectSpellChecker.java
+@@ -0,0 +1,482 @@
++package org.apache.lucene.search.spell;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.PriorityQueue;
++
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.FuzzyTermsEnum;
++import org.apache.lucene.search.MultiTermQuery;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.automaton.LevenshteinAutomata;
++
++/**
++ * Simple automaton-based spellchecker.
++ * <p>
++ * Candidates are presented directly from the term dictionary, based on
++ * Levenshtein distance. This is an alternative to {@link SpellChecker}
++ * if you are using an edit-distance-like metric such as Levenshtein
++ * or {@link JaroWinklerDistance}.
++ * <p>
++ * A practical benefit of this spellchecker is that it requires no additional
++ * datastructures (neither in RAM nor on disk) to do its work.
++ * 
++ * @see LevenshteinAutomata
++ * @see FuzzyTermsEnum
++ * 
++ * @lucene.experimental
++ */
++public class DirectSpellChecker {
++  /** The default StringDistance, Levenshtein distance implemented internally
++   *  via {@link LevenshteinAutomata}.
++   *  <p>
++   *  Note: this is the fastest distance metric, because Levenshtein is used
++   *  to draw candidates from the term dictionary: this just re-uses the scoring.
++   *  <p>
++   *  Note also that this metric differs in subtle ways from {@link LevenshteinDistance}:
++   *  <ul>
++   *    <li> This metric treats full unicode codepoints as characters, but
++   *         LevenshteinDistance calculates based on UTF-16 code units.
++   *    <li> This metric scales raw edit distances into a floating point score
++   *         differently than LevenshteinDistance: the scaling is based upon the
++   *         shortest of the two terms instead of the longest.
++   *  </ul>
++   */
++  public static final StringDistance INTERNAL_LEVENSHTEIN = new StringDistance() {
++    @Override
++    public float getDistance(String s1, String s2) {
++      throw new UnsupportedOperationException("Not for external use.");
++    }};
++
++  /** maximum edit distance for candidate terms */
++  private int maxEdits = LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE;
++  /** minimum prefix for candidate terms */
++  private int minPrefix = 1;
++  /** maximum number of top-N inspections per suggestion */
++  private int maxInspections = 5;
++  /** minimum accuracy for a term to match */
++  private float accuracy = SpellChecker.DEFAULT_ACCURACY;
++  /** value in [0..1] (or absolute number >=1) representing the minimum
++    * number of documents (of the total) where a term should appear. */
++  private float thresholdFrequency = 0f;
++  /** minimum length of a query word to return suggestions */
++  private int minQueryLength = 4;
++  /** value in [0..1] (or absolute number >=1) representing the maximum
++   *  number of documents (of the total) a query term can appear in to
++   *  be corrected. */
++  private float maxQueryFrequency = 0.01f;
++  /** true if the spellchecker should lowercase terms */
++  private boolean lowerCaseTerms = true;
++  /** the comparator to use */
++  private Comparator<SuggestWord> comparator = SuggestWordQueue.DEFAULT_COMPARATOR;
++  /** the string distance to use */
++  private StringDistance distance = INTERNAL_LEVENSHTEIN;
++
++  /** Get the maximum number of Levenshtein edit-distances to draw
++   *  candidate terms from. */  
++  public int getMaxEdits() {
++    return maxEdits;
++  }
++
++  /** Sets the maximum number of Levenshtein edit-distances to draw
++   *  candidate terms from. This value can be 1 or 2. The default is 2.
++   *  <p>
++   *  Note: a large number of spelling errors occur with an edit distance
++   *  of 1, by setting this value to 1 you can increase both performance
++   *  and precision at the cost of recall.
++   */
++  public void setMaxEdits(int maxEdits) {
++    if (maxEdits < 1 || maxEdits > LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE)
++      throw new UnsupportedOperationException("Invalid maxEdits");
++    this.maxEdits = maxEdits;
++  }
++  
++  /**
++   * Get the minimal number of characters that must match exactly
++   */
++  public int getMinPrefix() {
++    return minPrefix;
++  }
++  
++  /**
++   * Sets the minimal number of initial characters (default: 1) 
++   * that must match exactly.
++   * <p>
++   * This can improve both performance and accuracy of results,
++   * as misspellings are commonly not the first character.
++   */
++  public void setMinPrefix(int minPrefix) {
++    this.minPrefix = minPrefix;
++  }
++  
++  /**
++   * Get the maximum number of top-N inspections per suggestion
++   */
++  public int getMaxInspections() {
++    return maxInspections;
++  }
++
++  /**
++   * Set the maximum number of top-N inspections (default: 5) per suggestion.
++   * <p>
++   * Increasing this number can improve the accuracy of results, at the cost 
++   * of performance.
++   */
++  public void setMaxInspections(int maxInspections) {
++    this.maxInspections = maxInspections;
++  }
++
++  /**
++   * Get the minimal accuracy from the StringDistance for a match
++   */
++  public float getAccuracy() {
++    return accuracy;
++  }
++
++  /**
++   * Set the minimal accuracy required (default: 0.5f) from a StringDistance 
++   * for a suggestion match.
++   */
++  public void setAccuracy(float accuracy) {
++    this.accuracy = accuracy;
++  }
++
++  /**
++   * Get the minimal threshold of documents a term must appear for a match
++   */
++  public float getThresholdFrequency() {
++    return thresholdFrequency;
++  }
++
++  /**
++   * Set the minimal threshold of documents a term must appear for a match.
++   * <p>
++   * This can improve quality by only suggesting high-frequency terms. Note that
++   * very high values might decrease performance slightly, by forcing the spellchecker
++   * to draw more candidates from the term dictionary, but a practical value such
++   * as <code>1</code> can be very useful towards improving quality.
++   * <p>
++   * This can be specified as a relative percentage of documents such as 0.5f,
++   * or it can be specified as an absolute whole document frequency, such as 4f.
++   * Absolute document frequencies may not be fractional.
++   */
++  public void setThresholdFrequency(float thresholdFrequency) {
++    if (thresholdFrequency >= 1f && thresholdFrequency != (int) thresholdFrequency)
++      throw new IllegalArgumentException("Fractional absolute document frequencies are not allowed");
++    this.thresholdFrequency = thresholdFrequency;
++  }
++
++  /** Get the minimum length of a query term needed to return suggestions */
++  public int getMinQueryLength() {
++    return minQueryLength;
++  }
++
++  /** 
++   * Set the minimum length of a query term (default: 4) needed to return suggestions. 
++   * <p>
++   * Very short query terms will often cause only bad suggestions with any distance
++   * metric.
++   */
++  public void setMinQueryLength(int minQueryLength) {
++    this.minQueryLength = minQueryLength;
++  }
++
++  /**
++   * Get the maximum threshold of documents a query term can appear in order
++   * to provide suggestions.
++   */
++  public float getMaxQueryFrequency() {
++    return maxQueryFrequency;
++  }
++
++  /**
++   * Set the maximum threshold (default: 0.01f) of documents a query term can 
++   * appear in order to provide suggestions.
++   * <p>
++   * Very high-frequency terms are typically spelled correctly. Additionally,
++   * this can increase performance as it will do no work for the common case
++   * of correctly-spelled input terms.
++   * <p>
++   * This can be specified as a relative percentage of documents such as 0.5f,
++   * or it can be specified as an absolute whole document frequency, such as 4f.
++   * Absolute document frequencies may not be fractional.
++   */
++  public void setMaxQueryFrequency(float maxQueryFrequency) {
++    if (maxQueryFrequency >= 1f && maxQueryFrequency != (int) maxQueryFrequency)
++      throw new IllegalArgumentException("Fractional absolute document frequencies are not allowed");
++    this.maxQueryFrequency = maxQueryFrequency;
++  }
++
++  /** true if the spellchecker should lowercase terms */
++  public boolean getLowerCaseTerms() {
++    return lowerCaseTerms;
++  }
++  
++  /** 
++   * True if the spellchecker should lowercase terms (default: true)
++   * <p>
++   * This is a convenience method, if your index field has more complicated
++   * analysis (such as StandardTokenizer removing punctuation), its probably
++   * better to turn this off, and instead run your query terms through your
++   * Analyzer first.
++   * <p>
++   * If this option is not on, case differences count as an edit! 
++   */
++  public void setLowerCaseTerms(boolean lowerCaseTerms) {
++    this.lowerCaseTerms = lowerCaseTerms;
++  }
++  
++  /**
++   * Get the current comparator in use.
++   */
++  public Comparator<SuggestWord> getComparator() {
++    return comparator;
++  }
++
++  /**
++   * Set the comparator for sorting suggestions.
++   * The default is {@link SuggestWordQueue#DEFAULT_COMPARATOR}
++   */
++  public void setComparator(Comparator<SuggestWord> comparator) {
++    this.comparator = comparator;
++  }
++
++  /**
++   * Get the string distance metric in use.
++   */
++  public StringDistance getDistance() {
++    return distance;
++  }
++
++  /**
++   * Set the string distance metric.
++   * The default is {@link #INTERNAL_LEVENSHTEIN}
++   * <p>
++   * Note: because this spellchecker draws its candidates from the
++   * term dictionary using Levenshtein, it works best with an edit-distance-like
++   * string metric. If you use a different metric than the default,
++   * you might want to consider increasing {@link #setMaxInspections(int)}
++   * to draw more candidates for your metric to rank.
++   */
++  public void setDistance(StringDistance distance) {
++    this.distance = distance;
++  }
++
++  /**
++   * Calls {@link #suggestSimilar(Term, int, IndexReader, boolean) 
++   *       suggestSimilar(term, numSug, ir, false)
++   */
++  public SuggestWord[] suggestSimilar(Term term, int numSug, IndexReader ir) 
++     throws IOException {
++    return suggestSimilar(term, numSug, ir, false);
++  }
++  
++  /**
++   * Calls {@link #suggestSimilar(Term, int, IndexReader, boolean, float) 
++   *       suggestSimilar(term, numSug, ir, morePopular, this.accuracy)
++   */
++  public SuggestWord[] suggestSimilar(Term term, int numSug, IndexReader ir, 
++      boolean morePopular) throws IOException {
++    return suggestSimilar(term, numSug, ir, morePopular, accuracy);
++  }
++  
++  /**
++   * Suggest similar words.
++   * 
++   * <p>Unlike {@link SpellChecker}, the similarity used to fetch the most
++   * relevant terms is an edit distance, therefore typically a low value
++   * for numSug will work very well.
++   * 
++   * @param term Term you want to spell check on
++   * @param numSug the maximum number of suggested words
++   * @param ir IndexReader to find terms from
++   * @param morePopular return only suggested words that are as frequent or more frequent than the searched word
++   * @param accuracy return only suggested words that match with this similarity
++   * @return sorted list of the suggested words according to the comparator
++   * @throws IOException
++   */
++  public SuggestWord[] suggestSimilar(Term term, int numSug, IndexReader ir, 
++      boolean morePopular, float accuracy) throws IOException {
++    
++    String text = term.text();
++    if (minQueryLength > 0 && text.codePointCount(0, text.length()) < minQueryLength)
++      return new SuggestWord[0];
++    
++    if (lowerCaseTerms)
++      term = term.createTerm(text.toLowerCase(Locale.ENGLISH));
++    
++    int docfreq = ir.docFreq(term);
++    
++    // see line 341 of spellchecker. this is certainly very very nice for perf,
++    // but is it really the right way to go?
++    if (!morePopular && docfreq > 0) {
++      return new SuggestWord[0];
++    }
++    
++    int maxDoc = ir.maxDoc();
++    
++    if (maxQueryFrequency >= 1f && docfreq > maxQueryFrequency) {
++      return new SuggestWord[0];
++    } else if (docfreq > (int) Math.ceil(maxQueryFrequency * (float)maxDoc)) {
++      return new SuggestWord[0];
++    }
++    
++    if (!morePopular) docfreq = 0;
++    
++    if (thresholdFrequency >= 1f) {
++      docfreq = Math.max(docfreq, (int) thresholdFrequency);
++    } else if (thresholdFrequency > 0f) {
++      docfreq = Math.max(docfreq, (int)(thresholdFrequency * (float)maxDoc)-1);
++    }
++    
++    Collection<ScoreTerm> terms = null;
++    int inspections = numSug * maxInspections;
++    
++    // try ed=1 first, in case we get lucky
++    terms = suggestSimilar(term, inspections, ir, docfreq, 1, accuracy);
++    if (maxEdits > 1 && terms.size() < inspections) {
++      HashSet<ScoreTerm> moreTerms = new HashSet<ScoreTerm>();
++      moreTerms.addAll(terms);
++      moreTerms.addAll(suggestSimilar(term, inspections, ir, docfreq, maxEdits, accuracy));
++      terms = moreTerms;
++    }
++    
++    // create the suggestword response, sort it, and trim it to size.
++    
++    SuggestWord suggestions[] = new SuggestWord[terms.size()];
++    int index = suggestions.length - 1;
++    for (ScoreTerm s : terms) {
++      SuggestWord suggestion = new SuggestWord();
++      suggestion.string = s.termAsString != null ? s.termAsString : s.term.utf8ToString();
++      suggestion.score = s.score;
++      suggestion.freq = s.docfreq;
++      suggestions[index--] = suggestion;
++    }
++    
++    Arrays.sort(suggestions, Collections.reverseOrder(comparator));
++    if (numSug < suggestions.length) {
++      SuggestWord trimmed[] = new SuggestWord[numSug];
++      System.arraycopy(suggestions, 0, trimmed, 0, numSug);
++      suggestions = trimmed;
++    }
++    return suggestions;
++  }
++  
++  private Collection<ScoreTerm> suggestSimilar(Term term, int numSug, 
++      IndexReader ir, int docfreq, int editDistance, float accuracy) throws IOException {
++    
++    FuzzyTermsEnum e = new FuzzyTermsEnum(ir, term, editDistance, Math.max(minPrefix, editDistance-1));
++    final PriorityQueue<ScoreTerm> stQueue = new PriorityQueue<ScoreTerm>();
++    
++    BytesRef queryTerm = new BytesRef(term.text());
++    BytesRef candidateTerm;
++    ScoreTerm st = new ScoreTerm();
++    MultiTermQuery.BoostAttribute boostAtt =
++      e.attributes().addAttribute(MultiTermQuery.BoostAttribute.class);
++    while ((candidateTerm = e.next()) != null) {
++      final float boost = boostAtt.getBoost();
++      // ignore uncompetitive hits
++      if (stQueue.size() >= numSug && boost <= stQueue.peek().boost)
++        continue;
++      
++      // ignore exact match of the same term
++      if (queryTerm.bytesEquals(candidateTerm))
++        continue;
++      
++      int df = e.docFreq();
++      
++      // check docFreq if required
++      if (df <= docfreq)
++        continue;
++      
++      final float score;
++      final String termAsString;
++      if (distance == INTERNAL_LEVENSHTEIN) {
++        // delay creating strings until the end
++        termAsString = null;
++        // undo FuzzyTermsEnum's scale factor for a real scaled lev score
++        score = boost / e.getScaleFactor() + e.getMinSimilarity();
++      } else {
++        termAsString = candidateTerm.utf8ToString();
++        score = distance.getDistance(term.text(), termAsString);
++      }
++      
++      if (score < accuracy)
++        continue;
++      
++      // add new entry in PQ
++      st.term = new BytesRef(candidateTerm);
++      st.boost = boost;
++      st.docfreq = df;
++      st.termAsString = termAsString;
++      st.score = score;
++      stQueue.offer(st);
++      // possibly drop entries from queue
++      st = (stQueue.size() > numSug) ? stQueue.poll() : new ScoreTerm();
++      boostAtt.setMaxNonCompetitiveBoost((stQueue.size() >= numSug) ? stQueue.peek().boost : Float.NEGATIVE_INFINITY);
++    }
++      
++    return stQueue;
++  }
++  
++  private static class ScoreTerm implements Comparable<ScoreTerm> {
++    public BytesRef term;
++    public float boost;
++    public int docfreq;
++    
++    public String termAsString;
++    public float score;
++    
++    public int compareTo(ScoreTerm other) {
++      if (term.bytesEquals(other.term))
++        return 0; // consistent with equals
++      if (this.boost == other.boost)
++        return other.term.compareTo(this.term);
++      else
++        return Float.compare(this.boost, other.boost);
++    }
++
++    @Override
++    public int hashCode() {
++      final int prime = 31;
++      int result = 1;
++      result = prime * result + ((term == null) ? 0 : term.hashCode());
++      return result;
++    }
++
++    @Override
++    public boolean equals(Object obj) {
++      if (this == obj) return true;
++      if (obj == null) return false;
++      if (getClass() != obj.getClass()) return false;
++      ScoreTerm other = (ScoreTerm) obj;
++      if (term == null) {
++        if (other.term != null) return false;
++      } else if (!term.bytesEquals(other.term)) return false;
++      return true;
++    }
++  }
++}
+diff --git a/lucene/contrib/spellchecker/src/test/org/apache/lucene/search/spell/TestDirectSpellChecker.java b/lucene/contrib/spellchecker/src/test/org/apache/lucene/search/spell/TestDirectSpellChecker.java
+new file mode 100644
+index 0000000..ff9975d
+--- /dev/null
++++ b/lucene/contrib/spellchecker/src/test/org/apache/lucene/search/spell/TestDirectSpellChecker.java
+@@ -0,0 +1,144 @@
++package org.apache.lucene.search.spell;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.English;
++import org.apache.lucene.util.LuceneTestCase;
++
++public class TestDirectSpellChecker extends LuceneTestCase {
++
++  public void testSimpleExamples() throws Exception {
++    DirectSpellChecker spellChecker = new DirectSpellChecker();
++    spellChecker.setMinQueryLength(0);
++    Directory dir = newDirectory();
++    RandomIndexWriter writer = new RandomIndexWriter(random, dir, 
++        new MockAnalyzer(MockTokenizer.SIMPLE, true));
++
++    for (int i = 0; i < 20; i++) {
++      Document doc = new Document();
++      doc.add(newField("numbers", English.intToEnglish(i), Field.Store.NO, Field.Index.ANALYZED));
++      writer.addDocument(doc);
++    }
++
++    IndexReader ir = writer.getReader();
++
++    SuggestWord[] similar = spellChecker.suggestSimilar(new Term("numbers", "fvie"), 2, ir, false);
++    assertTrue(similar.length > 0);
++    assertEquals("five", similar[0].string);
++
++    similar = spellChecker.suggestSimilar(new Term("numbers", "five"), 2, ir, false);
++    if (similar.length > 0) {
++      assertFalse(similar[0].string.equals("five")); // don't suggest a word for itself
++    }
++
++    similar = spellChecker.suggestSimilar(new Term("numbers", "fvie"), 2, ir, false);
++    assertTrue(similar.length > 0);
++    assertEquals("five", similar[0].string);
++
++    similar = spellChecker.suggestSimilar(new Term("numbers", "fiv"), 2, ir, false);
++    assertTrue(similar.length > 0);
++    assertEquals("five", similar[0].string);
++
++    similar = spellChecker.suggestSimilar(new Term("numbers", "fives"), 2, ir, false);
++    assertTrue(similar.length > 0);
++    assertEquals("five", similar[0].string);
++
++    assertTrue(similar.length > 0);
++    similar = spellChecker.suggestSimilar(new Term("numbers", "fie"), 2, ir, false);
++    assertEquals("five", similar[0].string);
++
++    // add some more documents
++    for (int i = 1000; i < 1100; i++) {
++      Document doc = new Document();
++      doc.add(newField("numbers", English.intToEnglish(i), Field.Store.NO, Field.Index.ANALYZED));
++      writer.addDocument(doc);
++    }
++
++    ir.close();
++    ir = writer.getReader();
++
++    // look ma, no spellcheck index rebuild
++    similar = spellChecker.suggestSimilar(new Term("numbers", "tousand"), 10, ir, false);
++    assertTrue(similar.length > 0); 
++    assertEquals("thousand", similar[0].string);
++
++    ir.close();
++    writer.close();
++    dir.close();
++  }
++  
++  public void testOptions() throws Exception {
++    Directory dir = newDirectory();
++    RandomIndexWriter writer = new RandomIndexWriter(random, dir, 
++        new MockAnalyzer(MockTokenizer.SIMPLE, true));
++
++    Document doc = new Document();
++    doc.add(newField("text", "foobar", Field.Store.NO, Field.Index.ANALYZED));
++    writer.addDocument(doc);
++    doc.add(newField("text", "foobar", Field.Store.NO, Field.Index.ANALYZED));
++    writer.addDocument(doc);
++    doc.add(newField("text", "foobaz", Field.Store.NO, Field.Index.ANALYZED));
++    writer.addDocument(doc);
++    doc.add(newField("text", "fobar", Field.Store.NO, Field.Index.ANALYZED));
++    writer.addDocument(doc);
++   
++    IndexReader ir = writer.getReader();
++    
++    DirectSpellChecker spellChecker = new DirectSpellChecker();
++    spellChecker.setMaxQueryFrequency(0F);
++    SuggestWord[] similar = spellChecker.suggestSimilar(new Term("text", "fobar"), 1, ir, true);
++    assertEquals(0, similar.length);
++    
++    spellChecker = new DirectSpellChecker(); // reset defaults
++    spellChecker.setMinQueryLength(5);
++    similar = spellChecker.suggestSimilar(new Term("text", "foba"), 1, ir, true);
++    assertEquals(0, similar.length);
++    
++    spellChecker = new DirectSpellChecker(); // reset defaults
++    spellChecker.setMaxEdits(1);
++    similar = spellChecker.suggestSimilar(new Term("text", "foobazzz"), 1, ir, true);
++    assertEquals(0, similar.length);
++    
++    spellChecker = new DirectSpellChecker(); // reset defaults
++    spellChecker.setAccuracy(0.9F);
++    similar = spellChecker.suggestSimilar(new Term("text", "foobazzz"), 1, ir, true);
++    assertEquals(0, similar.length);
++    
++    spellChecker = new DirectSpellChecker(); // reset defaults
++    spellChecker.setMinPrefix(0);
++    similar = spellChecker.suggestSimilar(new Term("text", "roobaz"), 1, ir, true);
++    assertEquals(1, similar.length);
++    
++    spellChecker = new DirectSpellChecker(); // reset defaults
++    spellChecker.setMinPrefix(1);
++    similar = spellChecker.suggestSimilar(new Term("text", "roobaz"), 1, ir, true);
++    assertEquals(0, similar.length);
++    
++    ir.close();
++    writer.close();
++    dir.close();
++  }
++}
+diff --git a/lucene/src/java/org/apache/lucene/search/FuzzyTermsEnum.java b/lucene/src/java/org/apache/lucene/search/FuzzyTermsEnum.java
+index fe99e24..1cc1e64 100644
+--- a/lucene/src/java/org/apache/lucene/search/FuzzyTermsEnum.java
++++ b/lucene/src/java/org/apache/lucene/search/FuzzyTermsEnum.java
+@@ -514,4 +514,14 @@ public final class FuzzyTermsEnum extends TermsEnum {
+           (int)((1-minSimilarity) * (Math.min(text.length, m) + realPrefixLength)));
+     }
+   }
++  
++  /** @lucene.internal */
++  public float getMinSimilarity() {
++    return minSimilarity;
++  }
++  
++  /** @lucene.internal */
++  public float getScaleFactor() {
++    return scale_factor;
++  }
+ }
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 189abb3..019f93b 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -280,7 +280,9 @@ New Features
+   after parsing the functions, instead of silently ignoring it.
+   This allows expressions like q=dist(2,vector(1,2),$pt)&pt=3,4   (yonik)
+ 
+-
++* LUCENE-2507: Added DirectSolrSpellChecker, which uses Lucene's DirectSpellChecker
++  to retrieve correction candidates directly from the term dictionary using
++  levenshtein automata.  (rmuir)
+ 
+ Optimizations
+ ----------------------
+diff --git a/solr/example/solr/conf/solrconfig.xml b/solr/example/solr/conf/solrconfig.xml
+index 318d0b5..0b0629f 100755
+--- a/solr/example/solr/conf/solrconfig.xml
++++ b/solr/example/solr/conf/solrconfig.xml
+@@ -708,6 +708,18 @@
+       <str name="spellcheckIndexDir">./spellchecker</str>
+     </lst>
+ 
++    <!-- a spellchecker that uses no auxiliary index
++    <lst name="spellchecker">
++      <str name="name">default</str>
++      <str name="field">name</str>
++      <str name="classname">solr.DirectSolrSpellChecker</str>
++      &lt;!&ndash; Note: this value is just for the example,
++      to correct hell to dell. In practice a value of 1
++      is highly recommended.
++       &ndash;&gt;
++      <str name="minPrefix">0</str>
++    </lst>
++    -->
+     <!-- a spellchecker that uses a different distance measure
+     <lst name="spellchecker">
+       <str name="name">jarowinkler</str>
+diff --git a/solr/src/java/org/apache/solr/spelling/DirectSolrSpellChecker.java b/solr/src/java/org/apache/solr/spelling/DirectSolrSpellChecker.java
+new file mode 100644
+index 0000000..f3b9d52
+--- /dev/null
++++ b/solr/src/java/org/apache/solr/spelling/DirectSolrSpellChecker.java
+@@ -0,0 +1,191 @@
++package org.apache.solr.spelling;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.Comparator;
++
++import org.apache.lucene.analysis.Token;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.spell.DirectSpellChecker;
++import org.apache.lucene.search.spell.StringDistance;
++import org.apache.lucene.search.spell.SuggestWord;
++import org.apache.lucene.search.spell.SuggestWordFrequencyComparator;
++import org.apache.lucene.search.spell.SuggestWordQueue;
++import org.apache.solr.common.util.NamedList;
++import org.apache.solr.core.SolrCore;
++import org.apache.solr.search.SolrIndexSearcher;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Spellchecker implementation that uses {@link DirectSpellChecker}
++ * <p>
++ * Requires no auxiliary index or data structure.
++ * <p>
++ * Supported options:
++ * <ul>
++ *   <li>field: Used as the source of terms.
++ *   <li>distanceMeasure: Sets {@link DirectSpellChecker#setDistance(StringDistance)}. 
++ *       Note: to set the default {@link DirectSpellChecker#INTERNAL_LEVENSHTEIN}, use "internal".
++ *   <li>accuracy: Sets {@link DirectSpellChecker#setAccuracy(float)}.
++ *   <li>maxEdits: Sets {@link DirectSpellChecker#setMaxEdits(int)}.
++ *   <li>minPrefix: Sets {@link DirectSpellChecker#setMinPrefix(int)}.
++ *   <li>maxInspections: Sets {@link DirectSpellChecker#setMaxInspections(int)}.
++ *   <li>comparatorClass: Sets {@link DirectSpellChecker#setComparator(Comparator)}.
++ *       Note: score-then-frequency can be specified as "score" and frequency-then-score
++ *       can be specified as "freq".
++ *   <li>thresholdTokenFrequency: sets {@link DirectSpellChecker#setThresholdFrequency(float)}.
++ *   <li>minQueryLength: sets {@link DirectSpellChecker#setMinQueryLength(int)}.
++ *   <li>maxQueryFrequency: sets {@link DirectSpellChecker#setMaxQueryFrequency(float)}.
++ * </ul>
++ * @see DirectSpellChecker
++ */
++public class DirectSolrSpellChecker extends SolrSpellChecker {
++  private static final Logger LOG = LoggerFactory.getLogger(DirectSolrSpellChecker.class);
++  
++  /** Field to use as the source of terms */
++  public static final String FIELD = "field";
++  
++  public static final String STRING_DISTANCE = "distanceMeasure";
++  public static final String INTERNAL_DISTANCE = "internal";
++  
++  public static final String ACCURACY = "accuracy";
++  public static final float DEFAULT_ACCURACY = 0.5f;
++  
++  public static final String MAXEDITS = "maxEdits";
++  public static final int DEFAULT_MAXEDITS = 2;
++  
++  public static final String MINPREFIX = "minPrefix";
++  public static final int DEFAULT_MINPREFIX = 1;
++  
++  public static final String MAXINSPECTIONS = "maxInspections";
++  public static final int DEFAULT_MAXINSPECTIONS = 5;
++
++  public static final String COMPARATOR_CLASS = "comparatorClass";
++  public static final String SCORE_COMP = "score";
++  public static final String FREQ_COMP = "freq";
++
++  public static final String THRESHOLD = "thresholdTokenFrequency";
++  public static final float DEFAULT_THRESHOLD = 0.0f;
++  
++  public static final String MINQUERYLENGTH = "minQueryLength";
++  public static final int DEFAULT_MINQUERYLENGTH = 4;
++  
++  public static final String MAXQUERYFREQUENCY = "maxQueryFrequency";
++  public static final float DEFAULT_MAXQUERYFREQUENCY = 0.01f;
++  
++  private DirectSpellChecker checker = new DirectSpellChecker();
++  private String field;
++  
++  @Override
++  public String init(NamedList config, SolrCore core) {
++    LOG.info("init: " + config);
++    String name = super.init(config, core);
++    
++    Comparator<SuggestWord> comp = SuggestWordQueue.DEFAULT_COMPARATOR;
++    String compClass = (String) config.get(COMPARATOR_CLASS);
++    if (compClass != null) {
++      if (compClass.equalsIgnoreCase(SCORE_COMP))
++        comp = SuggestWordQueue.DEFAULT_COMPARATOR;
++      else if (compClass.equalsIgnoreCase(FREQ_COMP))
++        comp = new SuggestWordFrequencyComparator();
++      else //must be a FQCN
++        comp = (Comparator<SuggestWord>) core.getResourceLoader().newInstance(compClass);
++    }
++    
++    StringDistance sd = DirectSpellChecker.INTERNAL_LEVENSHTEIN;
++    String distClass = (String) config.get(STRING_DISTANCE);
++    if (distClass != null && !distClass.equalsIgnoreCase(INTERNAL_DISTANCE))
++      sd = (StringDistance) core.getResourceLoader().newInstance(distClass);
++
++    field = (String) config.get(FIELD);
++    
++    float minAccuracy = DEFAULT_ACCURACY;
++    String accuracy = (String) config.get(ACCURACY);
++    if (accuracy != null)
++      minAccuracy = Float.parseFloat(accuracy);
++    
++    int maxEdits = DEFAULT_MAXEDITS;
++    String edits = (String) config.get(MAXEDITS);
++    if (edits != null)
++      maxEdits = Integer.parseInt(edits);
++    
++    int minPrefix = DEFAULT_MINPREFIX;
++    String prefix = (String) config.get(MINPREFIX);
++    if (prefix != null)
++      minPrefix = Integer.parseInt(prefix);
++    
++    int maxInspections = DEFAULT_MAXINSPECTIONS;
++    String inspections = (String) config.get(MAXINSPECTIONS);
++    if (inspections != null)
++      maxInspections = Integer.parseInt(inspections);
++    
++    float minThreshold = DEFAULT_THRESHOLD;
++    String threshold = (String) config.get(THRESHOLD);
++    if (threshold != null)
++      minThreshold = Float.parseFloat(threshold);
++    
++    int minQueryLength = DEFAULT_MINQUERYLENGTH;
++    String queryLength = (String) config.get(MINQUERYLENGTH);
++    if (queryLength != null)
++      minQueryLength = Integer.parseInt(queryLength);
++    
++    float maxQueryFrequency = DEFAULT_MAXQUERYFREQUENCY;
++    String queryFreq = (String) config.get(MAXQUERYFREQUENCY);
++    if (queryFreq != null)
++      maxQueryFrequency = Float.parseFloat(queryFreq);
++    
++    checker.setComparator(comp);
++    checker.setDistance(sd);
++    checker.setMaxEdits(maxEdits);
++    checker.setMinPrefix(minPrefix);
++    checker.setAccuracy(minAccuracy);
++    checker.setThresholdFrequency(minThreshold);
++    checker.setMaxInspections(maxInspections);
++    checker.setMinQueryLength(minQueryLength);
++    checker.setMaxQueryFrequency(maxQueryFrequency);
++    checker.setLowerCaseTerms(false);
++    
++    return name;
++  }
++  
++  @Override
++  public void reload(SolrCore core, SolrIndexSearcher searcher)
++      throws IOException {}
++
++  @Override
++  public void build(SolrCore core, SolrIndexSearcher searcher) {}
++
++  @Override
++  public SpellingResult getSuggestions(SpellingOptions options)
++      throws IOException {
++    LOG.debug("getSuggestions: " + options.tokens);
++    
++    SpellingResult result = new SpellingResult();
++    float accuracy = (options.accuracy == Float.MIN_VALUE) ? checker.getAccuracy() : options.accuracy;
++    
++    for (Token token : options.tokens) {
++      SuggestWord[] suggestions = checker.suggestSimilar(new Term(field, token.toString()), 
++          options.count, options.reader, options.onlyMorePopular, accuracy);
++      for (SuggestWord suggestion : suggestions)
++        result.add(token, suggestion.string, suggestion.freq);
++    }
++    return result;
++  }
++}
+diff --git a/solr/src/test/org/apache/solr/spelling/DirectSolrSpellCheckerTest.java b/solr/src/test/org/apache/solr/spelling/DirectSolrSpellCheckerTest.java
+new file mode 100644
+index 0000000..950a12f
+--- /dev/null
++++ b/solr/src/test/org/apache/solr/spelling/DirectSolrSpellCheckerTest.java
+@@ -0,0 +1,78 @@
++package org.apache.solr.spelling;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.Collection;
++import java.util.Map;
++
++import org.apache.lucene.analysis.Token;
++import org.apache.lucene.index.IndexReader;
++import org.apache.solr.SolrTestCaseJ4;
++import org.apache.solr.common.util.NamedList;
++import org.apache.solr.core.SolrCore;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Simple tests for {@link DirectSolrSpellChecker}
++ */
++public class DirectSolrSpellCheckerTest extends SolrTestCaseJ4 {
++
++  private static SpellingQueryConverter queryConverter;
++
++  @BeforeClass
++  public static void beforeClass() throws Exception {
++    initCore("solrconfig.xml","schema.xml");
++    //Index something with a title
++    assertNull(h.validateUpdate(adoc("id", "0", "teststop", "This is a title")));
++    assertNull(h.validateUpdate(adoc("id", "1", "teststop", "The quick reb fox jumped over the lazy brown dogs.")));
++    assertNull(h.validateUpdate(adoc("id", "2", "teststop", "This is a Solr")));
++    assertNull(h.validateUpdate(adoc("id", "3", "teststop", "solr foo")));
++    assertNull(h.validateUpdate(commit()));
++    queryConverter = new SimpleQueryConverter();
++    queryConverter.init(new NamedList());
++  }
++  
++  @Test
++  public void test() throws Exception {
++    DirectSolrSpellChecker checker = new DirectSolrSpellChecker();
++    NamedList spellchecker = new NamedList();
++    spellchecker.add("classname", DirectSolrSpellChecker.class.getName());
++    spellchecker.add(DirectSolrSpellChecker.FIELD, "teststop");
++    spellchecker.add(DirectSolrSpellChecker.MINQUERYLENGTH, "2"); // we will try "fob"
++
++    SolrCore core = h.getCore();
++    checker.init(spellchecker, core);
++
++    IndexReader reader = core.getSearcher().get().getReader();
++    Collection<Token> tokens = queryConverter.convert("fob");
++    SpellingOptions spellOpts = new SpellingOptions(tokens, reader);
++    SpellingResult result = checker.getSuggestions(spellOpts);
++    assertTrue("result is null and it shouldn't be", result != null);
++    Map<String, Integer> suggestions = result.get(tokens.iterator().next());
++    Map.Entry<String, Integer> entry = suggestions.entrySet().iterator().next();
++    assertTrue(entry.getKey() + " is not equal to " + "foo", entry.getKey().equals("foo") == true);
++    assertFalse(entry.getValue() + " equals: " + SpellingResult.NO_FREQUENCY_INFO, entry.getValue() == SpellingResult.NO_FREQUENCY_INFO);
++
++    spellOpts.tokens = queryConverter.convert("super");
++    result = checker.getSuggestions(spellOpts);
++    assertTrue("result is null and it shouldn't be", result != null);
++    suggestions = result.get(tokens.iterator().next());
++    assertTrue("suggestions is not null and it should be", suggestions == null);
++  }
++}
+

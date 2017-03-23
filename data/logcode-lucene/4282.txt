@@ -1,0 +1,737 @@
+GitDiffStart: 248121bb3f74a8af032ccd66f903904eaa3e1c59 | Mon Feb 9 03:10:45 2015 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index ce84851..06e1902 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -36,9 +36,11 @@ New Features
+ * LUCENE-3922: Added JapaneseNumberFilter that normalizes Japanese numbers
+   in kansuji form to regular/Arabic numbers. (Gaute Lambertsen, Christian Moen)
+ 
++* LUCENE-6191: New spatial 2D heatmap faceting for PrefixTreeStrategy. (David Smiley)
++
+ Bug Fixes
+ 
+-* Spatial pointsOnly flag on PrefixTreeStrategy shouldn't switch all predicates to
++* LUCENE-6190: Spatial pointsOnly flag on PrefixTreeStrategy shouldn't switch all predicates to
+   Intersects. (David Smiley)
+ 
+ Optimizations
+diff --git a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/HeatmapFacetCounter.java b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/HeatmapFacetCounter.java
+new file mode 100644
+index 0000000..e37754b
+--- /dev/null
++++ b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/HeatmapFacetCounter.java
+@@ -0,0 +1,312 @@
++package org.apache.lucene.spatial.prefix;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.Map;
++
++import com.spatial4j.core.context.SpatialContext;
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Rectangle;
++import com.spatial4j.core.shape.Shape;
++import com.spatial4j.core.shape.SpatialRelation;
++import org.apache.lucene.index.IndexReaderContext;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.spatial.prefix.tree.Cell;
++import org.apache.lucene.spatial.prefix.tree.CellIterator;
++import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
++import org.apache.lucene.util.ArrayUtil;
++
++/**
++ * Computes spatial facets in two dimensions as a grid of numbers.  The data is often visualized as a so-called
++ * "heatmap", hence the name.
++ */
++public class HeatmapFacetCounter {
++  //TODO where should this code live? It could go to PrefixTreeFacetCounter, or maybe here in its own class is fine.
++
++  /** Maximum number of supported rows (or columns). */
++  public static final int MAX_ROWS_OR_COLUMNS = (int) Math.sqrt(ArrayUtil.MAX_ARRAY_LENGTH);
++  static {
++    Math.multiplyExact(MAX_ROWS_OR_COLUMNS, MAX_ROWS_OR_COLUMNS);//will throw if doesn't stay within integer
++  }
++
++  /** Response structure */
++  public static class Heatmap {
++    public final int columns;
++    public final int rows;
++    public final int[] counts;//in order of 1st column (all rows) then 2nd column (all rows) etc.
++    public final Rectangle region;
++
++    public Heatmap(int columns, int rows, Rectangle region) {
++      this.columns = columns;
++      this.rows = rows;
++      this.counts = new int[columns * rows];
++      this.region = region;
++    }
++
++    public int getCount(int x, int y) {
++      return counts[x * rows + y];
++    }
++
++    @Override
++    public String toString() {
++      return "Heatmap{" + columns + "x" + rows + " " + region + '}';
++    }
++  }
++
++  /**
++   * Calculates spatial 2D facets (aggregated counts) in a grid, sometimes called a heatmap.
++   * Facet computation is implemented by navigating the underlying indexed terms efficiently. If you don't know exactly
++   * what facetLevel to go to for a given input box but you have some sense of how many cells there should be relative
++   * to the size of the shape, then consider using the logic that {@link org.apache.lucene.spatial.prefix.PrefixTreeStrategy}
++   * uses when approximating what level to go to when indexing a shape given a distErrPct.
++   *
++   * @param context the IndexReader's context
++   * @param filter a Filter to limit counted docs. For optimal performance, it's
++   *               {@link org.apache.lucene.search.DocIdSet#bits()} should be non-null. If no filter is provided, live
++   *               docs are counted.
++   * @param inputShape the shape to gather grid squares for; typically a {@link com.spatial4j.core.shape.Rectangle}.
++   *                   The <em>actual</em> heatmap area will usually be larger since the cells on the edge that overlap
++   *                   are returned. We always return a rectangle of integers even if the inputShape isn't a rectangle
++   *                   -- the non-intersecting cells will all be 0.
++   *                   If null is given, the entire world is assumed.
++   * @param facetLevel the target depth (detail) of cells.
++   * @param maxCells the maximum number of cells to return. If the cells exceed this count, an
++   *                 IllegalArgumentException is thrown.
++   */
++  public static Heatmap calcFacets(PrefixTreeStrategy strategy, IndexReaderContext context, Filter filter,
++                                   Shape inputShape, final int facetLevel, int maxCells) throws IOException {
++    if (maxCells > (MAX_ROWS_OR_COLUMNS * MAX_ROWS_OR_COLUMNS)) {
++      throw new IllegalArgumentException("maxCells (" + maxCells + ") should be <= " + MAX_ROWS_OR_COLUMNS);
++    }
++    if (inputShape == null) {
++      inputShape = strategy.getSpatialContext().getWorldBounds();
++    }
++    final Rectangle inputRect = inputShape.getBoundingBox();
++    //First get the rect of the cell at the bottom-left at depth facetLevel
++    final SpatialPrefixTree grid = strategy.getGrid();
++    final SpatialContext ctx = grid.getSpatialContext();
++    final Point cornerPt = ctx.makePoint(inputRect.getMinX(), inputRect.getMinY());
++    final CellIterator cellIterator = grid.getTreeCellIterator(cornerPt, facetLevel);
++    Cell cornerCell = null;
++    while (cellIterator.hasNext()) {
++      cornerCell = cellIterator.next();
++    }
++    assert cornerCell != null && cornerCell.getLevel() == facetLevel : "Cell not at target level: " + cornerCell;
++    final Rectangle cornerRect = (Rectangle) cornerCell.getShape();
++    assert cornerRect.hasArea();
++    //Now calculate the number of columns and rows necessary to cover the inputRect
++    double heatMinX = cornerRect.getMinX();//note: we might change this below...
++    final double cellWidth = cornerRect.getWidth();
++    final Rectangle worldRect = ctx.getWorldBounds();
++    final int columns = calcRowsOrCols(cellWidth, heatMinX, inputRect.getWidth(), inputRect.getMinX(), worldRect.getWidth());
++    final double heatMinY = cornerRect.getMinY();
++    final double cellHeight = cornerRect.getHeight();
++    final int rows = calcRowsOrCols(cellHeight, heatMinY, inputRect.getHeight(), inputRect.getMinY(), worldRect.getHeight());
++    assert rows > 0 && columns > 0;
++    if (columns > MAX_ROWS_OR_COLUMNS || rows > MAX_ROWS_OR_COLUMNS || columns * rows > maxCells) {
++      throw new IllegalArgumentException(
++          "Too many cells (" + columns + " x " + rows + ") for level " + facetLevel + " shape " + inputRect);
++    }
++
++    //Create resulting heatmap bounding rectangle & Heatmap object.
++    final double halfCellWidth = cellWidth / 2.0;
++    // if X world-wraps, use world bounds' range
++    if (columns * cellWidth + halfCellWidth > worldRect.getWidth()) {
++      heatMinX = worldRect.getMinX();
++    }
++    double heatMaxX = heatMinX + columns * cellWidth;
++    if (Math.abs(heatMaxX - worldRect.getMaxX()) < halfCellWidth) {//numeric conditioning issue
++      heatMaxX = worldRect.getMaxX();
++    } else if (heatMaxX > worldRect.getMaxX()) {//wraps dateline (won't happen if !geo)
++      heatMaxX = heatMaxX - worldRect.getMaxX() +  worldRect.getMinX();
++    }
++    final double halfCellHeight = cellHeight / 2.0;
++    double heatMaxY = heatMinY + rows * cellHeight;
++    if (Math.abs(heatMaxY - worldRect.getMaxY()) < halfCellHeight) {//numeric conditioning issue
++      heatMaxY = worldRect.getMaxY();
++    }
++
++    final Heatmap heatmap = new Heatmap(columns, rows, ctx.makeRectangle(heatMinX, heatMaxX, heatMinY, heatMaxY));
++
++    //All ancestor cell counts (of facetLevel) will be captured during facet visiting and applied later. If the data is
++    // just points then there won't be any ancestors.
++    //Facet count of ancestors covering all of the heatmap:
++    int[] allCellsAncestorCount = new int[1]; // single-element array so it can be accumulated in the inner class
++    //All other ancestors:
++    Map<Rectangle,Integer> ancestors = new HashMap<>();
++
++    //Now lets count some facets!
++    PrefixTreeFacetCounter.compute(strategy, context, filter, inputShape, facetLevel,
++        new PrefixTreeFacetCounter.FacetVisitor() {
++      @Override
++      public void visit(Cell cell, int count) {
++        final double heatMinX = heatmap.region.getMinX();
++        final Rectangle rect = (Rectangle) cell.getShape();
++        if (cell.getLevel() == facetLevel) {//heatmap level; count it directly
++          //convert to col & row
++          int column;
++          if (rect.getMinX() >= heatMinX) {
++            column = (int) Math.round((rect.getMinX() - heatMinX) / cellWidth);
++          } else { // due to dateline wrap
++            column = (int) Math.round((rect.getMinX() + 360 - heatMinX) / cellWidth);
++          }
++          int row = (int) Math.round((rect.getMinY() - heatMinY) / cellHeight);
++          //note: unfortunately, it's possible for us to visit adjacent cells to the heatmap (if the SpatialPrefixTree
++          // allows adjacent cells to overlap on the seam), so we need to skip them
++          if (column < 0 || column >= heatmap.columns || row < 0 || row >= heatmap.rows) {
++            return;
++          }
++          // increment
++          heatmap.counts[column * heatmap.rows + row] += count;
++
++        } else if (rect.relate(heatmap.region) == SpatialRelation.CONTAINS) {//containing ancestor
++          allCellsAncestorCount[0] += count;
++
++        } else { // ancestor
++          // note: not particularly efficient (possible put twice, and Integer wrapper); oh well
++          Integer existingCount = ancestors.put(rect, count);
++          if (existingCount != null) {
++            ancestors.put(rect, count + existingCount);
++          }
++        }
++      }
++    });
++
++    //Update the heatmap counts with ancestor counts
++
++    // Apply allCellsAncestorCount
++    if (allCellsAncestorCount[0] > 0) {
++      for (int i = 0; i < heatmap.counts.length; i++) {
++        heatmap.counts[i] += allCellsAncestorCount[0];
++      }
++    }
++
++    // Apply ancestors
++    //  note: This approach isn't optimized for a ton of ancestor cells. We'll potentially increment the same cells
++    //    multiple times in separate passes if any ancestors overlap. IF this poses a problem, we could optimize it
++    //    with additional complication by keeping track of intervals in a sorted tree structure (possible TreeMap/Set)
++    //    and iterate them cleverly such that we just make one pass at this stage.
++
++    int[] pair = new int[2];//output of intersectInterval
++    for (Map.Entry<Rectangle, Integer> entry : ancestors.entrySet()) {
++      Rectangle rect = entry.getKey();
++      final int count = entry.getValue();
++      //note: we approach this in a way that eliminates int overflow/underflow (think huge cell, tiny heatmap)
++      intersectInterval(heatMinY, heatMaxY, cellHeight, rows, rect.getMinY(), rect.getMaxY(), pair);
++      final int startRow = pair[0];
++      final int endRow = pair[1];
++
++      if (!heatmap.region.getCrossesDateLine()) {
++        intersectInterval(heatMinX, heatMaxX, cellWidth, columns, rect.getMinX(), rect.getMaxX(), pair);
++        final int startCol = pair[0];
++        final int endCol = pair[1];
++        incrementRange(heatmap, startCol, endCol, startRow, endRow, count);
++
++      } else {
++        //left half of dateline:
++        if (rect.getMaxX() >= heatMinX) {
++          final int leftColumns = (int) Math.round((180 - heatMinX) / cellWidth) + 1;
++          intersectInterval(heatMinX, 180, cellWidth, leftColumns, rect.getMinX(), rect.getMaxX(), pair);
++          final int startCol = pair[0];
++          final int endCol = pair[1];
++          incrementRange(heatmap, startCol, endCol, startRow, endRow, count);
++        }
++        //right half of dateline
++        if (rect.getMinY() <= heatMaxX) {
++          final int rightColumns = (int) Math.round(heatMaxX / cellWidth) + 1;
++          intersectInterval(0, heatMaxX, cellWidth, rightColumns, rect.getMinX(), rect.getMaxX(), pair);
++          final int startCol = pair[0];
++          final int endCol = pair[1];
++          incrementRange(heatmap, startCol, endCol, startRow, endRow, count);
++        }
++      }
++
++    }
++
++    return heatmap;
++  }
++
++  private static void intersectInterval(double heatMin, double heatMax, double heatCellLen, int heatLen,
++                                        double cellMin, double cellMax,
++                                        int[] out) {
++    //precondition: we know there's an intersection
++    if (heatMin >= cellMin) {
++      out[0] = 0;
++    } else {
++      out[0] = (int) Math.round((cellMin - heatMin) / heatCellLen);
++    }
++    if (heatMax <= cellMax) {
++      out[1] = heatLen - 1;
++    } else {
++      out[1] = (int) Math.round((cellMax - heatMin) / heatCellLen) - 1;
++    }
++  }
++
++  private static void incrementRange(Heatmap heatmap, int startColumn, int endColumn, int startRow, int endRow,
++                                     int count) {
++    //startColumn & startRow are not necessarily within the heatmap range; likewise numRows/columns may overlap.
++    if (startColumn < 0) {
++      endColumn += startColumn;
++      startColumn = 0;
++    }
++    endColumn = Math.min(heatmap.columns-1, endColumn);
++
++    if (startRow < 0) {
++      endRow += startRow;
++      startRow = 0;
++    }
++    endRow = Math.min(heatmap.rows-1, endRow);
++
++    if (startRow > endRow) {
++      return;//short-circuit
++    }
++    for (int c = startColumn; c <= endColumn; c++) {
++      int cBase = c * heatmap.rows;
++      for (int r = startRow; r <= endRow; r++) {
++        heatmap.counts[cBase + r] += count;
++      }
++    }
++  }
++
++  /** Computes the number of intervals (rows or columns) to cover a range given the sizes. */
++  private static int calcRowsOrCols(double cellRange, double cellMin, double requestRange, double requestMin,
++                                    double worldRange) {
++    assert requestMin >= cellMin;
++    //Idealistically this wouldn't be so complicated but we concern ourselves with overflow and edge cases
++    double range = (requestRange + (requestMin - cellMin));
++    if (range == 0) {
++      return 1;
++    }
++    final double intervals = Math.ceil(range / cellRange);
++    if (intervals > Integer.MAX_VALUE) {
++      return Integer.MAX_VALUE;//should result in an error soon (exceed thresholds)
++    }
++    // ensures we don't have more intervals than world bounds (possibly due to rounding/edge issue)
++    final long intervalsMax = Math.round(worldRange / cellRange);
++    if (intervalsMax > Integer.MAX_VALUE) {
++      //just return intervals
++      return (int) intervals;
++    }
++    return Math.min((int)intervalsMax, (int)intervals);
++  }
++
++  private HeatmapFacetCounter() {
++  }
++}
+diff --git a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java
+index 9ae31aa..d96dbde 100644
+--- a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java
++++ b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java
+@@ -17,6 +17,7 @@ package org.apache.lucene.spatial.prefix;
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
+ import java.util.Iterator;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+@@ -27,7 +28,9 @@ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.document.FieldType;
+ import org.apache.lucene.index.IndexOptions;
++import org.apache.lucene.index.IndexReaderContext;
+ import org.apache.lucene.queries.function.ValueSource;
++import org.apache.lucene.search.Filter;
+ import org.apache.lucene.spatial.SpatialStrategy;
+ import org.apache.lucene.spatial.prefix.tree.Cell;
+ import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
+@@ -87,6 +90,10 @@ public abstract class PrefixTreeStrategy extends SpatialStrategy {
+     this.grid = grid;
+   }
+ 
++  public SpatialPrefixTree getGrid() {
++    return grid;
++  }
++
+   /**
+    * A memory hint used by {@link #makeDistanceValueSource(com.spatial4j.core.shape.Point)}
+    * for how big the initial size of each Document's array should be. The
+@@ -180,7 +187,14 @@ public abstract class PrefixTreeStrategy extends SpatialStrategy {
+     return new ShapeFieldCacheDistanceValueSource(ctx, p, queryPoint, multiplier);
+   }
+ 
+-  public SpatialPrefixTree getGrid() {
+-    return grid;
++  /**
++   * Computes spatial facets in two dimensions as a grid of numbers.  The data is often visualized as a so-called
++   * "heatmap".
++   *
++   * @see org.apache.lucene.spatial.prefix.HeatmapFacetCounter#calcFacets(PrefixTreeStrategy, org.apache.lucene.index.IndexReaderContext, org.apache.lucene.search.Filter, com.spatial4j.core.shape.Shape, int, int)
++   */
++  public HeatmapFacetCounter.Heatmap calcFacets(IndexReaderContext context, Filter filter,
++                                   Shape inputShape, final int facetLevel, int maxCells) throws IOException {
++    return HeatmapFacetCounter.calcFacets(this, context, filter, inputShape, facetLevel, maxCells);
+   }
+ }
+diff --git a/lucene/spatial/src/test/org/apache/lucene/spatial/SpatialTestCase.java b/lucene/spatial/src/test/org/apache/lucene/spatial/SpatialTestCase.java
+index 0eef93c..b8b3861 100644
+--- a/lucene/spatial/src/test/org/apache/lucene/spatial/SpatialTestCase.java
++++ b/lucene/spatial/src/test/org/apache/lucene/spatial/SpatialTestCase.java
+@@ -17,7 +17,16 @@ package org.apache.lucene.spatial;
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Random;
++import java.util.logging.Logger;
++
+ import com.spatial4j.core.context.SpatialContext;
++import com.spatial4j.core.distance.DistanceUtils;
+ import com.spatial4j.core.shape.Point;
+ import com.spatial4j.core.shape.Rectangle;
+ import org.apache.lucene.analysis.MockAnalyzer;
+@@ -40,20 +49,17 @@ import org.apache.lucene.util.TestUtil;
+ import org.junit.After;
+ import org.junit.Before;
+ 
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Random;
+-
++import static com.carrotsearch.randomizedtesting.RandomizedTest.randomDouble;
+ import static com.carrotsearch.randomizedtesting.RandomizedTest.randomGaussian;
++import static com.carrotsearch.randomizedtesting.RandomizedTest.randomInt;
+ import static com.carrotsearch.randomizedtesting.RandomizedTest.randomIntBetween;
+ 
+ /** A base test class for spatial lucene. It's mostly Lucene generic. */
+ @SuppressSysoutChecks(bugUrl = "These tests use JUL extensively.")
+ public abstract class SpatialTestCase extends LuceneTestCase {
+ 
++  protected Logger log = Logger.getLogger(getClass().getName());
++
+   private DirectoryReader indexReader;
+   protected RandomIndexWriter indexWriter;
+   private Directory directory;
+@@ -152,18 +158,42 @@ public abstract class SpatialTestCase extends LuceneTestCase {
+   }
+ 
+   protected Rectangle randomRectangle() {
+-    final Rectangle WB = ctx.getWorldBounds();
+-    int rW = (int) randomGaussianMeanMax(10, WB.getWidth());
+-    double xMin = randomIntBetween((int) WB.getMinX(), (int) WB.getMaxX() - rW);
+-    double xMax = xMin + rW;
++    return randomRectangle(ctx.getWorldBounds());
++  }
+ 
+-    int yH = (int) randomGaussianMeanMax(Math.min(rW, WB.getHeight()), WB.getHeight());
+-    double yMin = randomIntBetween((int) WB.getMinY(), (int) WB.getMaxY() - yH);
+-    double yMax = yMin + yH;
++  protected Rectangle randomRectangle(Rectangle bounds) {
++    double[] xNewStartAndWidth = randomSubRange(bounds.getMinX(), bounds.getWidth());
++    double xMin = xNewStartAndWidth[0];
++    double xMax = xMin + xNewStartAndWidth[1];
++    if (bounds.getCrossesDateLine()) {
++      xMin = DistanceUtils.normLonDEG(xMin);
++      xMax = DistanceUtils.normLonDEG(xMax);
++    }
++
++    double[] yNewStartAndHeight = randomSubRange(bounds.getMinY(), bounds.getHeight());
++    double yMin = yNewStartAndHeight[0];
++    double yMax = yMin + yNewStartAndHeight[1];
+ 
+     return ctx.makeRectangle(xMin, xMax, yMin, yMax);
+   }
+ 
++  /** Returns new minStart and new length that is inside the range specified by the arguments. */
++  protected double[] randomSubRange(double boundStart, double boundLen) {
++    if (boundLen >= 3 && usually()) { // typical
++      // prefer integers for ease of debugability ... and prefer 1/16th of bound
++      int intBoundStart = (int) Math.ceil(boundStart);
++      int intBoundEnd = (int) (boundStart + boundLen);
++      int intBoundLen = intBoundEnd - intBoundStart;
++      int newLen = (int) randomGaussianMeanMax(intBoundLen / 16.0, intBoundLen);
++      int newStart = intBoundStart + randomInt(intBoundLen - newLen);
++      return new double[]{newStart, newLen};
++    } else { // (no int rounding)
++      double newLen = randomGaussianMeanMax(boundLen / 16, boundLen);
++      double newStart = boundStart + (boundLen - newLen == 0 ? 0 : (randomDouble() % (boundLen - newLen)));
++      return new double[]{newStart, newLen};
++    }
++  }
++
+   private double randomGaussianMinMeanMax(double min, double mean, double max) {
+     assert mean > min;
+     return randomGaussianMeanMax(mean - min, max - min) + min;
+diff --git a/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/HeatmapFacetCounterTest.java b/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/HeatmapFacetCounterTest.java
+new file mode 100644
+index 0000000..7834c4f
+--- /dev/null
++++ b/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/HeatmapFacetCounterTest.java
+@@ -0,0 +1,247 @@
++package org.apache.lucene.spatial.prefix;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import com.carrotsearch.randomizedtesting.annotations.Repeat;
++import com.spatial4j.core.context.SpatialContext;
++import com.spatial4j.core.context.SpatialContextFactory;
++import com.spatial4j.core.distance.DistanceUtils;
++import com.spatial4j.core.shape.Circle;
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Rectangle;
++import com.spatial4j.core.shape.Shape;
++import com.spatial4j.core.shape.SpatialRelation;
++import com.spatial4j.core.shape.impl.RectangleImpl;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.MatchAllDocsQuery;
++import org.apache.lucene.search.TotalHitCountCollector;
++import org.apache.lucene.spatial.StrategyTestCase;
++import org.apache.lucene.spatial.prefix.tree.QuadPrefixTree;
++import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import static com.carrotsearch.randomizedtesting.RandomizedTest.atMost;
++import static com.carrotsearch.randomizedtesting.RandomizedTest.randomIntBetween;
++
++public class HeatmapFacetCounterTest extends StrategyTestCase {
++
++  SpatialPrefixTree grid;
++
++  int cellsValidated;
++  int cellValidatedNonZero;
++
++  @Before
++  public void setUp() throws Exception {
++    super.setUp();
++    cellsValidated = cellValidatedNonZero = 0;
++    ctx = SpatialContext.GEO;
++    grid = new QuadPrefixTree(ctx, randomIntBetween(1, 8));
++    strategy = new RecursivePrefixTreeStrategy(grid, getTestClass().getSimpleName());
++    if (rarely()) {
++      ((PrefixTreeStrategy) strategy).setPointsOnly(true);
++    }
++  }
++
++  @After
++  public void after() {
++    log.info("Validated " + cellsValidated + " cells, " + cellValidatedNonZero + " non-zero");
++  }
++
++  @Test
++  public void testStatic() throws IOException {
++    //Some specific tests (static, not random).
++    adoc("0", ctx.makeRectangle(179.8, -170, -90, -80));//barely crosses equator
++    adoc("1", ctx.makePoint(-180, -85));//a pt within the above rect
++    adoc("2", ctx.makePoint(172, -85));//a pt to left of rect
++    commit();
++
++    validateHeatmapResultLoop(ctx.makeRectangle(+170, +180, -90, -85), 1, 100);
++    validateHeatmapResultLoop(ctx.makeRectangle(-180, -160, -89, -50), 1, 100);
++    // We could test anything and everything at this point... I prefer we leave that to random testing and then
++    // add specific tests if we find a bug.
++  }
++
++  @Test
++  public void testQueryCircle() throws IOException {
++    //overwrite setUp; non-geo bounds is more straight-forward; otherwise 88,88 would actually be practically north,
++    final SpatialContextFactory spatialContextFactory = new SpatialContextFactory();
++    spatialContextFactory.geo = false;
++    spatialContextFactory.worldBounds = new RectangleImpl(-90, 90, -90, 90, null);
++    ctx = spatialContextFactory.newSpatialContext();
++    final int LEVEL = 4;
++    grid = new QuadPrefixTree(ctx, LEVEL);
++    strategy = new RecursivePrefixTreeStrategy(grid, getTestClass().getSimpleName());
++    Circle circle = ctx.makeCircle(0, 0, 89);
++    adoc("0", ctx.makePoint(88, 88));//top-right, inside bbox of circle but not the circle
++    adoc("1", ctx.makePoint(0, 0));//clearly inside; dead center in fact
++    commit();
++    final HeatmapFacetCounter.Heatmap heatmap = HeatmapFacetCounter.calcFacets(
++        (PrefixTreeStrategy) strategy, indexSearcher.getTopReaderContext(), null,
++        circle, LEVEL, 1000);
++    //assert that only one point is found, not 2
++    boolean foundOne = false;
++    for (int count : heatmap.counts) {
++      switch (count) {
++        case 0: break;
++        case 1:
++          assertFalse(foundOne);//this is the first
++          foundOne = true;
++          break;
++        default:
++          fail("counts should be 0 or 1: " + count);
++      }
++    }
++    assertTrue(foundOne);
++  }
++
++  /** Recursively facet & validate at higher resolutions until we've seen enough. We assume there are
++   * some non-zero cells. */
++  private void validateHeatmapResultLoop(Rectangle inputRange, int facetLevel, int cellCountRecursThreshold)
++      throws IOException {
++    if (facetLevel > grid.getMaxLevels()) {
++      return;
++    }
++    final int maxCells = 10_000;
++    final HeatmapFacetCounter.Heatmap heatmap = HeatmapFacetCounter.calcFacets(
++        (PrefixTreeStrategy) strategy, indexSearcher.getTopReaderContext(), null, inputRange, facetLevel, maxCells);
++    int preNonZero = cellValidatedNonZero;
++    validateHeatmapResult(inputRange, facetLevel, heatmap);
++    assert cellValidatedNonZero - preNonZero > 0;//we validated more non-zero cells
++    if (heatmap.counts.length < cellCountRecursThreshold) {
++      validateHeatmapResultLoop(inputRange, facetLevel + 1, cellCountRecursThreshold);
++    }
++  }
++
++  @Test
++  @Repeat(iterations = 20)
++  public void testRandom() throws IOException {
++    // Tests using random index shapes & query shapes. This has found all sorts of edge case bugs (e.g. dateline,
++    // cell border, overflow(?)).
++
++    final int numIndexedShapes = 1 + atMost(9);
++    List<Shape> indexedShapes = new ArrayList<>(numIndexedShapes);
++    for (int i = 0; i < numIndexedShapes; i++) {
++      indexedShapes.add(randomIndexedShape());
++    }
++
++    //Main index loop:
++    for (int i = 0; i < indexedShapes.size(); i++) {
++      Shape shape = indexedShapes.get(i);
++      adoc("" + i, shape);
++
++      if (random().nextInt(10) == 0)
++        commit();//intermediate commit, produces extra segments
++    }
++    //delete some documents randomly
++    for (int id = 0; id < indexedShapes.size(); id++) {
++      if (random().nextInt(10) == 0) {
++        deleteDoc("" + id);
++        indexedShapes.set(id, null);
++      }
++    }
++
++    commit();
++
++    // once without dateline wrap
++    final Rectangle rect = randomRectangle();
++    queryHeatmapRecursive(usually() ? ctx.getWorldBounds() : rect, 1);
++    // and once with dateline wrap
++    if (rect.getWidth() > 0) {
++      double shift = random().nextDouble() % rect.getWidth();
++      queryHeatmapRecursive(ctx.makeRectangle(
++              DistanceUtils.normLonDEG(rect.getMinX() - shift),
++              DistanceUtils.normLonDEG(rect.getMaxX() - shift),
++              rect.getMinY(), rect.getMaxY()),
++          1);
++    }
++  }
++
++  /** Build heatmap, validate results, then descend recursively to another facet level. */
++  private boolean queryHeatmapRecursive(Rectangle inputRange, int facetLevel) throws IOException {
++    Filter filter = null; //FYI testing filtering of underlying PrefixTreeFacetCounter is done in another test
++    //Calculate facets
++    final int maxCells = 10_000;
++    final HeatmapFacetCounter.Heatmap heatmap = HeatmapFacetCounter.calcFacets(
++        (PrefixTreeStrategy) strategy, indexSearcher.getTopReaderContext(), filter, inputRange, facetLevel, maxCells);
++
++    validateHeatmapResult(inputRange, facetLevel, heatmap);
++
++    boolean foundNonZeroCount = false;
++    for (int count : heatmap.counts) {
++      if (count > 0) {
++        foundNonZeroCount = true;
++        break;
++      }
++    }
++
++    //Test again recursively to higher facetLevel (more detailed cells)
++    if (foundNonZeroCount && cellsValidated <= 500 && facetLevel != grid.getMaxLevels() && inputRange.hasArea()) {
++      for (int i = 0; i < 5; i++) {//try multiple times until we find non-zero counts
++        if (queryHeatmapRecursive(randomRectangle(inputRange), facetLevel + 1)) {
++          break;//we found data here so we needn't try again
++        }
++      }
++    }
++    return foundNonZeroCount;
++  }
++
++  private void validateHeatmapResult(Rectangle inputRange, int facetLevel, HeatmapFacetCounter.Heatmap heatmap)
++      throws IOException {
++    final Rectangle heatRect = heatmap.region;
++    assertTrue(heatRect.relate(inputRange) == SpatialRelation.CONTAINS || heatRect.equals(inputRange));
++    final double cellWidth = heatRect.getWidth() / heatmap.columns;
++    final double cellHeight = heatRect.getHeight() / heatmap.rows;
++    for (int c = 0; c < heatmap.columns; c++) {
++      for (int r = 0; r < heatmap.rows; r++) {
++        final int facetCount = heatmap.getCount(c, r);
++        double x = DistanceUtils.normLonDEG(heatRect.getMinX() + c * cellWidth + cellWidth / 2);
++        double y = DistanceUtils.normLatDEG(heatRect.getMinY() + r * cellHeight + cellHeight / 2);
++        Point pt =  ctx.makePoint(x, y);
++        assertEquals(countMatchingDocsAtLevel(pt, facetLevel), facetCount);
++      }
++    }
++  }
++
++  private int countMatchingDocsAtLevel(Point pt, int facetLevel) throws IOException {
++    // we use IntersectsPrefixTreeFilter directly so that we can specify the level to go to exactly.
++    RecursivePrefixTreeStrategy strategy = (RecursivePrefixTreeStrategy) this.strategy;
++    Filter filter = new IntersectsPrefixTreeFilter(
++        pt, strategy.getFieldName(), grid, facetLevel, grid.getMaxLevels(), !strategy.isPointsOnly());
++    final TotalHitCountCollector collector = new TotalHitCountCollector();
++    indexSearcher.search(new MatchAllDocsQuery(), filter, collector);
++    cellsValidated++;
++    if (collector.getTotalHits() > 0) {
++      cellValidatedNonZero++;
++    }
++    return collector.getTotalHits();
++  }
++
++  private Shape randomIndexedShape() {
++    if (((PrefixTreeStrategy) strategy).isPointsOnly() || random().nextBoolean()) {
++      return randomPoint();
++    } else {
++      return randomRectangle();
++    }
++  }
++}
+\ No newline at end of file
+

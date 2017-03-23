@@ -1,0 +1,313 @@
+GitDiffStart: bc61e7cdc9b43f8eff78da42d96481cdfd4aa288 | Sun Dec 9 09:38:26 2012 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index ff181de..ac4146c 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -234,6 +234,9 @@ Bug Fixes
+   with 2-char codepoints, and to correctly break/combine terms containing
+   non-latin characters. (James Dyer, Andreas Hubold)
+ 
++* LUCENE-4596: fix a concurrency bug in DirectoryTaxonomyWriter.
++  (Shai Erera)
++
+ Changes in Runtime Behavior
+   
+ * LUCENE-4586: Change default ResultMode of FacetRequest to PER_NODE_IN_TREE.
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java b/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java
+index ceafb80..029ed3b 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/DirectoryTaxonomyWriter.java
+@@ -425,14 +425,18 @@ public class DirectoryTaxonomyWriter implements TaxonomyWriter {
+     DirectoryReader reader = readerManager.acquire();
+     try {
+       final BytesRef catTerm = new BytesRef(categoryPath.toString(delimiter));
++      TermsEnum termsEnum = null; // reuse
++      DocsEnum docs = null; // reuse
+       for (AtomicReaderContext ctx : reader.leaves()) {
+         Terms terms = ctx.reader().terms(Consts.FULL);
+         if (terms != null) {
+-          TermsEnum termsEnum = terms.iterator(null);
++          termsEnum = terms.iterator(termsEnum);
+           if (termsEnum.seekExact(catTerm, true)) {
+-            // TODO: is it really ok that null is passed here as liveDocs?
+-            DocsEnum docs = termsEnum.docs(null, null, 0);
++            // liveDocs=null because the taxonomy has no deletes
++            docs = termsEnum.docs(null, docs, 0 /* freqs not required */);
++            // if the term was found, we know it has exactly one document.
+             doc = docs.nextDoc() + ctx.docBase;
++            break;
+           }
+         }
+       }
+@@ -592,11 +596,13 @@ public class DirectoryTaxonomyWriter implements TaxonomyWriter {
+     // added a category document, mark that ReaderManager is not up-to-date
+     shouldRefreshReaderManager = true;
+     
+-    addToCache(categoryPath, length, id);
+-    
+     // also add to the parent array
+     taxoArrays = getTaxoArrays().add(id, parent);
+ 
++    // NOTE: this line must be executed last, or else the cache gets updated
++    // before the parents array (LUCENE-4596)
++    addToCache(categoryPath, length, id);
++
+     return id;
+   }
+ 
+@@ -832,7 +838,10 @@ public class DirectoryTaxonomyWriter implements TaxonomyWriter {
+     if (ordinal >= nextID) {
+       throw new ArrayIndexOutOfBoundsException("requested ordinal is bigger than the largest ordinal in the taxonomy");
+     }
+-    return getTaxoArrays().parents()[ordinal];
++    
++    int[] parents = getTaxoArrays().parents();
++    assert ordinal < parents.length : "requested ordinal (" + ordinal + "); parents.length (" + parents.length + ") !";
++    return parents[ordinal];
+   }
+   
+   /**
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/ParallelTaxonomyArrays.java b/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/ParallelTaxonomyArrays.java
+index 6248bf3..cfbf297 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/ParallelTaxonomyArrays.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/directory/ParallelTaxonomyArrays.java
+@@ -182,7 +182,7 @@ public class ParallelTaxonomyArrays {
+    */
+   ParallelTaxonomyArrays add(int ordinal, int parentOrdinal) {
+     if (ordinal >= parents.length) {
+-      int[] newarray = ArrayUtil.grow(parents);
++      int[] newarray = ArrayUtil.grow(parents, ordinal + 1);
+       newarray[ordinal] = parentOrdinal;
+       return new ParallelTaxonomyArrays(newarray);
+     }
+diff --git a/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/TestTaxonomyCombined.java b/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/TestTaxonomyCombined.java
+index adbabc1..53fe544 100644
+--- a/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/TestTaxonomyCombined.java
++++ b/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/TestTaxonomyCombined.java
+@@ -35,7 +35,7 @@ import org.junit.Test;
+  * limitations under the License.
+  */
+ 
+-// TODO: remove this suppress after we fix the TaxoWriter Codec to a non-default (see todo in DirTW)
++// TODO: remove this suppress if we fix the TaxoWriter Codec to a non-default (see todo in DirTW)
+ @SuppressCodecs("SimpleText")
+ public class TestTaxonomyCombined extends LuceneTestCase {
+ 
+diff --git a/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/directory/TestConcurrentFacetedIndexing.java b/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/directory/TestConcurrentFacetedIndexing.java
+new file mode 100644
+index 0000000..6057973
+--- /dev/null
++++ b/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/directory/TestConcurrentFacetedIndexing.java
+@@ -0,0 +1,153 @@
++package org.apache.lucene.facet.taxonomy.directory;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.facet.index.CategoryDocumentBuilder;
++import org.apache.lucene.facet.taxonomy.CategoryPath;
++import org.apache.lucene.facet.taxonomy.writercache.TaxonomyWriterCache;
++import org.apache.lucene.facet.taxonomy.writercache.cl2o.Cl2oTaxonomyWriterCache;
++import org.apache.lucene.facet.taxonomy.writercache.lru.LruTaxonomyWriterCache;
++import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.index.IndexWriterConfig.OpenMode;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.LuceneTestCase;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/** Tests concurrent indexing with facets. */
++public class TestConcurrentFacetedIndexing extends LuceneTestCase {
++
++  // A No-Op TaxonomyWriterCache which always discards all given categories, and
++  // always returns true in put(), to indicate some cache entries were cleared.
++  private static TaxonomyWriterCache NO_OP_CACHE = new TaxonomyWriterCache() {
++    
++    @Override
++    public void close() {}
++    @Override
++    public int get(CategoryPath categoryPath) { return -1; }
++    @Override
++    public int get(CategoryPath categoryPath, int length) { return -1; }
++    @Override
++    public boolean put(CategoryPath categoryPath, int ordinal) { return true; }
++    @Override
++    public boolean put(CategoryPath categoryPath, int prefixLen, int ordinal) { return true; }
++    @Override
++    public boolean isFull() { return true; }
++    @Override
++    public void clear() {}
++    
++  };
++  
++  static CategoryPath newCategory() {
++    Random r = random();
++    String l1 = "l1." + r.nextInt(10); // l1.0-l1.9 (10 categories)
++    String l2 = "l2." + r.nextInt(30); // l2.0-l2.29 (30 categories)
++    String l3 = "l3." + r.nextInt(100); // l3.0-l3.99 (100 categories)
++    return new CategoryPath(l1, l2, l3);
++  }
++  
++  static TaxonomyWriterCache newTaxoWriterCache(int ndocs) {
++    final double d = random().nextDouble();
++    if (d < 0.7) {
++      // this is the fastest, yet most memory consuming
++      return new Cl2oTaxonomyWriterCache(1024, 0.15f, 3);
++    } else if (TEST_NIGHTLY && d > 0.98) {
++      // this is the slowest, but tests the writer concurrency when no caching is done.
++      // only pick it during NIGHTLY tests, and even then, with very low chances.
++      return NO_OP_CACHE;
++    } else {
++      // this is slower than CL2O, but less memory consuming, and exercises finding categories on disk too.
++      return new LruTaxonomyWriterCache(ndocs / 10);
++    }
++  }
++  
++  public void testConcurrency() throws Exception {
++    final AtomicInteger numDocs = new AtomicInteger(atLeast(10000));
++    final Directory indexDir = newDirectory();
++    final Directory taxoDir = newDirectory();
++    final ConcurrentHashMap<String,String> values = new ConcurrentHashMap<String,String>();
++    final IndexWriter iw = new IndexWriter(indexDir, newIndexWriterConfig(TEST_VERSION_CURRENT, null));
++    final DirectoryTaxonomyWriter tw = new DirectoryTaxonomyWriter(taxoDir, OpenMode.CREATE, newTaxoWriterCache(numDocs.get()));
++    final Thread[] indexThreads = new Thread[atLeast(4)];
++
++    for (int i = 0; i < indexThreads.length; i++) {
++      indexThreads[i] = new Thread() {
++        private final CategoryDocumentBuilder cdb = new CategoryDocumentBuilder(tw);
++        
++        @Override
++        public void run() {
++          Random random = random();
++          while (numDocs.decrementAndGet() > 0) {
++            try {
++              Document doc = new Document();
++              int numCats = random.nextInt(3) + 1; // 1-3
++              List<CategoryPath> cats = new ArrayList<CategoryPath>(numCats);
++              while (numCats-- > 0) {
++                CategoryPath cp = newCategory();
++                cats.add(cp);
++                // add all prefixes to values
++                int level = cp.length();
++                while (level > 0) {
++                  String s = cp.toString('/', level);
++                  values.put(s, s);
++                  --level;
++                }
++              }
++              cdb.setCategoryPaths(cats);
++              cdb.build(doc);
++              iw.addDocument(doc);
++            } catch (IOException e) {
++              throw new RuntimeException(e);
++            }
++          }
++        }
++      };
++    }
++    
++    for (Thread t : indexThreads) t.start();
++    for (Thread t : indexThreads) t.join();
++    
++    DirectoryTaxonomyReader tr = new DirectoryTaxonomyReader(tw);
++    assertEquals("mismatch number of categories", values.size() + 1, tr.getSize()); // +1 for root category
++    int[] parents = tr.getParallelTaxonomyArrays().parents();
++    for (String cat : values.keySet()) {
++      CategoryPath cp = new CategoryPath(cat, '/');
++      assertTrue("category not found " + cp, tr.getOrdinal(cp) > 0);
++      int level = cp.length();
++      int parentOrd = 0; // for root, parent is always virtual ROOT (ord=0)
++      CategoryPath path = new CategoryPath();
++      for (int i = 0; i < level; i++) {
++        path.add(cp.getComponent(i));
++        int ord = tr.getOrdinal(path);
++        assertEquals("invalid parent for cp=" + path, parentOrd, parents[ord]);
++        parentOrd = ord; // next level should have this parent
++      }
++    }
++    tr.close();
++
++    IOUtils.close(tw, iw, taxoDir, indexDir);
++  }
++
++}
+diff --git a/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/directory/TestDirectoryTaxonomyWriter.java b/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/directory/TestDirectoryTaxonomyWriter.java
+index a7480d5..f696b6e 100644
+--- a/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/directory/TestDirectoryTaxonomyWriter.java
++++ b/lucene/facet/src/test/org/apache/lucene/facet/taxonomy/directory/TestDirectoryTaxonomyWriter.java
+@@ -237,7 +237,7 @@ public class TestDirectoryTaxonomyWriter extends LuceneTestCase {
+     final int range = ncats * 3; // affects the categories selection
+     final AtomicInteger numCats = new AtomicInteger(ncats);
+     final Directory dir = newDirectory();
+-    final ConcurrentHashMap<Integer,Integer> values = new ConcurrentHashMap<Integer,Integer>();
++    final ConcurrentHashMap<String,String> values = new ConcurrentHashMap<String,String>();
+     final double d = random().nextDouble();
+     final TaxonomyWriterCache cache;
+     if (d < 0.7) {
+@@ -261,8 +261,18 @@ public class TestDirectoryTaxonomyWriter extends LuceneTestCase {
+           while (numCats.decrementAndGet() > 0) {
+             try {
+               int value = random.nextInt(range);
+-              tw.addCategory(new CategoryPath("a", Integer.toString(value)));
+-              values.put(value, value);
++              CategoryPath cp = new CategoryPath(Integer.toString(value / 1000), Integer.toString(value / 10000),
++                  Integer.toString(value / 100000), Integer.toString(value));
++              int ord = tw.addCategory(cp);
++              assertTrue("invalid parent for ordinal " + ord + ", category " + cp, tw.getParent(ord) != -1);
++              String l1 = cp.toString('/', 1);
++              String l2 = cp.toString('/', 2);
++              String l3 = cp.toString('/', 3);
++              String l4 = cp.toString('/', 4);
++              values.put(l1, l1);
++              values.put(l2, l2);
++              values.put(l3, l3);
++              values.put(l4, l4);
+             } catch (IOException e) {
+               throw new RuntimeException(e);
+             }
+@@ -276,9 +286,20 @@ public class TestDirectoryTaxonomyWriter extends LuceneTestCase {
+     tw.close();
+     
+     DirectoryTaxonomyReader dtr = new DirectoryTaxonomyReader(dir);
+-    assertEquals("mismatch number of categories", values.size() + 2, dtr.getSize()); // +2 for root category + "a"
+-    for (Integer value : values.keySet()) {
+-      assertTrue("category not found a/" + value, dtr.getOrdinal(new CategoryPath("a", value.toString())) > 0);
++    assertEquals("mismatch number of categories", values.size() + 1, dtr.getSize()); // +1 for root category
++    int[] parents = dtr.getParallelTaxonomyArrays().parents();
++    for (String cat : values.keySet()) {
++      CategoryPath cp = new CategoryPath(cat, '/');
++      assertTrue("category not found " + cp, dtr.getOrdinal(cp) > 0);
++      int level = cp.length();
++      int parentOrd = 0; // for root, parent is always virtual ROOT (ord=0)
++      CategoryPath path = new CategoryPath();
++      for (int i = 0; i < level; i++) {
++        path.add(cp.getComponent(i));
++        int ord = dtr.getOrdinal(path);
++        assertEquals("invalid parent for cp=" + path, parentOrd, parents[ord]);
++        parentOrd = ord; // next level should have this parent
++      }
+     }
+     dtr.close();
+     
+

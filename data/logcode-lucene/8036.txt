@@ -1,0 +1,672 @@
+GitDiffStart: e4bcd35ac057056714a98b5f85636c25b795e937 | Fri Sep 6 17:53:40 2013 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index b90853e..2a7c53a 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -117,6 +117,11 @@ New Features
+   FieldMutatingUpdateProcessorFactory and supports all of it's selector options. Use
+   of the "fields" init param is now deprecated in favor of "fieldName" (hossman)
+   
++* SOLR-2548: Allow multiple threads to be specified for faceting. When threading, one
++  can specify facet.threads to parallelize loading the uninverted fields. In at least
++  one extreme case this reduced warmup time from 20 seconds to 3 seconds. (Janne Majaranta,
++  Gun Akkor via Erick Erickson)
++  
+ 
+ Bug Fixes
+ ----------------------
+diff --git a/solr/core/src/java/org/apache/solr/request/SimpleFacets.java b/solr/core/src/java/org/apache/solr/request/SimpleFacets.java
+index 835c413..dd2f871 100644
+--- a/solr/core/src/java/org/apache/solr/request/SimpleFacets.java
++++ b/solr/core/src/java/org/apache/solr/request/SimpleFacets.java
+@@ -23,10 +23,16 @@ import java.util.Collection;
+ import java.util.Date;
+ import java.util.EnumSet;
+ import java.util.IdentityHashMap;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.Callable;
++import java.util.concurrent.CompletionService;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorCompletionService;
++import java.util.concurrent.Future;
+ import java.util.concurrent.SynchronousQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+@@ -334,6 +340,10 @@ public class SimpleFacets {
+   }
+ 
+   public NamedList<Integer> getTermCounts(String field) throws IOException {
++    return getTermCounts(field, this.docs);
++  }
++
++  public NamedList<Integer> getTermCounts(String field, DocSet base) throws IOException {
+     int offset = params.getFieldInt(field, FacetParams.FACET_OFFSET, 0);
+     int limit = params.getFieldInt(field, FacetParams.FACET_LIMIT, 100);
+     if (limit == 0) return new NamedList<Integer>();
+@@ -405,13 +415,13 @@ public class SimpleFacets {
+     }
+ 
+     if (params.getFieldBool(field, GroupParams.GROUP_FACET, false)) {
+-      counts = getGroupedCounts(searcher, docs, field, multiToken, offset,limit, mincount, missing, sort, prefix);
++      counts = getGroupedCounts(searcher, base, field, multiToken, offset,limit, mincount, missing, sort, prefix);
+     } else {
+       assert method != null;
+       switch (method) {
+         case ENUM:
+           assert TrieField.getMainValuePrefix(ft) == null;
+-          counts = getFacetTermEnumCounts(searcher, docs, field, offset, limit, mincount,missing,sort,prefix);
++          counts = getFacetTermEnumCounts(searcher, base, field, offset, limit, mincount,missing,sort,prefix);
+           break;
+         case FCS:
+           assert !multiToken;
+@@ -420,9 +430,9 @@ public class SimpleFacets {
+             if (prefix != null && !prefix.isEmpty()) {
+               throw new SolrException(ErrorCode.BAD_REQUEST, FacetParams.FACET_PREFIX + " is not supported on numeric types");
+             }
+-            counts = NumericFacets.getCounts(searcher, docs, field, offset, limit, mincount, missing, sort);
++            counts = NumericFacets.getCounts(searcher, base, field, offset, limit, mincount, missing, sort);
+           } else {
+-            PerSegmentSingleValuedFaceting ps = new PerSegmentSingleValuedFaceting(searcher, docs, field, offset,limit, mincount, missing, sort, prefix);
++            PerSegmentSingleValuedFaceting ps = new PerSegmentSingleValuedFaceting(searcher, base, field, offset,limit, mincount, missing, sort, prefix);
+             Executor executor = threads == 0 ? directExecutor : facetExecutor;
+             ps.setNumThreads(threads);
+             counts = ps.getFacetCounts(executor);
+@@ -430,12 +440,12 @@ public class SimpleFacets {
+           break;
+         case FC:
+           if (sf.hasDocValues()) {
+-            counts = DocValuesFacets.getCounts(searcher, docs, field, offset,limit, mincount, missing, sort, prefix);
++            counts = DocValuesFacets.getCounts(searcher, base, field, offset,limit, mincount, missing, sort, prefix);
+           } else if (multiToken || TrieField.getMainValuePrefix(ft) != null) {
+             UnInvertedField uif = UnInvertedField.getUnInvertedField(field, searcher);
+-            counts = uif.getCounts(searcher, docs, offset, limit, mincount,missing,sort,prefix);
++            counts = uif.getCounts(searcher, base, offset, limit, mincount,missing,sort,prefix);
+           } else {
+-            counts = getFieldCacheCounts(searcher, docs, field, offset,limit, mincount, missing, sort, prefix);
++            counts = getFieldCacheCounts(searcher, base, field, offset,limit, mincount, missing, sort, prefix);
+           }
+           break;
+         default:
+@@ -516,19 +526,75 @@ public class SimpleFacets {
+    * @see #getFacetTermEnumCounts
+    */
+   public NamedList<Object> getFacetFieldCounts()
+-          throws IOException, SyntaxError {
++      throws IOException, SyntaxError {
+ 
+     NamedList<Object> res = new SimpleOrderedMap<Object>();
+     String[] facetFs = params.getParams(FacetParams.FACET_FIELD);
+-    if (null != facetFs) {
+-      for (String f : facetFs) {
+-        parseParams(FacetParams.FACET_FIELD, f);
+-        String termList = localParams == null ? null : localParams.get(CommonParams.TERMS);
+-        if (termList != null) {
+-          res.add(key, getListedTermCounts(facetValue, termList));
+-        } else {
+-          res.add(key, getTermCounts(facetValue));
++    if (null == facetFs) {
++      return res;
++    }
++
++    int maxThreads = req.getParams().getInt(FacetParams.FACET_THREADS, 0);
++    Executor executor = maxThreads == 0 ? directExecutor : facetExecutor;
++
++    // passing a negative number for FACET_THREADS implies an unlimited number of threads is acceptable.
++    // Also, a subtlety of directeExecutor is that no matter how many times you "submit" a job, it's really
++    // just a method call in that it's run by this thread.
++    maxThreads = (maxThreads <= 0) ? Integer.MAX_VALUE : maxThreads;
++    CompletionService completionService = new ExecutorCompletionService(executor);
++    LinkedList<Callable> pending = new LinkedList<Callable>();
++    for (String f : facetFs) {
++      parseParams(FacetParams.FACET_FIELD, f);
++      final String termList = localParams == null ? null : localParams.get(CommonParams.TERMS);
++      final String workerKey = key;
++      final String workerFacetValue = facetValue;
++      final DocSet workerBase = this.docs;
++      Callable worker = new Callable() {
++        @Override
++        public Object call() throws Exception {
++          NamedList<Object> result = new SimpleOrderedMap<Object>();
++          try {
++            if(termList != null) {
++              result.add(workerKey, getListedTermCounts(workerFacetValue, termList, workerBase));
++            } else {
++              result.add(workerKey, getTermCounts(workerFacetValue, workerBase));
++            }
++          } catch (SolrException se) {
++            throw se;
++          } catch (Exception e){
++            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
++                                    "Exception during facet.field: " + workerFacetValue, e.getCause());
++          }
++          return result;
++        }
++      };
++      if (--maxThreads >= 0) {
++        completionService.submit(worker);
++      } else {
++        pending.add(worker);
++      }
++    }
++    for (String f : facetFs) {
++      NamedList taskResult;
++      try {
++        Future future = completionService.take();
++        taskResult = (NamedList)future.get();
++        if (taskResult != null) {
++          res.addAll(taskResult);
+         }
++        if (pending.isEmpty() == false) {
++          completionService.submit(pending.removeFirst());
++        }
++      } catch (InterruptedException e) {
++        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
++            "Processing of facet fields InterruptedException", e);
++      } catch (ExecutionException e) {
++        Throwable cause = e.getCause();
++        if (cause instanceof SolrException) {
++          throw (SolrException) cause;
++        }
++        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
++            "Processing of facet fields ExecutionException ", e);
+       }
+     }
+     return res;
+@@ -536,12 +602,16 @@ public class SimpleFacets {
+ 
+ 
+   private NamedList<Integer> getListedTermCounts(String field, String termList) throws IOException {
++    return getListedTermCounts(field, termList, this.docs);
++  }
++
++  private NamedList getListedTermCounts(String field, String termList, DocSet base) throws IOException {
+     FieldType ft = searcher.getSchema().getFieldType(field);
+     List<String> terms = StrUtils.splitSmart(termList, ",", true);
+     NamedList<Integer> res = new NamedList<Integer>();
+     for (String term : terms) {
+       String internal = ft.toInternal(term);
+-      int count = searcher.numDocs(new TermQuery(new Term(field, internal)), docs);
++      int count = searcher.numDocs(new TermQuery(new Term(field, internal)), base);
+       res.add(term, count);
+     }
+     return res;    
+@@ -558,7 +628,7 @@ public class SimpleFacets {
+     throws IOException {
+     SchemaField sf = searcher.getSchema().getField(fieldName);
+     DocSet hasVal = searcher.getDocSet
+-      (sf.getType().getRangeQuery(null, sf, null, null, false, false));
++        (sf.getType().getRangeQuery(null, sf, null, null, false, false));
+     return docs.andNotSize(hasVal);
+   }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/request/UnInvertedField.java b/solr/core/src/java/org/apache/solr/request/UnInvertedField.java
+index 55918f6..1939b63 100644
+--- a/solr/core/src/java/org/apache/solr/request/UnInvertedField.java
++++ b/solr/core/src/java/org/apache/solr/request/UnInvertedField.java
+@@ -18,7 +18,6 @@
+ package org.apache.solr.request;
+ 
+ import java.io.IOException;
+-import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -102,6 +101,15 @@ public class UnInvertedField extends DocTermOrds {
+ 
+   private SolrIndexSearcher.DocsEnumState deState;
+   private final SolrIndexSearcher searcher;
++  private final boolean isPlaceholder;
++
++  private static UnInvertedField uifPlaceholder = new UnInvertedField();
++
++  private UnInvertedField() { // Dummy for synchronization.
++    super("fake", 0, 0); // cheapest initialization I can find.
++    isPlaceholder = true;
++    searcher = null;
++   }
+ 
+   @Override
+   protected void visitTerm(TermsEnum te, int termNum) throws IOException {
+@@ -172,6 +180,7 @@ public class UnInvertedField extends DocTermOrds {
+           DEFAULT_INDEX_INTERVAL_BITS);
+     //System.out.println("maxTermDocFreq=" + maxTermDocFreq + " maxDoc=" + searcher.maxDoc());
+ 
++    isPlaceholder = false;
+     final String prefix = TrieField.getMainValuePrefix(searcher.getSchema().getFieldType(field));
+     this.searcher = searcher;
+     try {
+@@ -650,22 +659,44 @@ public class UnInvertedField extends DocTermOrds {
+   //////////////////////////////////////////////////////////////////
+   //////////////////////////// caching /////////////////////////////
+   //////////////////////////////////////////////////////////////////
++
+   public static UnInvertedField getUnInvertedField(String field, SolrIndexSearcher searcher) throws IOException {
+     SolrCache<String,UnInvertedField> cache = searcher.getFieldValueCache();
+     if (cache == null) {
+       return new UnInvertedField(field, searcher);
+     }
+-
+-    UnInvertedField uif = cache.get(field);
+-    if (uif == null) {
+-      synchronized (cache) {
+-        uif = cache.get(field);
+-        if (uif == null) {
+-          uif = new UnInvertedField(field, searcher);
+-          cache.put(field, uif);
++    UnInvertedField uif = null;
++    Boolean doWait = false;
++    synchronized (cache) {
++      uif = cache.get(field);
++      if (uif == null) {
++        cache.put(field, uifPlaceholder); // This thread will load this field, don't let other threads try.
++      } else {
++        if (uif.isPlaceholder == false) {
++          return uif;
+         }
++        doWait = true; // Someone else has put the place holder in, wait for that to complete.
+       }
+     }
++    while (doWait) {
++      try {
++        synchronized (cache) {
++          uif = cache.get(field); // Should at least return the placeholder, NPE if not is OK.
++          if (uif.isPlaceholder == false) { // OK, another thread put this in the cache we should be good.
++            return uif;
++          }
++          cache.wait();
++        }
++      } catch (InterruptedException e) {
++        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Thread interrupted in getUninvertedField.");
++      }
++    }
++
++    uif = new UnInvertedField(field, searcher);
++    synchronized (cache) {
++      cache.put(field, uif); // Note, this cleverly replaces the placeholder.
++      cache.notifyAll();
++    }
+ 
+     return uif;
+   }
+diff --git a/solr/core/src/test/org/apache/solr/request/TestFaceting.java b/solr/core/src/test/org/apache/solr/request/TestFaceting.java
+index a884c10..a6c1dae 100644
+--- a/solr/core/src/test/org/apache/solr/request/TestFaceting.java
++++ b/solr/core/src/test/org/apache/solr/request/TestFaceting.java
+@@ -28,6 +28,8 @@ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.solr.SolrTestCaseJ4;
+ import org.apache.solr.common.params.FacetParams;
++import org.apache.solr.search.SolrIndexSearcher;
++import org.apache.solr.util.RefCounted;
+ import org.junit.After;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+@@ -321,7 +323,7 @@ public class TestFaceting extends SolrTestCaseJ4 {
+   }
+ 
+ 
+-
++  @Test
+   public void testDateFacetsWithMultipleConfigurationForSameField() {
+     clearIndex();
+     final String f = "bday_dt";
+@@ -613,5 +615,337 @@ public class TestFaceting extends SolrTestCaseJ4 {
+       clearIndex();
+       assertU(commit());
+   }
++
++  private void add50ocs() {
++    // Gimme 50 docs with 10 facet fields each
++    for (int idx = 0; idx < 50; ++idx) {
++      String f0 = (idx % 2 == 0) ? "zero_2" : "zero_1";
++      String f1 = (idx % 3 == 0) ? "one_3" : "one_1";
++      String f2 = (idx % 4 == 0) ? "two_4" : "two_1";
++      String f3 = (idx % 5 == 0) ? "three_5" : "three_1";
++      String f4 = (idx % 6 == 0) ? "four_6" : "four_1";
++      String f5 = (idx % 7 == 0) ? "five_7" : "five_1";
++      String f6 = (idx % 8 == 0) ? "six_8" : "six_1";
++      String f7 = (idx % 9 == 0) ? "seven_9" : "seven_1";
++      String f8 = (idx % 10 == 0) ? "eight_10" : "eight_1";
++      String f9 = (idx % 11 == 0) ? "nine_11" : "nine_1";
++      assertU(adoc("id", Integer.toString(idx),
++          "f0_ws", f0,
++          "f1_ws", f1,
++          "f2_ws", f2,
++          "f3_ws", f3,
++          "f4_ws", f4,
++          "f5_ws", f5,
++          "f6_ws", f6,
++          "f7_ws", f7,
++          "f8_ws", f8,
++          "f9_ws", f9
++      ));
++    }
++
++    assertU(commit());
++
++  }
++
++  @Test
++  public void testThreadWait() throws Exception {
++
++    add50ocs();
++    // All I really care about here is the chance to fire off a bunch of threads to the UnIninvertedField.get method
++    // to insure that we get into/out of the lock. Again, it's not entirely deterministic, but it might catch bad
++    // stuff occasionally...
++    assertQ("check threading, more threads than fields",
++        req("q", "id:*", "indent", "true", "fl", "id", "rows", "1"
++            , "facet", "true"
++            , "facet.field", "f0_ws"
++            , "facet.field", "f0_ws"
++            , "facet.field", "f0_ws"
++            , "facet.field", "f0_ws"
++            , "facet.field", "f0_ws"
++            , "facet.field", "f1_ws"
++            , "facet.field", "f1_ws"
++            , "facet.field", "f1_ws"
++            , "facet.field", "f1_ws"
++            , "facet.field", "f1_ws"
++            , "facet.field", "f2_ws"
++            , "facet.field", "f2_ws"
++            , "facet.field", "f2_ws"
++            , "facet.field", "f2_ws"
++            , "facet.field", "f2_ws"
++            , "facet.field", "f3_ws"
++            , "facet.field", "f3_ws"
++            , "facet.field", "f3_ws"
++            , "facet.field", "f3_ws"
++            , "facet.field", "f3_ws"
++            , "facet.field", "f4_ws"
++            , "facet.field", "f4_ws"
++            , "facet.field", "f4_ws"
++            , "facet.field", "f4_ws"
++            , "facet.field", "f4_ws"
++            , "facet.field", "f5_ws"
++            , "facet.field", "f5_ws"
++            , "facet.field", "f5_ws"
++            , "facet.field", "f5_ws"
++            , "facet.field", "f5_ws"
++            , "facet.field", "f6_ws"
++            , "facet.field", "f6_ws"
++            , "facet.field", "f6_ws"
++            , "facet.field", "f6_ws"
++            , "facet.field", "f6_ws"
++            , "facet.field", "f7_ws"
++            , "facet.field", "f7_ws"
++            , "facet.field", "f7_ws"
++            , "facet.field", "f7_ws"
++            , "facet.field", "f7_ws"
++            , "facet.field", "f8_ws"
++            , "facet.field", "f8_ws"
++            , "facet.field", "f8_ws"
++            , "facet.field", "f8_ws"
++            , "facet.field", "f8_ws"
++            , "facet.field", "f9_ws"
++            , "facet.field", "f9_ws"
++            , "facet.field", "f9_ws"
++            , "facet.field", "f9_ws"
++            , "facet.field", "f9_ws"
++            , "facet.threads", "1000"
++            , "facet.limit", "-1"
++        )
++        , "*[count(//lst[@name='facet_fields']/lst)=50]"
++        , "*[count(//lst[@name='facet_fields']/lst/int)=100]"
++    );
++
++  }
++
++  @Test
++  public void testMultiThreadedFacets() throws Exception {
++    add50ocs();
++    assertQ("check no threading, threads == 0",
++        req("q", "id:*", "indent", "true", "fl", "id", "rows", "1"
++            , "facet", "true"
++            , "facet.field", "f0_ws"
++            , "facet.field", "f1_ws"
++            , "facet.field", "f2_ws"
++            , "facet.field", "f3_ws"
++            , "facet.field", "f4_ws"
++            , "facet.field", "f5_ws"
++            , "facet.field", "f6_ws"
++            , "facet.field", "f7_ws"
++            , "facet.field", "f8_ws"
++            , "facet.field", "f9_ws"
++            , "facet.threads", "0"
++            , "facet.limit", "-1"
++        )
++        , "*[count(//lst[@name='facet_fields']/lst)=10]"
++        , "*[count(//lst[@name='facet_fields']/lst/int)=20]"
++        , "//lst[@name='f0_ws']/int[@name='zero_1'][.='25']"
++        , "//lst[@name='f0_ws']/int[@name='zero_2'][.='25']"
++        , "//lst[@name='f1_ws']/int[@name='one_1'][.='33']"
++        , "//lst[@name='f1_ws']/int[@name='one_3'][.='17']"
++        , "//lst[@name='f2_ws']/int[@name='two_1'][.='37']"
++        , "//lst[@name='f2_ws']/int[@name='two_4'][.='13']"
++        , "//lst[@name='f3_ws']/int[@name='three_1'][.='40']"
++        , "//lst[@name='f3_ws']/int[@name='three_5'][.='10']"
++        , "//lst[@name='f4_ws']/int[@name='four_1'][.='41']"
++        , "//lst[@name='f4_ws']/int[@name='four_6'][.='9']"
++        , "//lst[@name='f5_ws']/int[@name='five_1'][.='42']"
++        , "//lst[@name='f5_ws']/int[@name='five_7'][.='8']"
++        , "//lst[@name='f6_ws']/int[@name='six_1'][.='43']"
++        , "//lst[@name='f6_ws']/int[@name='six_8'][.='7']"
++        , "//lst[@name='f7_ws']/int[@name='seven_1'][.='44']"
++        , "//lst[@name='f7_ws']/int[@name='seven_9'][.='6']"
++        , "//lst[@name='f8_ws']/int[@name='eight_1'][.='45']"
++        , "//lst[@name='f8_ws']/int[@name='eight_10'][.='5']"
++        , "//lst[@name='f9_ws']/int[@name='nine_1'][.='45']"
++        , "//lst[@name='f9_ws']/int[@name='nine_11'][.='5']"
++
++    );
++
++    RefCounted<SolrIndexSearcher> currentSearcherRef = h.getCore().getSearcher();
++    try {
++      SolrIndexSearcher currentSearcher = currentSearcherRef.get();
++      UnInvertedField ui0 = UnInvertedField.getUnInvertedField("f0_ws", currentSearcher);
++      UnInvertedField ui1 = UnInvertedField.getUnInvertedField("f1_ws", currentSearcher);
++      UnInvertedField ui2 = UnInvertedField.getUnInvertedField("f2_ws", currentSearcher);
++      UnInvertedField ui3 = UnInvertedField.getUnInvertedField("f3_ws", currentSearcher);
++      UnInvertedField ui4 = UnInvertedField.getUnInvertedField("f4_ws", currentSearcher);
++      UnInvertedField ui5 = UnInvertedField.getUnInvertedField("f5_ws", currentSearcher);
++      UnInvertedField ui6 = UnInvertedField.getUnInvertedField("f6_ws", currentSearcher);
++      UnInvertedField ui7 = UnInvertedField.getUnInvertedField("f7_ws", currentSearcher);
++      UnInvertedField ui8 = UnInvertedField.getUnInvertedField("f8_ws", currentSearcher);
++      UnInvertedField ui9 = UnInvertedField.getUnInvertedField("f9_ws", currentSearcher);
++
++      assertQ("check threading, more threads than fields",
++          req("q", "id:*", "indent", "true", "fl", "id", "rows", "1"
++              , "facet", "true"
++              , "facet.field", "f0_ws"
++              , "facet.field", "f1_ws"
++              , "facet.field", "f2_ws"
++              , "facet.field", "f3_ws"
++              , "facet.field", "f4_ws"
++              , "facet.field", "f5_ws"
++              , "facet.field", "f6_ws"
++              , "facet.field", "f7_ws"
++              , "facet.field", "f8_ws"
++              , "facet.field", "f9_ws"
++              , "facet.threads", "1000"
++              , "facet.limit", "-1"
++          )
++          , "*[count(//lst[@name='facet_fields']/lst)=10]"
++          , "*[count(//lst[@name='facet_fields']/lst/int)=20]"
++          , "//lst[@name='f0_ws']/int[@name='zero_1'][.='25']"
++          , "//lst[@name='f0_ws']/int[@name='zero_2'][.='25']"
++          , "//lst[@name='f1_ws']/int[@name='one_1'][.='33']"
++          , "//lst[@name='f1_ws']/int[@name='one_3'][.='17']"
++          , "//lst[@name='f2_ws']/int[@name='two_1'][.='37']"
++          , "//lst[@name='f2_ws']/int[@name='two_4'][.='13']"
++          , "//lst[@name='f3_ws']/int[@name='three_1'][.='40']"
++          , "//lst[@name='f3_ws']/int[@name='three_5'][.='10']"
++          , "//lst[@name='f4_ws']/int[@name='four_1'][.='41']"
++          , "//lst[@name='f4_ws']/int[@name='four_6'][.='9']"
++          , "//lst[@name='f5_ws']/int[@name='five_1'][.='42']"
++          , "//lst[@name='f5_ws']/int[@name='five_7'][.='8']"
++          , "//lst[@name='f6_ws']/int[@name='six_1'][.='43']"
++          , "//lst[@name='f6_ws']/int[@name='six_8'][.='7']"
++          , "//lst[@name='f7_ws']/int[@name='seven_1'][.='44']"
++          , "//lst[@name='f7_ws']/int[@name='seven_9'][.='6']"
++          , "//lst[@name='f8_ws']/int[@name='eight_1'][.='45']"
++          , "//lst[@name='f8_ws']/int[@name='eight_10'][.='5']"
++          , "//lst[@name='f9_ws']/int[@name='nine_1'][.='45']"
++          , "//lst[@name='f9_ws']/int[@name='nine_11'][.='5']"
++
++      );
++      assertQ("check threading, fewer threads than fields",
++          req("q", "id:*", "indent", "true", "fl", "id", "rows", "1"
++              , "facet", "true"
++              , "facet.field", "f0_ws"
++              , "facet.field", "f1_ws"
++              , "facet.field", "f2_ws"
++              , "facet.field", "f3_ws"
++              , "facet.field", "f4_ws"
++              , "facet.field", "f5_ws"
++              , "facet.field", "f6_ws"
++              , "facet.field", "f7_ws"
++              , "facet.field", "f8_ws"
++              , "facet.field", "f9_ws"
++              , "facet.threads", "3"
++              , "facet.limit", "-1"
++          )
++          , "*[count(//lst[@name='facet_fields']/lst)=10]"
++          , "*[count(//lst[@name='facet_fields']/lst/int)=20]"
++          , "//lst[@name='f0_ws']/int[@name='zero_1'][.='25']"
++          , "//lst[@name='f0_ws']/int[@name='zero_2'][.='25']"
++          , "//lst[@name='f1_ws']/int[@name='one_1'][.='33']"
++          , "//lst[@name='f1_ws']/int[@name='one_3'][.='17']"
++          , "//lst[@name='f2_ws']/int[@name='two_1'][.='37']"
++          , "//lst[@name='f2_ws']/int[@name='two_4'][.='13']"
++          , "//lst[@name='f3_ws']/int[@name='three_1'][.='40']"
++          , "//lst[@name='f3_ws']/int[@name='three_5'][.='10']"
++          , "//lst[@name='f4_ws']/int[@name='four_1'][.='41']"
++          , "//lst[@name='f4_ws']/int[@name='four_6'][.='9']"
++          , "//lst[@name='f5_ws']/int[@name='five_1'][.='42']"
++          , "//lst[@name='f5_ws']/int[@name='five_7'][.='8']"
++          , "//lst[@name='f6_ws']/int[@name='six_1'][.='43']"
++          , "//lst[@name='f6_ws']/int[@name='six_8'][.='7']"
++          , "//lst[@name='f7_ws']/int[@name='seven_1'][.='44']"
++          , "//lst[@name='f7_ws']/int[@name='seven_9'][.='6']"
++          , "//lst[@name='f8_ws']/int[@name='eight_1'][.='45']"
++          , "//lst[@name='f8_ws']/int[@name='eight_10'][.='5']"
++          , "//lst[@name='f9_ws']/int[@name='nine_1'][.='45']"
++          , "//lst[@name='f9_ws']/int[@name='nine_11'][.='5']"
++
++      );
++
++      // After this all, the uninverted fields should be exactly the same as they were the first time, even if we
++      // blast a whole bunch of identical fields at the facet code. Which, BTW, doesn't detect
++      // if you've asked for the same field more than once.
++      // The way fetching the uninverted field is written, all this is really testing is if the cache is working.
++      // It's NOT testing whether the pending/sleep is actually functioning, I had to do that by hand since I don't
++      // see how to make sure that uninverting the field multiple times actually happens to hit the wait state.
++      assertQ("check threading, more threads than fields",
++          req("q", "id:*", "indent", "true", "fl", "id", "rows", "1"
++              , "facet", "true"
++              , "facet.field", "f0_ws"
++              , "facet.field", "f0_ws"
++              , "facet.field", "f0_ws"
++              , "facet.field", "f0_ws"
++              , "facet.field", "f0_ws"
++              , "facet.field", "f1_ws"
++              , "facet.field", "f1_ws"
++              , "facet.field", "f1_ws"
++              , "facet.field", "f1_ws"
++              , "facet.field", "f1_ws"
++              , "facet.field", "f2_ws"
++              , "facet.field", "f2_ws"
++              , "facet.field", "f2_ws"
++              , "facet.field", "f2_ws"
++              , "facet.field", "f2_ws"
++              , "facet.field", "f3_ws"
++              , "facet.field", "f3_ws"
++              , "facet.field", "f3_ws"
++              , "facet.field", "f3_ws"
++              , "facet.field", "f3_ws"
++              , "facet.field", "f4_ws"
++              , "facet.field", "f4_ws"
++              , "facet.field", "f4_ws"
++              , "facet.field", "f4_ws"
++              , "facet.field", "f4_ws"
++              , "facet.field", "f5_ws"
++              , "facet.field", "f5_ws"
++              , "facet.field", "f5_ws"
++              , "facet.field", "f5_ws"
++              , "facet.field", "f5_ws"
++              , "facet.field", "f6_ws"
++              , "facet.field", "f6_ws"
++              , "facet.field", "f6_ws"
++              , "facet.field", "f6_ws"
++              , "facet.field", "f6_ws"
++              , "facet.field", "f7_ws"
++              , "facet.field", "f7_ws"
++              , "facet.field", "f7_ws"
++              , "facet.field", "f7_ws"
++              , "facet.field", "f7_ws"
++              , "facet.field", "f8_ws"
++              , "facet.field", "f8_ws"
++              , "facet.field", "f8_ws"
++              , "facet.field", "f8_ws"
++              , "facet.field", "f8_ws"
++              , "facet.field", "f9_ws"
++              , "facet.field", "f9_ws"
++              , "facet.field", "f9_ws"
++              , "facet.field", "f9_ws"
++              , "facet.field", "f9_ws"
++              , "facet.threads", "1000"
++              , "facet.limit", "-1"
++          )
++          , "*[count(//lst[@name='facet_fields']/lst)=50]"
++          , "*[count(//lst[@name='facet_fields']/lst/int)=100]"
++      );
++
++      // Now, are all the UnInvertedFields still the same? Meaning they weren't re-fetched even when a bunch were
++      // requested at the same time?
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui0, UnInvertedField.getUnInvertedField("f0_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui1, UnInvertedField.getUnInvertedField("f1_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui2, UnInvertedField.getUnInvertedField("f2_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui3, UnInvertedField.getUnInvertedField("f3_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui4, UnInvertedField.getUnInvertedField("f4_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui5, UnInvertedField.getUnInvertedField("f5_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui6, UnInvertedField.getUnInvertedField("f6_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui7, UnInvertedField.getUnInvertedField("f7_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui8, UnInvertedField.getUnInvertedField("f8_ws", currentSearcher));
++      assertEquals("UnInvertedField coming back from the seacher should not have changed! ",
++          ui9, UnInvertedField.getUnInvertedField("f9_ws", currentSearcher));
++    } finally {
++      currentSearcherRef.decref();
++    }
++  }
+ }
+ 
+diff --git a/solr/solrj/src/java/org/apache/solr/common/params/FacetParams.java b/solr/solrj/src/java/org/apache/solr/common/params/FacetParams.java
+index 8b8c002..9385ad8 100644
+--- a/solr/solrj/src/java/org/apache/solr/common/params/FacetParams.java
++++ b/solr/solrj/src/java/org/apache/solr/common/params/FacetParams.java
+@@ -32,6 +32,12 @@ public interface FacetParams {
+    */
+   public static final String FACET = "facet";
+ 
++  /**
++   * Numeric option indicating the maximum number of threads to be used
++   * in counting facet field vales 
++   */
++  public static final String FACET_THREADS = FACET + ".threads";
++
+   /** What method should be used to do the faceting */
+   public static final String FACET_METHOD = FACET + ".method";
+ 
+

@@ -1,0 +1,1 @@
+This folder contains the files which serve as the input or output of the program.

@@ -1,0 +1,1322 @@
+GitDiffStart: f6126f8808c2202ae90df55653789d49d3854784 | Tue Mar 23 21:25:15 2010 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 3278e3e..ef11c97 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -276,6 +276,15 @@ Optimizations
+   TermAttributeImpl, move DEFAULT_TYPE constant to TypeInterface, improve
+   null-handling for TypeAttribute.  (Uwe Schindler)
+ 
++* LUCENE-2329: Switch TermsHash* from using a PostingList object per unique 
++  term to parallel arrays, indexed by termID. This reduces garbage collection
++  overhead significantly, which results in great indexing performance wins
++  when the available JVM heap space is low. This will become even more
++  important when the DocumentsWriter RAM buffer is searchable in the future,
++  because then it will make sense to make the RAM buffers as large as 
++  possible. (Mike McCandless, Michael Busch)
++
++
+ Build
+ 
+ * LUCENE-2124: Moved the JDK-based collation support from contrib/collation 
+diff --git a/lucene/src/java/org/apache/lucene/index/FreqProxFieldMergeState.java b/lucene/src/java/org/apache/lucene/index/FreqProxFieldMergeState.java
+index d5f6e80..c84c32f 100644
+--- a/lucene/src/java/org/apache/lucene/index/FreqProxFieldMergeState.java
++++ b/lucene/src/java/org/apache/lucene/index/FreqProxFieldMergeState.java
+@@ -19,6 +19,8 @@ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.index.FreqProxTermsWriterPerField.FreqProxPostingsArray;
++
+ // TODO FI: some of this is "generic" to TermsHash* so we
+ // should factor it out so other consumers don't have to
+ // duplicate this code
+@@ -30,9 +32,10 @@ final class FreqProxFieldMergeState {
+   final FreqProxTermsWriterPerField field;
+   final int numPostings;
+   final CharBlockPool charPool;
+-  final RawPostingList[] postings;
+-
+-  private FreqProxTermsWriter.PostingList p;
++  final int[] termIDs;
++  final FreqProxPostingsArray postings;
++  int currentTermID;
++  
+   char[] text;
+   int textOffset;
+ 
+@@ -48,7 +51,8 @@ final class FreqProxFieldMergeState {
+     this.field = field;
+     this.charPool = field.perThread.termsHashPerThread.charPool;
+     this.numPostings = field.termsHashPerField.numPostings;
+-    this.postings = field.termsHashPerField.sortPostings();
++    this.termIDs = field.termsHashPerField.sortPostings();
++    this.postings = (FreqProxPostingsArray) field.termsHashPerField.postingsArray;
+   }
+ 
+   boolean nextTerm() throws IOException {
+@@ -56,15 +60,16 @@ final class FreqProxFieldMergeState {
+     if (postingUpto == numPostings)
+       return false;
+ 
+-    p = (FreqProxTermsWriter.PostingList) postings[postingUpto];
++    currentTermID = termIDs[postingUpto];
+     docID = 0;
+ 
+-    text = charPool.buffers[p.textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
+-    textOffset = p.textStart & DocumentsWriter.CHAR_BLOCK_MASK;
++    final int textStart = postings.textStarts[currentTermID];
++    text = charPool.buffers[textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
++    textOffset = textStart & DocumentsWriter.CHAR_BLOCK_MASK;
+ 
+-    field.termsHashPerField.initReader(freq, p, 0);
++    field.termsHashPerField.initReader(freq, currentTermID, 0);
+     if (!field.fieldInfo.omitTermFreqAndPositions)
+-      field.termsHashPerField.initReader(prox, p, 1);
++      field.termsHashPerField.initReader(prox, currentTermID, 1);
+ 
+     // Should always be true
+     boolean result = nextDoc();
+@@ -75,12 +80,12 @@ final class FreqProxFieldMergeState {
+ 
+   public boolean nextDoc() throws IOException {
+     if (freq.eof()) {
+-      if (p.lastDocCode != -1) {
++      if (postings.lastDocCodes[currentTermID] != -1) {
+         // Return last doc
+-        docID = p.lastDocID;
++        docID = postings.lastDocIDs[currentTermID];
+         if (!field.omitTermFreqAndPositions)
+-          termFreq = p.docFreq;
+-        p.lastDocCode = -1;
++          termFreq = postings.docFreqs[currentTermID];
++        postings.lastDocCodes[currentTermID] = -1;
+         return true;
+       } else
+         // EOF
+@@ -98,7 +103,7 @@ final class FreqProxFieldMergeState {
+         termFreq = freq.readVInt();
+     }
+ 
+-    assert docID != p.lastDocID;
++    assert docID != postings.lastDocIDs[currentTermID];
+ 
+     return true;
+   }
+diff --git a/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriter.java b/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriter.java
+index 6816611..85269c9 100644
+--- a/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriter.java
++++ b/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriter.java
+@@ -33,13 +33,6 @@ final class FreqProxTermsWriter extends TermsHashConsumer {
+     return new FreqProxTermsWriterPerThread(perThread);
+   }
+ 
+-  @Override
+-  void createPostings(RawPostingList[] postings, int start, int count) {
+-    final int end = start + count;
+-    for(int i=start;i<end;i++)
+-      postings[i] = new PostingList();
+-  }
+-
+   private static int compareText(final char[] text1, int pos1, final char[] text2, int pos2) {
+     while(true) {
+       final char c1 = text1[pos1++];
+@@ -272,16 +265,4 @@ final class FreqProxTermsWriter extends TermsHashConsumer {
+   }
+ 
+   final UnicodeUtil.UTF8Result termsUTF8 = new UnicodeUtil.UTF8Result();
+-
+-  static final class PostingList extends RawPostingList {
+-    int docFreq;                                    // # times this term occurs in the current doc
+-    int lastDocID;                                  // Last docID where this term occurred
+-    int lastDocCode;                                // Code for prior doc
+-    int lastPosition;                               // Last position where this term occurred
+-  }
+-
+-  @Override
+-  int bytesPerPosting() {
+-    return RawPostingList.BYTES_SIZE + 4 * DocumentsWriter.INT_NUM_BYTE;
+-  }
+ }
+diff --git a/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriterPerField.java b/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriterPerField.java
+index e339c90..ec0124a 100644
+--- a/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriterPerField.java
++++ b/lucene/src/java/org/apache/lucene/index/FreqProxTermsWriterPerField.java
+@@ -18,8 +18,9 @@ package org.apache.lucene.index;
+  */
+ 
+ import java.io.IOException;
+-import org.apache.lucene.document.Fieldable;
++
+ import org.apache.lucene.analysis.tokenattributes.PayloadAttribute;
++import org.apache.lucene.document.Fieldable;
+ 
+ // TODO: break into separate freq and prox writers as
+ // codecs; make separate container (tii/tis/skip/*) that can
+@@ -87,7 +88,7 @@ final class FreqProxTermsWriterPerField extends TermsHashConsumerPerField implem
+     }
+   }
+ 
+-  final void writeProx(FreqProxTermsWriter.PostingList p, int proxCode) {
++  final void writeProx(final int termID, int proxCode) {
+     final Payload payload;
+     if (payloadAttribute == null) {
+       payload = null;
+@@ -102,66 +103,111 @@ final class FreqProxTermsWriterPerField extends TermsHashConsumerPerField implem
+       hasPayloads = true;      
+     } else
+       termsHashPerField.writeVInt(1, proxCode<<1);
+-    p.lastPosition = fieldState.position;
++    
++    FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
++    postings.lastPositions[termID] = fieldState.position;
++    
+   }
+ 
+   @Override
+-  final void newTerm(RawPostingList p0) {
++  final void newTerm(final int termID) {
+     // First time we're seeing this term since the last
+     // flush
+     assert docState.testPoint("FreqProxTermsWriterPerField.newTerm start");
+-    FreqProxTermsWriter.PostingList p = (FreqProxTermsWriter.PostingList) p0;
+-    p.lastDocID = docState.docID;
++    
++    FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
++    postings.lastDocIDs[termID] = docState.docID;
+     if (omitTermFreqAndPositions) {
+-      p.lastDocCode = docState.docID;
++      postings.lastDocCodes[termID] = docState.docID;
+     } else {
+-      p.lastDocCode = docState.docID << 1;
+-      p.docFreq = 1;
+-      writeProx(p, fieldState.position);
++      postings.lastDocCodes[termID] = docState.docID << 1;
++      postings.docFreqs[termID] = 1;
++      writeProx(termID, fieldState.position);
+     }
+   }
+ 
+   @Override
+-  final void addTerm(RawPostingList p0) {
++  final void addTerm(final int termID) {
+ 
+     assert docState.testPoint("FreqProxTermsWriterPerField.addTerm start");
+-
+-    FreqProxTermsWriter.PostingList p = (FreqProxTermsWriter.PostingList) p0;
+-
+-    assert omitTermFreqAndPositions || p.docFreq > 0;
++    
++    FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
++    
++    assert omitTermFreqAndPositions || postings.docFreqs[termID] > 0;
+ 
+     if (omitTermFreqAndPositions) {
+-      if (docState.docID != p.lastDocID) {
+-        assert docState.docID > p.lastDocID;
+-        termsHashPerField.writeVInt(0, p.lastDocCode);
+-        p.lastDocCode = docState.docID - p.lastDocID;
+-        p.lastDocID = docState.docID;
++      if (docState.docID != postings.lastDocIDs[termID]) {
++        assert docState.docID > postings.lastDocIDs[termID];
++        termsHashPerField.writeVInt(0, postings.lastDocCodes[termID]);
++        postings.lastDocCodes[termID] = docState.docID - postings.lastDocIDs[termID];
++        postings.lastDocIDs[termID] = docState.docID;
+       }
+     } else {
+-      if (docState.docID != p.lastDocID) {
+-        assert docState.docID > p.lastDocID;
++      if (docState.docID != postings.lastDocIDs[termID]) {
++        assert docState.docID > postings.lastDocIDs[termID];
+         // Term not yet seen in the current doc but previously
+         // seen in other doc(s) since the last flush
+ 
+         // Now that we know doc freq for previous doc,
+         // write it & lastDocCode
+-        if (1 == p.docFreq)
+-          termsHashPerField.writeVInt(0, p.lastDocCode|1);
++        if (1 == postings.docFreqs[termID])
++          termsHashPerField.writeVInt(0, postings.lastDocCodes[termID]|1);
+         else {
+-          termsHashPerField.writeVInt(0, p.lastDocCode);
+-          termsHashPerField.writeVInt(0, p.docFreq);
++          termsHashPerField.writeVInt(0, postings.lastDocCodes[termID]);
++          termsHashPerField.writeVInt(0, postings.docFreqs[termID]);
+         }
+-        p.docFreq = 1;
+-        p.lastDocCode = (docState.docID - p.lastDocID) << 1;
+-        p.lastDocID = docState.docID;
+-        writeProx(p, fieldState.position);
++        postings.docFreqs[termID] = 1;
++        postings.lastDocCodes[termID] = (docState.docID - postings.lastDocIDs[termID]) << 1;
++        postings.lastDocIDs[termID] = docState.docID;
++        writeProx(termID, fieldState.position);
+       } else {
+-        p.docFreq++;
+-        writeProx(p, fieldState.position-p.lastPosition);
++        postings.docFreqs[termID]++;
++        writeProx(termID, fieldState.position-postings.lastPositions[termID]);
+       }
+     }
+   }
++  
++  @Override
++  ParallelPostingsArray createPostingsArray(int size) {
++    return new FreqProxPostingsArray(size);
++  }
+ 
++  static final class FreqProxPostingsArray extends ParallelPostingsArray {
++    public FreqProxPostingsArray(int size) {
++      super(size);
++      docFreqs = new int[size];
++      lastDocIDs = new int[size];
++      lastDocCodes = new int[size];
++      lastPositions = new int[size];
++    }
++
++    int docFreqs[];                                    // # times this term occurs in the current doc
++    int lastDocIDs[];                                  // Last docID where this term occurred
++    int lastDocCodes[];                                // Code for prior doc
++    int lastPositions[];                               // Last position where this term occurred
++    
++    @Override
++    ParallelPostingsArray resize(int newSize) {
++      FreqProxPostingsArray newArray = new FreqProxPostingsArray(newSize);
++      copy(this, newArray);
++      return newArray;
++    }
++    
++    void copy(FreqProxPostingsArray fromArray, FreqProxPostingsArray toArray) {
++      super.copy(fromArray, toArray);
++      System.arraycopy(fromArray.docFreqs, 0, toArray.docFreqs, 0, fromArray.docFreqs.length);
++      System.arraycopy(fromArray.lastDocIDs, 0, toArray.lastDocIDs, 0, fromArray.lastDocIDs.length);
++      System.arraycopy(fromArray.lastDocCodes, 0, toArray.lastDocCodes, 0, fromArray.lastDocCodes.length);
++      System.arraycopy(fromArray.lastPositions, 0, toArray.lastPositions, 0, fromArray.lastPositions.length);
++    }
++    
++  }
++  
++  @Override
++  int bytesPerPosting() {
++    return ParallelPostingsArray.BYTES_PER_POSTING + 4 * DocumentsWriter.INT_NUM_BYTE;
++  }
++  
+   public void abort() {}
+ }
+ 
+diff --git a/lucene/src/java/org/apache/lucene/index/ParallelPostingsArray.java b/lucene/src/java/org/apache/lucene/index/ParallelPostingsArray.java
+new file mode 100644
+index 0000000..86f00ca
+--- /dev/null
++++ b/lucene/src/java/org/apache/lucene/index/ParallelPostingsArray.java
+@@ -0,0 +1,45 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++class ParallelPostingsArray {
++  final static int BYTES_PER_POSTING = 3 * DocumentsWriter.INT_NUM_BYTE;
++
++  final int[] textStarts;
++  final int[] intStarts;
++  final int[] byteStarts;
++  
++  public ParallelPostingsArray(final int size) {
++    textStarts = new int[size];
++    intStarts = new int[size];
++    byteStarts = new int[size];
++  }
++  
++  ParallelPostingsArray resize(int newSize) {
++    ParallelPostingsArray newArray = new ParallelPostingsArray(newSize);
++    copy(this, newArray);
++    return newArray;
++  }
++  
++  void copy(ParallelPostingsArray fromArray, ParallelPostingsArray toArray) {
++    System.arraycopy(fromArray.textStarts, 0, toArray.textStarts, 0, fromArray.textStarts.length);
++    System.arraycopy(fromArray.intStarts, 0, toArray.intStarts, 0, fromArray.intStarts.length);
++    System.arraycopy(fromArray.byteStarts, 0, toArray.byteStarts, 0, fromArray.byteStarts.length);
++  }
++}
+diff --git a/lucene/src/java/org/apache/lucene/index/RawPostingList.java b/lucene/src/java/org/apache/lucene/index/RawPostingList.java
+deleted file mode 100644
+index d2beea2..0000000
+--- a/lucene/src/java/org/apache/lucene/index/RawPostingList.java
++++ /dev/null
+@@ -1,36 +0,0 @@
+-package org.apache.lucene.index;
+-
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-
+-/** This is the base class for an in-memory posting list,
+- *  keyed by a Token.  {@link TermsHash} maintains a hash
+- *  table holding one instance of this per unique Token.
+- *  Consumers of TermsHash ({@link TermsHashConsumer}) must
+- *  subclass this class with its own concrete class.
+- *  FreqProxTermsWriter.PostingList is a private inner class used 
+- *  for the freq/prox postings, and 
+- *  TermVectorsTermsWriter.PostingList is a private inner class
+- *  used to hold TermVectors postings. */
+-
+-abstract class RawPostingList {
+-  final static int BYTES_SIZE = DocumentsWriter.OBJECT_HEADER_BYTES + 3*DocumentsWriter.INT_NUM_BYTE;
+-  int textStart;
+-  int intStart;
+-  int byteStart;
+-}
+diff --git a/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriter.java b/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriter.java
+index fa05d3e..5a804b7 100644
+--- a/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriter.java
++++ b/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriter.java
+@@ -48,13 +48,6 @@ final class TermVectorsTermsWriter extends TermsHashConsumer {
+   }
+ 
+   @Override
+-  void createPostings(RawPostingList[] postings, int start, int count) {
+-    final int end = start + count;
+-    for(int i=start;i<end;i++)
+-      postings[i] = new PostingList();
+-  }
+-
+-  @Override
+   synchronized void flush(Map<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> threadsAndFields, final SegmentWriteState state) throws IOException {
+ 
+     if (tvx != null) {
+@@ -290,15 +283,4 @@ final class TermVectorsTermsWriter extends TermsHashConsumer {
+       finishDocument(this);
+     }
+   }
+-
+-  static final class PostingList extends RawPostingList {
+-    int freq;                                       // How many times this term occurred in the current doc
+-    int lastOffset;                                 // Last offset we saw
+-    int lastPosition;                               // Last position where this term occurred
+-  }
+-
+-  @Override
+-  int bytesPerPosting() {
+-    return RawPostingList.BYTES_SIZE + 3 * DocumentsWriter.INT_NUM_BYTE;
+-  }
+ }
+diff --git a/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriterPerField.java b/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriterPerField.java
+index c1ca547..81bd043 100644
+--- a/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriterPerField.java
++++ b/lucene/src/java/org/apache/lucene/index/TermVectorsTermsWriterPerField.java
+@@ -124,8 +124,9 @@ final class TermVectorsTermsWriterPerField extends TermsHashConsumerPerField {
+     assert perThread.vectorFieldsInOrder(fieldInfo);
+ 
+     perThread.doc.addField(termsHashPerField.fieldInfo.number);
++    TermVectorsPostingsArray postings = (TermVectorsPostingsArray) termsHashPerField.postingsArray;
+ 
+-    final RawPostingList[] postings = termsHashPerField.sortPostings();
++    final int[] termIDs = termsHashPerField.sortPostings();
+ 
+     tvf.writeVInt(numPostings);
+     byte bits = 0x0;
+@@ -141,11 +142,11 @@ final class TermVectorsTermsWriterPerField extends TermsHashConsumerPerField {
+     final ByteSliceReader reader = perThread.vectorSliceReader;
+     final char[][] charBuffers = perThread.termsHashPerThread.charPool.buffers;
+     for(int j=0;j<numPostings;j++) {
+-      final TermVectorsTermsWriter.PostingList posting = (TermVectorsTermsWriter.PostingList) postings[j];
+-      final int freq = posting.freq;
++      final int termID = termIDs[j];
++      final int freq = postings.freqs[termID];
+           
+-      final char[] text2 = charBuffers[posting.textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
+-      final int start2 = posting.textStart & DocumentsWriter.CHAR_BLOCK_MASK;
++      final char[] text2 = charBuffers[postings.textStarts[termID] >> DocumentsWriter.CHAR_BLOCK_SHIFT];
++      final int start2 = postings.textStarts[termID] & DocumentsWriter.CHAR_BLOCK_MASK;
+ 
+       // We swap between two encoders to save copying
+       // last Term's byte array
+@@ -178,12 +179,12 @@ final class TermVectorsTermsWriterPerField extends TermsHashConsumerPerField {
+       tvf.writeVInt(freq);
+ 
+       if (doVectorPositions) {
+-        termsHashPerField.initReader(reader, posting, 0);
++        termsHashPerField.initReader(reader, termID, 0);
+         reader.writeTo(tvf);
+       }
+ 
+       if (doVectorOffsets) {
+-        termsHashPerField.initReader(reader, posting, 1);
++        termsHashPerField.initReader(reader, termID, 1);
+         reader.writeTo(tvf);
+       }
+     }
+@@ -207,13 +208,13 @@ final class TermVectorsTermsWriterPerField extends TermsHashConsumerPerField {
+   }
+ 
+   @Override
+-  void newTerm(RawPostingList p0) {
++  void newTerm(final int termID) {
+ 
+     assert docState.testPoint("TermVectorsTermsWriterPerField.newTerm start");
+ 
+-    TermVectorsTermsWriter.PostingList p = (TermVectorsTermsWriter.PostingList) p0;
++    TermVectorsPostingsArray postings = (TermVectorsPostingsArray) termsHashPerField.postingsArray;
+ 
+-    p.freq = 1;
++    postings.freqs[termID] = 1;
+ 
+     if (doVectorOffsets) {
+       int startOffset = fieldState.offset + offsetAttribute.startOffset();
+@@ -221,38 +222,76 @@ final class TermVectorsTermsWriterPerField extends TermsHashConsumerPerField {
+       
+       termsHashPerField.writeVInt(1, startOffset);
+       termsHashPerField.writeVInt(1, endOffset - startOffset);
+-      p.lastOffset = endOffset;
++      postings.lastOffsets[termID] = endOffset;
+     }
+ 
+     if (doVectorPositions) {
+       termsHashPerField.writeVInt(0, fieldState.position);
+-      p.lastPosition = fieldState.position;
++      postings.lastPositions[termID] = fieldState.position;
+     }
+   }
+ 
+   @Override
+-  void addTerm(RawPostingList p0) {
++  void addTerm(final int termID) {
+ 
+     assert docState.testPoint("TermVectorsTermsWriterPerField.addTerm start");
+ 
+-    TermVectorsTermsWriter.PostingList p = (TermVectorsTermsWriter.PostingList) p0;
+-    p.freq++;
++    TermVectorsPostingsArray postings = (TermVectorsPostingsArray) termsHashPerField.postingsArray;
++    
++    postings.freqs[termID]++;
+ 
+     if (doVectorOffsets) {
+       int startOffset = fieldState.offset + offsetAttribute.startOffset();
+       int endOffset = fieldState.offset + offsetAttribute.endOffset();
+       
+-      termsHashPerField.writeVInt(1, startOffset - p.lastOffset);
++      termsHashPerField.writeVInt(1, startOffset - postings.lastOffsets[termID]);
+       termsHashPerField.writeVInt(1, endOffset - startOffset);
+-      p.lastOffset = endOffset;
++      postings.lastOffsets[termID] = endOffset;
+     }
+ 
+     if (doVectorPositions) {
+-      termsHashPerField.writeVInt(0, fieldState.position - p.lastPosition);
+-      p.lastPosition = fieldState.position;
++      termsHashPerField.writeVInt(0, fieldState.position - postings.lastPositions[termID]);
++      postings.lastPositions[termID] = fieldState.position;
+     }
+   }
+ 
+   @Override
+   void skippingLongTerm() {}
++
++  @Override
++  ParallelPostingsArray createPostingsArray(int size) {
++    return new TermVectorsPostingsArray(size);
++  }
++
++  static final class TermVectorsPostingsArray extends ParallelPostingsArray {
++    public TermVectorsPostingsArray(int size) {
++      super(size);
++      freqs = new int[size];
++      lastOffsets = new int[size];
++      lastPositions = new int[size];
++    }
++
++    int[] freqs;                                       // How many times this term occurred in the current doc
++    int[] lastOffsets;                                 // Last offset we saw
++    int[] lastPositions;                               // Last position where this term occurred
++    
++    @Override
++    ParallelPostingsArray resize(int newSize) {
++      TermVectorsPostingsArray newArray = new TermVectorsPostingsArray(newSize);
++      copy(this, newArray);
++      return newArray;
++    }
++    
++    void copy(TermVectorsPostingsArray fromArray, TermVectorsPostingsArray toArray) {
++      super.copy(fromArray, toArray);
++      System.arraycopy(fromArray.freqs, 0, toArray.freqs, 0, fromArray.freqs.length);
++      System.arraycopy(fromArray.lastOffsets, 0, toArray.lastOffsets, 0, fromArray.lastOffsets.length);
++      System.arraycopy(fromArray.lastPositions, 0, toArray.lastPositions, 0, fromArray.lastPositions.length);
++    }
++  }
++  
++  @Override
++  int bytesPerPosting() {
++    return ParallelPostingsArray.BYTES_PER_POSTING + 3 * DocumentsWriter.INT_NUM_BYTE;
++  }
+ }
+diff --git a/lucene/src/java/org/apache/lucene/index/TermsHash.java b/lucene/src/java/org/apache/lucene/index/TermsHash.java
+index 2a26d8c..e4e9752 100644
+--- a/lucene/src/java/org/apache/lucene/index/TermsHash.java
++++ b/lucene/src/java/org/apache/lucene/index/TermsHash.java
+@@ -17,16 +17,12 @@ package org.apache.lucene.index;
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
+ import java.util.Collection;
+-import java.util.Map;
+ import java.util.HashMap;
+-import java.util.Iterator;
+ import java.util.HashSet;
+-import java.util.Arrays;
+-import java.io.IOException;
+-
+-import org.apache.lucene.util.ArrayUtil;
+-import org.apache.lucene.util.RamUsageEstimator;
++import java.util.Iterator;
++import java.util.Map;
+ 
+ /** This class implements {@link InvertedDocConsumer}, which
+  *  is passed each token produced by the analyzer on each
+@@ -40,13 +36,8 @@ final class TermsHash extends InvertedDocConsumer {
+ 
+   final TermsHashConsumer consumer;
+   final TermsHash nextTermsHash;
+-  final int bytesPerPosting;
+-  final int postingsFreeChunk;
+   final DocumentsWriter docWriter;
+ 
+-  private RawPostingList[] postingsFreeList = new RawPostingList[1];
+-  private int postingsFreeCount;
+-  private int postingsAllocCount;
+   boolean trackAllocations;
+ 
+   public TermsHash(final DocumentsWriter docWriter, boolean trackAllocations, final TermsHashConsumer consumer, final TermsHash nextTermsHash) {
+@@ -54,14 +45,6 @@ final class TermsHash extends InvertedDocConsumer {
+     this.consumer = consumer;
+     this.nextTermsHash = nextTermsHash;
+     this.trackAllocations = trackAllocations;
+-
+-    // Why + 4*POINTER_NUM_BYTE below?
+-    //   +1: Posting is referenced by postingsFreeList array
+-    //   +3: Posting is referenced by hash, which
+-    //       targets 25-50% fill factor; approximate this
+-    //       as 3X # pointers
+-    bytesPerPosting = consumer.bytesPerPosting() + 4*DocumentsWriter.POINTER_NUM_BYTE;
+-    postingsFreeChunk = (DocumentsWriter.BYTE_BLOCK_SIZE / bytesPerPosting);
+   }
+ 
+   @Override
+@@ -86,18 +69,6 @@ final class TermsHash extends InvertedDocConsumer {
+       nextTermsHash.abort();
+   }
+ 
+-  void shrinkFreePostings(Map<InvertedDocConsumerPerThread,Collection<InvertedDocConsumerPerField>> threadsAndFields, SegmentWriteState state) {
+-
+-    assert postingsFreeCount == postingsAllocCount: Thread.currentThread().getName() + ": postingsFreeCount=" + postingsFreeCount + " postingsAllocCount=" + postingsAllocCount + " consumer=" + consumer;
+-
+-    final int newSize = ArrayUtil.getShrinkSize(postingsFreeList.length, postingsAllocCount, RamUsageEstimator.NUM_BYTES_OBJECT_REF);
+-    if (newSize != postingsFreeList.length) {
+-      RawPostingList[] newArray = new RawPostingList[newSize];
+-      System.arraycopy(postingsFreeList, 0, newArray, 0, postingsFreeCount);
+-      postingsFreeList = newArray;
+-    }
+-  }
+-
+   @Override
+   synchronized void closeDocStore(SegmentWriteState state) throws IOException {
+     consumer.closeDocStore(state);
+@@ -144,91 +115,12 @@ final class TermsHash extends InvertedDocConsumer {
+     
+     consumer.flush(childThreadsAndFields, state);
+ 
+-    shrinkFreePostings(threadsAndFields, state);
+-    
+     if (nextTermsHash != null)
+       nextTermsHash.flush(nextThreadsAndFields, state);
+   }
+ 
+   @Override
+   synchronized public boolean freeRAM() {
+-
+-    if (!trackAllocations)
+-      return false;
+-
+-    boolean any;
+-    final int numToFree;
+-    if (postingsFreeCount >= postingsFreeChunk)
+-      numToFree = postingsFreeChunk;
+-    else
+-      numToFree = postingsFreeCount;
+-    any = numToFree > 0;
+-    if (any) {
+-      Arrays.fill(postingsFreeList, postingsFreeCount-numToFree, postingsFreeCount, null);
+-      postingsFreeCount -= numToFree;
+-      postingsAllocCount -= numToFree;
+-      docWriter.bytesAllocated(-numToFree * bytesPerPosting);
+-      any = true;
+-    }
+-
+-    if (nextTermsHash != null)
+-      any |= nextTermsHash.freeRAM();
+-
+-    return any;
+-  }
+-
+-  synchronized public void recyclePostings(final RawPostingList[] postings, final int numPostings) {
+-
+-    assert postings.length >= numPostings;
+-
+-    // Move all Postings from this ThreadState back to our
+-    // free list.  We pre-allocated this array while we were
+-    // creating Postings to make sure it's large enough
+-    assert postingsFreeCount + numPostings <= postingsFreeList.length;
+-    System.arraycopy(postings, 0, postingsFreeList, postingsFreeCount, numPostings);
+-    postingsFreeCount += numPostings;
+-  }
+-
+-  synchronized public void getPostings(final RawPostingList[] postings) {
+-
+-    assert docWriter.writer.testPoint("TermsHash.getPostings start");
+-
+-    assert postingsFreeCount <= postingsFreeList.length;
+-    assert postingsFreeCount <= postingsAllocCount: "postingsFreeCount=" + postingsFreeCount + " postingsAllocCount=" + postingsAllocCount;
+-
+-    final int numToCopy;
+-    if (postingsFreeCount < postings.length)
+-      numToCopy = postingsFreeCount;
+-    else
+-      numToCopy = postings.length;
+-    final int start = postingsFreeCount-numToCopy;
+-    assert start >= 0;
+-    assert start + numToCopy <= postingsFreeList.length;
+-    assert numToCopy <= postings.length;
+-    System.arraycopy(postingsFreeList, start,
+-                     postings, 0, numToCopy);
+-
+-    // Directly allocate the remainder if any
+-    if (numToCopy != postings.length) {
+-      final int extra = postings.length - numToCopy;
+-      final int newPostingsAllocCount = postingsAllocCount + extra;
+-
+-      consumer.createPostings(postings, numToCopy, extra);
+-      assert docWriter.writer.testPoint("TermsHash.getPostings after create");
+-      postingsAllocCount += extra;
+-
+-      if (trackAllocations)
+-        docWriter.bytesAllocated(extra * bytesPerPosting);
+-
+-      if (newPostingsAllocCount > postingsFreeList.length)
+-        // Pre-allocate the postingsFreeList so it's large
+-        // enough to hold all postings we've given out
+-        postingsFreeList = new RawPostingList[ArrayUtil.oversize(newPostingsAllocCount, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+-    }
+-
+-    postingsFreeCount -= numToCopy;
+-
+-    if (trackAllocations)
+-      docWriter.bytesUsed(postings.length * bytesPerPosting);
++    return false;
+   }
+ }
+diff --git a/lucene/src/java/org/apache/lucene/index/TermsHashConsumer.java b/lucene/src/java/org/apache/lucene/index/TermsHashConsumer.java
+index a63b3e5..5cbbd45 100644
+--- a/lucene/src/java/org/apache/lucene/index/TermsHashConsumer.java
++++ b/lucene/src/java/org/apache/lucene/index/TermsHashConsumer.java
+@@ -22,8 +22,6 @@ import java.util.Collection;
+ import java.util.Map;
+ 
+ abstract class TermsHashConsumer {
+-  abstract int bytesPerPosting();
+-  abstract void createPostings(RawPostingList[] postings, int start, int count);
+   abstract TermsHashConsumerPerThread addThread(TermsHashPerThread perThread);
+   abstract void flush(Map<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> threadsAndFields, final SegmentWriteState state) throws IOException;
+   abstract void abort();
+diff --git a/lucene/src/java/org/apache/lucene/index/TermsHashConsumerPerField.java b/lucene/src/java/org/apache/lucene/index/TermsHashConsumerPerField.java
+index a7ad15c..61634bf 100644
+--- a/lucene/src/java/org/apache/lucene/index/TermsHashConsumerPerField.java
++++ b/lucene/src/java/org/apache/lucene/index/TermsHashConsumerPerField.java
+@@ -31,7 +31,11 @@ abstract class TermsHashConsumerPerField {
+   abstract void finish() throws IOException;
+   abstract void skippingLongTerm() throws IOException;
+   abstract void start(Fieldable field);
+-  abstract void newTerm(RawPostingList p) throws IOException;
+-  abstract void addTerm(RawPostingList p) throws IOException;
++  abstract void newTerm(int termID) throws IOException;
++  abstract void addTerm(int termID) throws IOException;
+   abstract int getStreamCount();
++  
++  abstract ParallelPostingsArray createPostingsArray(int size);
++  abstract int bytesPerPosting();
++
+ }
+diff --git a/lucene/src/java/org/apache/lucene/index/TermsHashPerField.java b/lucene/src/java/org/apache/lucene/index/TermsHashPerField.java
+index dead601..0f7a7ef 100644
+--- a/lucene/src/java/org/apache/lucene/index/TermsHashPerField.java
++++ b/lucene/src/java/org/apache/lucene/index/TermsHashPerField.java
+@@ -27,6 +27,7 @@ import org.apache.lucene.util.UnicodeUtil;
+ final class TermsHashPerField extends InvertedDocConsumerPerField {
+ 
+   final TermsHashConsumerPerField consumer;
++
+   final TermsHashPerField nextPerField;
+   final TermsHashPerThread perThread;
+   final DocumentsWriter.DocState docState;
+@@ -48,8 +49,11 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+   private int postingsHashSize = 4;
+   private int postingsHashHalfSize = postingsHashSize/2;
+   private int postingsHashMask = postingsHashSize-1;
+-  private RawPostingList[] postingsHash = new RawPostingList[postingsHashSize];
+-  private RawPostingList p;
++  private int[] postingsHash;
++ 
++  ParallelPostingsArray postingsArray;
++  
++  private final int bytesPerPosting;
+   
+   public TermsHashPerField(DocInverterPerField docInverterPerField, final TermsHashPerThread perThread, final TermsHashPerThread nextPerThread, final FieldInfo fieldInfo) {
+     this.perThread = perThread;
+@@ -57,6 +61,8 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+     charPool = perThread.charPool;
+     bytePool = perThread.bytePool;
+     docState = perThread.docState;
++    postingsHash = new int[postingsHashSize];
++    Arrays.fill(postingsHash, -1);
+     fieldState = docInverterPerField.fieldState;
+     this.consumer = perThread.consumer.addField(this, fieldInfo);
+     streamCount = consumer.getStreamCount();
+@@ -66,6 +72,21 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+       nextPerField = (TermsHashPerField) nextPerThread.addField(docInverterPerField, fieldInfo);
+     else
+       nextPerField = null;
++    
++    //   +3: Posting is referenced by hash, which
++    //       targets 25-50% fill factor; approximate this
++    //       as 3X # pointers
++    bytesPerPosting = consumer.bytesPerPosting() + 3*DocumentsWriter.INT_NUM_BYTE;
++  }
++  
++  void initPostingsArray() {
++    assert postingsArray == null;
++
++    postingsArray = consumer.createPostingsArray(postingsHashSize);
++    
++    if (perThread.termsHash.trackAllocations) {
++      perThread.termsHash.docWriter.bytesAllocated(bytesPerPosting * postingsHashSize);
++    }
+   }
+ 
+   void shrinkHash(int targetSize) {
+@@ -79,7 +100,9 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+     }
+ 
+     if (newSize != postingsHash.length) {
+-      postingsHash = new RawPostingList[newSize];
++      postingsHash = new int[newSize];
++      Arrays.fill(postingsHash, -1);
++      postingsArray = null;
+       postingsHashSize = newSize;
+       postingsHashHalfSize = newSize/2;
+       postingsHashMask = newSize-1;
+@@ -91,8 +114,7 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+       compactPostings();
+     assert numPostings <= postingsHash.length;
+     if (numPostings > 0) {
+-      perThread.termsHash.recyclePostings(postingsHash, numPostings);
+-      Arrays.fill(postingsHash, 0, numPostings, null);
++      Arrays.fill(postingsHash, 0, numPostings, -1);
+       numPostings = 0;
+     }
+     postingsCompacted = false;
+@@ -106,23 +128,34 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+     if (nextPerField != null)
+       nextPerField.abort();
+   }
++  
++  private void growParallelPostingsArray() {
++    int oldSize = postingsArray.byteStarts.length;
++    int newSize = (int) (oldSize * 1.5);
++    this.postingsArray = this.postingsArray.resize(newSize);
++    
++    if (perThread.termsHash.trackAllocations) {
++      perThread.termsHash.docWriter.bytesAllocated(bytesPerPosting * (newSize - oldSize));
++    }
++  }
+ 
+-  public void initReader(ByteSliceReader reader, RawPostingList p, int stream) {
++  public void initReader(ByteSliceReader reader, int termID, int stream) {
+     assert stream < streamCount;
+-    final int[] ints = intPool.buffers[p.intStart >> DocumentsWriter.INT_BLOCK_SHIFT];
+-    final int upto = p.intStart & DocumentsWriter.INT_BLOCK_MASK;
++    int intStart = postingsArray.intStarts[termID];
++    final int[] ints = intPool.buffers[intStart >> DocumentsWriter.INT_BLOCK_SHIFT];
++    final int upto = intStart & DocumentsWriter.INT_BLOCK_MASK;
+     reader.init(bytePool,
+-                p.byteStart+stream*ByteBlockPool.FIRST_LEVEL_SIZE,
++                postingsArray.byteStarts[termID]+stream*ByteBlockPool.FIRST_LEVEL_SIZE,
+                 ints[upto+stream]);
+   }
+ 
+   private synchronized void compactPostings() {
+     int upto = 0;
+     for(int i=0;i<postingsHashSize;i++) {
+-      if (postingsHash[i] != null) {
++      if (postingsHash[i] != -1) {
+         if (upto < i) {
+           postingsHash[upto] = postingsHash[i];
+-          postingsHash[i] = null;
++          postingsHash[i] = -1;
+         }
+         upto++;
+       }
+@@ -133,41 +166,41 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+   }
+ 
+   /** Collapse the hash table & sort in-place. */
+-  public RawPostingList[] sortPostings() {
++  public int[] sortPostings() {
+     compactPostings();
+     quickSort(postingsHash, 0, numPostings-1);
+     return postingsHash;
+   }
+ 
+-  void quickSort(RawPostingList[] postings, int lo, int hi) {
++  void quickSort(int[] termIDs, int lo, int hi) {
+     if (lo >= hi)
+       return;
+     else if (hi == 1+lo) {
+-      if (comparePostings(postings[lo], postings[hi]) > 0) {
+-        final RawPostingList tmp = postings[lo];
+-        postings[lo] = postings[hi];
+-        postings[hi] = tmp;
++      if (comparePostings(termIDs[lo], termIDs[hi]) > 0) {
++        final int tmp = termIDs[lo];
++        termIDs[lo] = termIDs[hi];
++        termIDs[hi] = tmp;
+       }
+       return;
+     }
+ 
+     int mid = (lo + hi) >>> 1;
+ 
+-    if (comparePostings(postings[lo], postings[mid]) > 0) {
+-      RawPostingList tmp = postings[lo];
+-      postings[lo] = postings[mid];
+-      postings[mid] = tmp;
++    if (comparePostings(termIDs[lo], termIDs[mid]) > 0) {
++      int tmp = termIDs[lo];
++      termIDs[lo] = termIDs[mid];
++      termIDs[mid] = tmp;
+     }
+ 
+-    if (comparePostings(postings[mid], postings[hi]) > 0) {
+-      RawPostingList tmp = postings[mid];
+-      postings[mid] = postings[hi];
+-      postings[hi] = tmp;
++    if (comparePostings(termIDs[mid], termIDs[hi]) > 0) {
++      int tmp = termIDs[mid];
++      termIDs[mid] = termIDs[hi];
++      termIDs[hi] = tmp;
+ 
+-      if (comparePostings(postings[lo], postings[mid]) > 0) {
+-        RawPostingList tmp2 = postings[lo];
+-        postings[lo] = postings[mid];
+-        postings[mid] = tmp2;
++      if (comparePostings(termIDs[lo], termIDs[mid]) > 0) {
++        int tmp2 = termIDs[lo];
++        termIDs[lo] = termIDs[mid];
++        termIDs[mid] = tmp2;
+       }
+     }
+ 
+@@ -177,40 +210,43 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+     if (left >= right)
+       return;
+ 
+-    RawPostingList partition = postings[mid];
++    int partition = termIDs[mid];
+ 
+     for (; ;) {
+-      while (comparePostings(postings[right], partition) > 0)
++      while (comparePostings(termIDs[right], partition) > 0)
+         --right;
+ 
+-      while (left < right && comparePostings(postings[left], partition) <= 0)
++      while (left < right && comparePostings(termIDs[left], partition) <= 0)
+         ++left;
+ 
+       if (left < right) {
+-        RawPostingList tmp = postings[left];
+-        postings[left] = postings[right];
+-        postings[right] = tmp;
++        int tmp = termIDs[left];
++        termIDs[left] = termIDs[right];
++        termIDs[right] = tmp;
+         --right;
+       } else {
+         break;
+       }
+     }
+ 
+-    quickSort(postings, lo, left);
+-    quickSort(postings, left + 1, hi);
++    quickSort(termIDs, lo, left);
++    quickSort(termIDs, left + 1, hi);
+   }
+ 
+   /** Compares term text for two Posting instance and
+    *  returns -1 if p1 < p2; 1 if p1 > p2; else 0. */
+-  int comparePostings(RawPostingList p1, RawPostingList p2) {
++  int comparePostings(int term1, int term2) {
+ 
+-    if (p1 == p2)
++    if (term1 == term2)
+       return 0;
+ 
+-    final char[] text1 = charPool.buffers[p1.textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
+-    int pos1 = p1.textStart & DocumentsWriter.CHAR_BLOCK_MASK;
+-    final char[] text2 = charPool.buffers[p2.textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
+-    int pos2 = p2.textStart & DocumentsWriter.CHAR_BLOCK_MASK;
++    final int textStart1 = postingsArray.textStarts[term1];
++    final int textStart2 = postingsArray.textStarts[term2];
++    
++    final char[] text1 = charPool.buffers[textStart1 >> DocumentsWriter.CHAR_BLOCK_SHIFT];
++    int pos1 = textStart1 & DocumentsWriter.CHAR_BLOCK_MASK;
++    final char[] text2 = charPool.buffers[textStart2 >> DocumentsWriter.CHAR_BLOCK_SHIFT];
++    int pos2 = textStart2 & DocumentsWriter.CHAR_BLOCK_MASK;
+ 
+     assert text1 != text2 || pos1 != pos2;
+ 
+@@ -233,11 +269,12 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+ 
+   /** Test whether the text for current RawPostingList p equals
+    *  current tokenText. */
+-  private boolean postingEquals(final char[] tokenText, final int tokenTextLen) {
+-
+-    final char[] text = perThread.charPool.buffers[p.textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
++  private boolean postingEquals(final int termID, final char[] tokenText, final int tokenTextLen) {
++    final int textStart = postingsArray.textStarts[termID];
++    
++    final char[] text = perThread.charPool.buffers[textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
+     assert text != null;
+-    int pos = p.textStart & DocumentsWriter.CHAR_BLOCK_MASK;
++    int pos = textStart & DocumentsWriter.CHAR_BLOCK_MASK;
+ 
+     int tokenPos = 0;
+     for(;tokenPos<tokenTextLen;pos++,tokenPos++)
+@@ -251,6 +288,9 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+ 
+   @Override
+   void start(Fieldable f) {
++    if (postingsArray == null) {
++      initPostingsArray();
++    }
+     termAtt = fieldState.attributeSource.addAttribute(TermAttribute.class);
+     consumer.start(f);
+     if (nextPerField != null) {
+@@ -270,7 +310,6 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+   // because token text has already been "interned" into
+   // textStart, so we hash by textStart
+   public void add(int textStart) throws IOException {
+-
+     int code = textStart;
+ 
+     int hashPos = code & postingsHashMask;
+@@ -278,37 +317,39 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+     assert !postingsCompacted;
+ 
+     // Locate RawPostingList in hash
+-    p = postingsHash[hashPos];
++    int termID = postingsHash[hashPos];
+ 
+-    if (p != null && p.textStart != textStart) {
++    if (termID != -1 && postingsArray.textStarts[termID] != textStart) {
+       // Conflict: keep searching different locations in
+       // the hash table.
+       final int inc = ((code>>8)+code)|1;
+       do {
+         code += inc;
+         hashPos = code & postingsHashMask;
+-        p = postingsHash[hashPos];
+-      } while (p != null && p.textStart != textStart);
++        termID = postingsHash[hashPos];
++      } while (termID != -1 && postingsArray.textStarts[termID] != textStart);
+     }
+ 
+-    if (p == null) {
++    if (termID == -1) {
+ 
+       // First time we are seeing this token since we last
+       // flushed the hash.
+ 
+-      // Refill?
+-      if (0 == perThread.freePostingsCount)
+-        perThread.morePostings();
++      // New posting
++      termID = numPostings++;
++      if (termID >= postingsArray.textStarts.length) {
++        growParallelPostingsArray();
++      }
++      if (perThread.termsHash.trackAllocations) {
++        perThread.termsHash.docWriter.bytesUsed(bytesPerPosting);
++      }
+ 
+-      // Pull next free RawPostingList from free list
+-      p = perThread.freePostings[--perThread.freePostingsCount];
+-      assert p != null;
++      assert termID >= 0;
+ 
+-      p.textStart = textStart;
++      postingsArray.textStarts[termID] = textStart;
+           
+-      assert postingsHash[hashPos] == null;
+-      postingsHash[hashPos] = p;
+-      numPostings++;
++      assert postingsHash[hashPos] == -1;
++      postingsHash[hashPos] = termID;
+ 
+       if (numPostings == postingsHashHalfSize)
+         rehashPostings(2*postingsHashSize);
+@@ -324,20 +365,21 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+       intUptoStart = intPool.intUpto;
+       intPool.intUpto += streamCount;
+ 
+-      p.intStart = intUptoStart + intPool.intOffset;
++      postingsArray.intStarts[termID] = intUptoStart + intPool.intOffset;
+ 
+       for(int i=0;i<streamCount;i++) {
+         final int upto = bytePool.newSlice(ByteBlockPool.FIRST_LEVEL_SIZE);
+         intUptos[intUptoStart+i] = upto + bytePool.byteOffset;
+       }
+-      p.byteStart = intUptos[intUptoStart];
++      postingsArray.byteStarts[termID] = intUptos[intUptoStart];
+ 
+-      consumer.newTerm(p);
++      consumer.newTerm(termID);
+ 
+     } else {
+-      intUptos = intPool.buffers[p.intStart >> DocumentsWriter.INT_BLOCK_SHIFT];
+-      intUptoStart = p.intStart & DocumentsWriter.INT_BLOCK_MASK;
+-      consumer.addTerm(p);
++      int intStart = postingsArray.intStarts[termID];
++      intUptos = intPool.buffers[intStart >> DocumentsWriter.INT_BLOCK_SHIFT];
++      intUptoStart = intStart & DocumentsWriter.INT_BLOCK_MASK;
++      consumer.addTerm(termID);
+     }
+   }
+ 
+@@ -389,20 +431,20 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+     int hashPos = code & postingsHashMask;
+ 
+     // Locate RawPostingList in hash
+-    p = postingsHash[hashPos];
++    int termID = postingsHash[hashPos];
+ 
+-    if (p != null && !postingEquals(tokenText, tokenTextLen)) {
++    if (termID != -1 && !postingEquals(termID, tokenText, tokenTextLen)) {
+       // Conflict: keep searching different locations in
+       // the hash table.
+       final int inc = ((code>>8)+code)|1;
+       do {
+         code += inc;
+         hashPos = code & postingsHashMask;
+-        p = postingsHash[hashPos];
+-      } while (p != null && !postingEquals(tokenText, tokenTextLen));
++        termID = postingsHash[hashPos];
++      } while (termID != -1 && !postingEquals(termID, tokenText, tokenTextLen));
+     }
+ 
+-    if (p == null) {
++    if (termID == -1) {
+ 
+       // First time we are seeing this token since we last
+       // flushed the hash.
+@@ -424,24 +466,26 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+         charPool.nextBuffer();
+       }
+ 
+-      // Refill?
+-      if (0 == perThread.freePostingsCount)
+-        perThread.morePostings();
++      // New posting
++      termID = numPostings++;
++      if (termID >= postingsArray.textStarts.length) {
++        growParallelPostingsArray();
++      }
++      if (perThread.termsHash.trackAllocations) {
++        perThread.termsHash.docWriter.bytesUsed(bytesPerPosting);
++      }
+ 
+-      // Pull next free RawPostingList from free list
+-      p = perThread.freePostings[--perThread.freePostingsCount];
+-      assert p != null;
++      assert termID != -1;
+ 
+       final char[] text = charPool.buffer;
+       final int textUpto = charPool.charUpto;
+-      p.textStart = textUpto + charPool.charOffset;
++      postingsArray.textStarts[termID] = textUpto + charPool.charOffset;
+       charPool.charUpto += textLen1;
+       System.arraycopy(tokenText, 0, text, textUpto, tokenTextLen);
+       text[textUpto+tokenTextLen] = 0xffff;
+           
+-      assert postingsHash[hashPos] == null;
+-      postingsHash[hashPos] = p;
+-      numPostings++;
++      assert postingsHash[hashPos] == -1;
++      postingsHash[hashPos] = termID;
+ 
+       if (numPostings == postingsHashHalfSize)
+         rehashPostings(2*postingsHashSize);
+@@ -457,24 +501,25 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+       intUptoStart = intPool.intUpto;
+       intPool.intUpto += streamCount;
+ 
+-      p.intStart = intUptoStart + intPool.intOffset;
++      postingsArray.intStarts[termID] = intUptoStart + intPool.intOffset;
+ 
+       for(int i=0;i<streamCount;i++) {
+         final int upto = bytePool.newSlice(ByteBlockPool.FIRST_LEVEL_SIZE);
+         intUptos[intUptoStart+i] = upto + bytePool.byteOffset;
+       }
+-      p.byteStart = intUptos[intUptoStart];
++      postingsArray.byteStarts[termID] = intUptos[intUptoStart];
+ 
+-      consumer.newTerm(p);
++      consumer.newTerm(termID);
+ 
+     } else {
+-      intUptos = intPool.buffers[p.intStart >> DocumentsWriter.INT_BLOCK_SHIFT];
+-      intUptoStart = p.intStart & DocumentsWriter.INT_BLOCK_MASK;
+-      consumer.addTerm(p);
++      final int intStart = postingsArray.intStarts[termID];
++      intUptos = intPool.buffers[intStart >> DocumentsWriter.INT_BLOCK_SHIFT];
++      intUptoStart = intStart & DocumentsWriter.INT_BLOCK_MASK;
++      consumer.addTerm(termID);
+     }
+ 
+     if (doNextCall)
+-      nextPerField.add(p.textStart);
++      nextPerField.add(postingsArray.textStarts[termID]);
+   }
+ 
+   int[] intUptos;
+@@ -524,14 +569,16 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+ 
+     final int newMask = newSize-1;
+ 
+-    RawPostingList[] newHash = new RawPostingList[newSize];
++    int[] newHash = new int[newSize];
++    Arrays.fill(newHash, -1);
+     for(int i=0;i<postingsHashSize;i++) {
+-      RawPostingList p0 = postingsHash[i];
+-      if (p0 != null) {
++      int termID = postingsHash[i];
++      if (termID != -1) {
+         int code;
+         if (perThread.primary) {
+-          final int start = p0.textStart & DocumentsWriter.CHAR_BLOCK_MASK;
+-          final char[] text = charPool.buffers[p0.textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
++          final int textStart = postingsArray.textStarts[termID];
++          final int start = textStart & DocumentsWriter.CHAR_BLOCK_MASK;
++          final char[] text = charPool.buffers[textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];
+           int pos = start;
+           while(text[pos] != 0xffff)
+             pos++;
+@@ -539,18 +586,18 @@ final class TermsHashPerField extends InvertedDocConsumerPerField {
+           while (pos > start)
+             code = (code*31) + text[--pos];
+         } else
+-          code = p0.textStart;
++          code = postingsArray.textStarts[termID];
+ 
+         int hashPos = code & newMask;
+         assert hashPos >= 0;
+-        if (newHash[hashPos] != null) {
++        if (newHash[hashPos] != -1) {
+           final int inc = ((code>>8)+code)|1;
+           do {
+             code += inc;
+             hashPos = code & newMask;
+-          } while (newHash[hashPos] != null);
++          } while (newHash[hashPos] != -1);
+         }
+-        newHash[hashPos] = p0;
++        newHash[hashPos] = termID;
+       }
+     }
+ 
+diff --git a/lucene/src/java/org/apache/lucene/index/TermsHashPerThread.java b/lucene/src/java/org/apache/lucene/index/TermsHashPerThread.java
+index 164ffc2..b1c3784 100644
+--- a/lucene/src/java/org/apache/lucene/index/TermsHashPerThread.java
++++ b/lucene/src/java/org/apache/lucene/index/TermsHashPerThread.java
+@@ -31,9 +31,6 @@ final class TermsHashPerThread extends InvertedDocConsumerPerThread {
+   final boolean primary;
+   final DocumentsWriter.DocState docState;
+ 
+-  final RawPostingList freePostings[] = new RawPostingList[256];
+-  int freePostingsCount;
+-
+   public TermsHashPerThread(DocInverterPerThread docInverterPerThread, final TermsHash termsHash, final TermsHash nextTermsHash, final TermsHashPerThread primaryPerThread) {
+     docState = docInverterPerThread.docState;
+ 
+@@ -71,20 +68,6 @@ final class TermsHashPerThread extends InvertedDocConsumerPerThread {
+       nextPerThread.abort();
+   }
+ 
+-  // perField calls this when it needs more postings:
+-  void morePostings() throws IOException {
+-    assert freePostingsCount == 0;
+-    termsHash.getPostings(freePostings);
+-    freePostingsCount = freePostings.length;
+-    assert noNullPostings(freePostings, freePostingsCount, "consumer=" + consumer);
+-  }
+-
+-  private static boolean noNullPostings(RawPostingList[] postings, int count, String details) {
+-    for(int i=0;i<count;i++)
+-      assert postings[i] != null: "postings[" + i + "] of " + count + " is null: " + details;
+-    return true;
+-  }
+-
+   @Override
+   public void startDocument() throws IOException {
+     consumer.startDocument();
+@@ -116,10 +99,5 @@ final class TermsHashPerThread extends InvertedDocConsumerPerThread {
+ 
+     if (primary)
+       charPool.reset();
+-
+-    if (recyclePostings) {
+-      termsHash.recyclePostings(freePostings, freePostingsCount);
+-      freePostingsCount = 0;
+-    }
+   }
+ }
+

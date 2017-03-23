@@ -1,0 +1,188 @@
+GitDiffStart: 09cc436a74af26acefc32902a73f9776335f20d2 | Thu Jun 20 15:48:03 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 5fc48e1..5671a0d 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -162,6 +162,11 @@ Bug Fixes
+   is now limited to MAX_CATEGORY_PATH_LENGTH characters.
+   (Colton Jamieson, Mike McCandless, Shai Erera)
+ 
++* LUCENE-5062: If the spatial data for a document was comprised of multiple
++  overlapping or adjacent parts then a CONTAINS predicate query might not match
++  when the sum of those shapes contain the query shape but none do individually.
++  A flag was added to use the original faster algorithm. (David Smiley)
++
+ Optimizations
+ 
+ * LUCENE-4936: Improve numeric doc values compression in case all values share
+diff --git a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/ContainsPrefixTreeFilter.java b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/ContainsPrefixTreeFilter.java
+index 74f0a68..bd0e954 100644
+--- a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/ContainsPrefixTreeFilter.java
++++ b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/ContainsPrefixTreeFilter.java
+@@ -41,8 +41,35 @@ import java.util.Collection;
+  */
+ public class ContainsPrefixTreeFilter extends AbstractPrefixTreeFilter {
+ 
+-  public ContainsPrefixTreeFilter(Shape queryShape, String fieldName, SpatialPrefixTree grid, int detailLevel) {
++  /*
++  Future optimizations:
++    Instead of seekExact, use seekCeil with some leap-frogging, like Intersects does.
++  */
++
++  /**
++   * If the spatial data for a document is comprised of multiple overlapping or adjacent parts,
++   * it might fail to match a query shape when doing the CONTAINS predicate when the sum of
++   * those shapes contain the query shape but none do individually.  Set this to false to
++   * increase performance if you don't care about that circumstance (such as if your indexed
++   * data doesn't even have such conditions).  See LUCENE-5062.
++   */
++  protected final boolean multiOverlappingIndexedShapes;
++
++  public ContainsPrefixTreeFilter(Shape queryShape, String fieldName, SpatialPrefixTree grid, int detailLevel, boolean multiOverlappingIndexedShapes) {
+     super(queryShape, fieldName, grid, detailLevel);
++    this.multiOverlappingIndexedShapes = multiOverlappingIndexedShapes;
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (!super.equals(o))
++      return false;
++    return multiOverlappingIndexedShapes == ((ContainsPrefixTreeFilter)o).multiOverlappingIndexedShapes;
++  }
++
++  @Override
++  public int hashCode() {
++    return super.hashCode() + (multiOverlappingIndexedShapes ? 1 : 0);
+   }
+ 
+   @Override
+@@ -65,18 +92,25 @@ public class ContainsPrefixTreeFilter extends AbstractPrefixTreeFilter {
+       if (termsEnum == null)//signals all done
+         return null;
+ 
+-      //Leaf docs match all query shape
++      // Leaf docs match all query shape
+       SmallDocSet leafDocs = getLeafDocs(cell, acceptContains);
+ 
+-      // Get the AND of all child results
++      // Get the AND of all child results (into combinedSubResults)
+       SmallDocSet combinedSubResults = null;
+-      Collection<Cell> subCells = cell.getSubCells(queryShape);
++      //   Optimization: use null subCellsFilter when we know cell is within the query shape.
++      Shape subCellsFilter = queryShape;
++      if (cell.getLevel() != 0 && ((cell.getShapeRel() == null || cell.getShapeRel() == SpatialRelation.WITHIN))) {
++        subCellsFilter = null;
++        assert cell.getShape().relate(queryShape) == SpatialRelation.WITHIN;
++      }
++      Collection <Cell> subCells = cell.getSubCells(subCellsFilter);
+       for (Cell subCell : subCells) {
+         if (!seekExact(subCell))
+           combinedSubResults = null;
+         else if (subCell.getLevel() == detailLevel)
+           combinedSubResults = getDocs(subCell, acceptContains);
+-        else if (subCell.getShapeRel() == SpatialRelation.WITHIN)
++        else if (!multiOverlappingIndexedShapes &&
++            subCell.getShapeRel() == SpatialRelation.WITHIN)
+           combinedSubResults = getLeafDocs(subCell, acceptContains);
+         else
+           combinedSubResults = visit(subCell, acceptContains); //recursion
+@@ -90,7 +124,7 @@ public class ContainsPrefixTreeFilter extends AbstractPrefixTreeFilter {
+       if (combinedSubResults != null) {
+         if (leafDocs == null)
+           return combinedSubResults;
+-        return leafDocs.union(combinedSubResults);
++        return leafDocs.union(combinedSubResults);//union is 'or'
+       }
+       return leafDocs;
+     }
+@@ -109,8 +143,12 @@ public class ContainsPrefixTreeFilter extends AbstractPrefixTreeFilter {
+       return collectDocs(acceptContains);
+     }
+ 
++    private Cell lastLeaf = null;//just for assertion
++
+     private SmallDocSet getLeafDocs(Cell leafCell, Bits acceptContains) throws IOException {
+       assert new BytesRef(leafCell.getTokenBytes()).equals(termBytes);
++      assert ! leafCell.equals(lastLeaf);//don't call for same leaf again
++      lastLeaf = leafCell;
+ 
+       BytesRef nextTerm = termsEnum.next();
+       if (nextTerm == null) {
+diff --git a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/RecursivePrefixTreeStrategy.java b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/RecursivePrefixTreeStrategy.java
+index 6c5364a..b2db296 100644
+--- a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/RecursivePrefixTreeStrategy.java
++++ b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/RecursivePrefixTreeStrategy.java
+@@ -38,6 +38,13 @@ public class RecursivePrefixTreeStrategy extends PrefixTreeStrategy {
+ 
+   private int prefixGridScanLevel;
+ 
++  /** True if only indexed points shall be supported.  See
++   *  {@link IntersectsPrefixTreeFilter#hasIndexedLeaves}. */
++  protected boolean pointsOnly = false;
++
++  /** See {@link ContainsPrefixTreeFilter#multiOverlappingIndexedShapes}. */
++  protected boolean multiOverlappingIndexedShapes = true;
++
+   public RecursivePrefixTreeStrategy(SpatialPrefixTree grid, String fieldName) {
+     super(grid, fieldName,
+         true);//simplify indexed cells
+@@ -69,18 +76,17 @@ public class RecursivePrefixTreeStrategy extends PrefixTreeStrategy {
+ 
+     Shape shape = args.getShape();
+     int detailLevel = grid.getLevelForDistance(args.resolveDistErr(ctx, distErrPct));
+-    final boolean hasIndexedLeaves = true;
+ 
+-    if (op == SpatialOperation.Intersects) {
++    if (pointsOnly || op == SpatialOperation.Intersects) {
+       return new IntersectsPrefixTreeFilter(
+-          shape, getFieldName(), grid, detailLevel, prefixGridScanLevel,
+-          hasIndexedLeaves);
++          shape, getFieldName(), grid, detailLevel, prefixGridScanLevel, !pointsOnly);
+     } else if (op == SpatialOperation.IsWithin) {
+       return new WithinPrefixTreeFilter(
+           shape, getFieldName(), grid, detailLevel, prefixGridScanLevel,
+           -1);//-1 flag is slower but ensures correct results
+     } else if (op == SpatialOperation.Contains) {
+-      return new ContainsPrefixTreeFilter(shape, getFieldName(), grid, detailLevel);
++      return new ContainsPrefixTreeFilter(shape, getFieldName(), grid, detailLevel,
++          multiOverlappingIndexedShapes);
+     }
+     throw new UnsupportedSpatialOperation(op);
+   }
+diff --git a/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/SpatialOpRecursivePrefixTreeTest.java b/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/SpatialOpRecursivePrefixTreeTest.java
+index 8c6a317..cbec0e2 100644
+--- a/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/SpatialOpRecursivePrefixTreeTest.java
++++ b/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/SpatialOpRecursivePrefixTreeTest.java
+@@ -110,6 +110,18 @@ public class SpatialOpRecursivePrefixTreeTest extends StrategyTestCase {
+     doTest(SpatialOperation.IsDisjointTo);
+   }
+ 
++  /** See LUCENE-5062, {@link ContainsPrefixTreeFilter#multiOverlappingIndexedShapes}. */
++  @Test
++  public void testContainsPairOverlap() throws IOException {
++    mySetup(3);
++    adoc("0", new ShapePair(ctx.makeRectangle(0, 33, -128, 128), ctx.makeRectangle(33, 128, -128, 128), true));
++    commit();
++    Query query = strategy.makeQuery(new SpatialArgs(SpatialOperation.Contains,
++        ctx.makeRectangle(0, 128, -16, 128)));
++    SearchResults searchResults = executeQuery(query, 1);
++    assertEquals(1, searchResults.numFound);
++  }
++
+   @Test
+   public void testWithinDisjointParts() throws IOException {
+     mySetup(7);
+@@ -184,10 +196,10 @@ public class SpatialOpRecursivePrefixTreeTest extends StrategyTestCase {
+       Shape indexedShape;
+       Shape indexedShapeGS; //(grid-snapped)
+       int R = random().nextInt(12);
+-      if (R == 0) {//1 in 10
++      if (R == 0) {//1 in 12
+         indexedShape = null; //no shape for this doc
+         indexedShapeGS = null;
+-      } else if (R % 4 == 0) {//3 in 12
++      } else if (R % 3 == 0) {//4-1 in 12
+         //comprised of more than one shape
+         Rectangle shape1 = randomRectangle();
+         Rectangle shape2 = randomRectangle();
+

@@ -1,0 +1,357 @@
+GitDiffStart: b935c20eb017a3ee7b3508623fb55a59f1310449 | Thu May 26 11:15:52 2011 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 24ca9a3..396eb44 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -511,6 +511,9 @@ Optimizations
+ * LUCENE-2897: Apply deleted terms while flushing a segment.  We still
+   buffer deleted terms to later apply to past segments.  (Mike McCandless)
+ 
++* LUCENE-3126: IndexWriter.addIndexes copies incoming segments into CFS if they
++  aren't already and MergePolicy allows that. (Shai Erera)
++
+ Bug fixes
+ 
+ * LUCENE-2996: addIndexes(IndexReader) did not flush before adding the new 
+diff --git a/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java b/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java
+index a077a8f..e47fed7 100644
+--- a/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java
++++ b/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java
+@@ -60,6 +60,9 @@ public final class CompoundFileWriter {
+ 
+         /** temporary holder for the start of this file's data section */
+         long dataOffset;
++        
++        /** the directory which contains the file. */
++        Directory dir;
+     }
+ 
+     // Before versioning started.
+@@ -119,6 +122,14 @@ public final class CompoundFileWriter {
+      *   has been added already
+      */
+     public void addFile(String file) {
++      addFile(file, directory);
++    }
++
++    /**
++     * Same as {@link #addFile(String)}, only for files that are found in an
++     * external {@link Directory}.
++     */
++    public void addFile(String file, Directory dir) {
+         if (merged)
+             throw new IllegalStateException(
+                 "Can't add extensions after merge has been called");
+@@ -133,6 +144,7 @@ public final class CompoundFileWriter {
+ 
+         FileEntry entry = new FileEntry();
+         entry.file = file;
++        entry.dir = dir;
+         entries.add(entry);
+     }
+ 
+@@ -170,7 +182,7 @@ public final class CompoundFileWriter {
+                 fe.directoryOffset = os.getFilePointer();
+                 os.writeLong(0);    // for now
+                 os.writeString(IndexFileNames.stripSegmentName(fe.file));
+-                totalSize += directory.fileLength(fe.file);
++                totalSize += fe.dir.fileLength(fe.file);
+             }
+ 
+             // Pre-allocate size of file as optimization --
+@@ -216,7 +228,7 @@ public final class CompoundFileWriter {
+    * output stream.
+    */
+   private void copyFile(FileEntry source, IndexOutput os) throws IOException {
+-    IndexInput is = directory.openInput(source.file);
++    IndexInput is = source.dir.openInput(source.file);
+     try {
+       long startPtr = os.getFilePointer();
+       long length = is.length();
+diff --git a/lucene/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/src/java/org/apache/lucene/index/IndexWriter.java
+index 54f6ad2..9c069af 100644
+--- a/lucene/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -23,6 +23,7 @@ import java.io.PrintStream;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Comparator;
+ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -51,6 +52,7 @@ import org.apache.lucene.store.LockObtainFailedException;
+ import org.apache.lucene.util.BitVector;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.Constants;
++import org.apache.lucene.util.StringHelper;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.lucene.util.MapBackedSet;
+ 
+@@ -2322,10 +2324,10 @@ public class IndexWriter implements Closeable {
+    * <p>
+    * <b>NOTE:</b> this method only copies the segments of the incoming indexes
+    * and does not merge them. Therefore deleted documents are not removed and
+-   * the new segments are not merged with the existing ones. Also, the segments
+-   * are copied as-is, meaning they are not converted to CFS if they aren't,
+-   * and vice-versa. If you wish to do that, you can call {@link #maybeMerge}
+-   * or {@link #optimize} afterwards.
++   * the new segments are not merged with the existing ones. Also, if the merge 
++   * policy allows compound files, then any segment that is not compound is 
++   * converted to such. However, if the segment is compound, it is copied as-is
++   * even if the merge policy does not allow compound files.
+    *
+    * <p>This requires this index not be among those to be added.
+    *
+@@ -2349,6 +2351,7 @@ public class IndexWriter implements Closeable {
+ 
+       int docCount = 0;
+       List<SegmentInfo> infos = new ArrayList<SegmentInfo>();
++      Comparator<String> versionComparator = StringHelper.getVersionComparator();
+       for (Directory dir : dirs) {
+         if (infoStream != null) {
+           message("addIndexes: process directory " + dir);
+@@ -2368,46 +2371,22 @@ public class IndexWriter implements Closeable {
+             message("addIndexes: process segment origName=" + info.name + " newName=" + newSegName + " dsName=" + dsName + " info=" + info);
+           }
+ 
+-          // Determine if the doc store of this segment needs to be copied. It's
+-          // only relevant for segments who share doc store with others, because
+-          // the DS might have been copied already, in which case we just want
+-          // to update the DS name of this SegmentInfo.
+-          // NOTE: pre-3x segments include a null DSName if they don't share doc
+-          // store. So the following code ensures we don't accidentally insert
+-          // 'null' to the map.
+-          final String newDsName;
+-          if (dsName != null) {
+-            if (dsNames.containsKey(dsName)) {
+-              newDsName = dsNames.get(dsName);
+-            } else {
+-              dsNames.put(dsName, newSegName);
+-              newDsName = newSegName;
+-            }
+-          } else {
+-            newDsName = newSegName;
++          // create CFS only if the source segment is not CFS, and MP agrees it
++          // should be CFS.
++          boolean createCFS;
++          synchronized (this) { // Guard segmentInfos
++            createCFS = !info.getUseCompoundFile()
++                && mergePolicy.useCompoundFile(segmentInfos, info)
++                // optimize case only for segments that don't share doc stores
++                && versionComparator.compare(info.getVersion(), "3.1") >= 0;
+           }
+ 
+-          // Copy the segment files
+-          for (String file: info.files()) {
+-            final String newFileName;
+-            if (IndexFileNames.isDocStoreFile(file)) {
+-              newFileName = newDsName + IndexFileNames.stripSegmentName(file);
+-              if (dsFilesCopied.contains(newFileName)) {
+-                continue;
+-              }
+-              dsFilesCopied.add(newFileName);
+-            } else {
+-              newFileName = newSegName + IndexFileNames.stripSegmentName(file);
+-            }
+-            assert !directory.fileExists(newFileName): "file \"" + newFileName + "\" already exists";
+-            dir.copy(directory, file, newFileName);
++          if (createCFS) {
++            copySegmentIntoCFS(info, newSegName);
++          } else {
++            copySegmentAsIs(info, newSegName, dsNames, dsFilesCopied);
+           }
+ 
+-          // Update SI appropriately
+-          info.setDocStore(info.getDocStoreOffset(), newDsName, info.getDocStoreIsCompoundFile());
+-          info.dir = directory;
+-          info.name = newSegName;
+-
+           infos.add(info);
+         }
+       }
+@@ -2496,6 +2475,76 @@ public class IndexWriter implements Closeable {
+     }
+   }
+ 
++  /** Copies the segment into the IndexWriter's directory, as a compound segment. */
++  private void copySegmentIntoCFS(SegmentInfo info, String segName) throws IOException {
++    String segFileName = IndexFileNames.segmentFileName(segName, "", IndexFileNames.COMPOUND_FILE_EXTENSION);
++    Collection<String> files = info.files();
++    CompoundFileWriter cfsWriter = new CompoundFileWriter(directory, segFileName);
++    for (String file : files) {
++      String newFileName = segName + IndexFileNames.stripSegmentName(file);
++      if (!IndexFileNames.matchesExtension(file, IndexFileNames.DELETES_EXTENSION)
++          && !IndexFileNames.isSeparateNormsFile(file)) {
++        cfsWriter.addFile(file, info.dir);
++      } else {
++        assert !directory.fileExists(newFileName): "file \"" + newFileName + "\" already exists";
++        info.dir.copy(directory, file, newFileName);
++      }
++    }
++    
++    // Create the .cfs
++    cfsWriter.close();
++    
++    info.dir = directory;
++    info.name = segName;
++    info.setUseCompoundFile(true);
++  }
++  
++  /** Copies the segment files as-is into the IndexWriter's directory. */
++  private void copySegmentAsIs(SegmentInfo info, String segName,
++      Map<String, String> dsNames, Set<String> dsFilesCopied)
++      throws IOException {
++    // Determine if the doc store of this segment needs to be copied. It's
++    // only relevant for segments that share doc store with others,
++    // because the DS might have been copied already, in which case we
++    // just want to update the DS name of this SegmentInfo.
++    // NOTE: pre-3x segments include a null DSName if they don't share doc
++    // store. The following code ensures we don't accidentally insert
++    // 'null' to the map.
++    String dsName = info.getDocStoreSegment();
++    final String newDsName;
++    if (dsName != null) {
++      if (dsNames.containsKey(dsName)) {
++        newDsName = dsNames.get(dsName);
++      } else {
++        dsNames.put(dsName, segName);
++        newDsName = segName;
++      }
++    } else {
++      newDsName = segName;
++    }
++    
++    // Copy the segment files
++    for (String file: info.files()) {
++      final String newFileName;
++      if (IndexFileNames.isDocStoreFile(file)) {
++        newFileName = newDsName + IndexFileNames.stripSegmentName(file);
++        if (dsFilesCopied.contains(newFileName)) {
++          continue;
++        }
++        dsFilesCopied.add(newFileName);
++      } else {
++        newFileName = segName + IndexFileNames.stripSegmentName(file);
++      }
++      
++      assert !directory.fileExists(newFileName): "file \"" + newFileName + "\" already exists";
++      info.dir.copy(directory, file, newFileName);
++    }
++    
++    info.setDocStore(info.getDocStoreOffset(), newDsName, info.getDocStoreIsCompoundFile());
++    info.dir = directory;
++    info.name = segName;
++  }
++  
+   /**
+    * A hook for extending classes to execute operations after pending added and
+    * deleted documents have been flushed to the Directory but before the change
+diff --git a/lucene/src/test/org/apache/lucene/index/TestAddIndexes.java b/lucene/src/test/org/apache/lucene/index/TestAddIndexes.java
+index 097d9c9..6f55e70 100755
+--- a/lucene/src/test/org/apache/lucene/index/TestAddIndexes.java
++++ b/lucene/src/test/org/apache/lucene/index/TestAddIndexes.java
+@@ -74,7 +74,7 @@ public class TestAddIndexes extends LuceneTestCase {
+     writer.close();
+ 
+     writer = newWriter(aux2, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(OpenMode.CREATE));
+-    // add 40 documents in compound files
++    // add 50 documents in compound files
+     addDocs2(writer, 50);
+     assertEquals(50, writer.maxDoc());
+     writer.close();
+@@ -1084,4 +1084,63 @@ public class TestAddIndexes extends LuceneTestCase {
+     assertEquals("Only one compound segment should exist", 4, dir.listAll().length);
+   }
+   
++  // LUCENE-3126: tests that if a non-CFS segment is copied, it is converted to
++  // a CFS, given MP preferences
++  public void testCopyIntoCFS() throws Exception {
++    // create an index, no CFS (so we can assert that existing segments are not affected)
++    Directory target = newDirectory();
++    LogMergePolicy lmp = newLogMergePolicy(false);
++    IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, null).setMergePolicy(lmp);
++    IndexWriter w = new IndexWriter(target, conf);
++    w.addDocument(new Document());
++    w.commit();
++    assertFalse(w.segmentInfos.info(0).getUseCompoundFile());
++
++    // prepare second index, no-CFS too + .del file + separate norms file
++    Directory src = newDirectory();
++    LogMergePolicy lmp2 = newLogMergePolicy(false);
++    IndexWriterConfig conf2 = newIndexWriterConfig(TEST_VERSION_CURRENT,
++        new MockAnalyzer(random)).setMergePolicy(lmp2);
++    IndexWriter w2 = new IndexWriter(src, conf2);
++    Document doc = new Document();
++    doc.add(new Field("c", "some text", Store.YES, Index.ANALYZED));
++    w2.addDocument(doc);
++    doc = new Document();
++    doc.add(new Field("d", "delete", Store.NO, Index.NOT_ANALYZED_NO_NORMS));
++    w2.addDocument(doc);
++    w2.commit();
++    w2.deleteDocuments(new Term("d", "delete"));
++    w2.commit();
++    w2.close();
++
++    // create separate norms file
++    IndexReader r = IndexReader.open(src, false);
++    r.setNorm(0, "c", (byte) 1);
++    r.close();
++    assertTrue(".del file not found", src.fileExists("_0_1.del"));
++    assertTrue("separate norms file not found", src.fileExists("_0_1.s0"));
++    
++    // Case 1: force 'CFS' on target
++    lmp.setUseCompoundFile(true);
++    lmp.setNoCFSRatio(1.0);
++    w.addIndexes(src);
++    w.commit();
++    assertFalse("existing segments should not be modified by addIndexes", w.segmentInfos.info(0).getUseCompoundFile());
++    assertTrue("segment should have been converted to a CFS by addIndexes", w.segmentInfos.info(1).getUseCompoundFile());
++    assertTrue(".del file not found", target.fileExists("_1_1.del"));
++    assertTrue("separate norms file not found", target.fileExists("_1_1.s0"));
++
++    // Case 2: LMP disallows CFS
++    lmp.setUseCompoundFile(false);
++    w.addIndexes(src);
++    w.commit();
++    assertFalse("segment should not have been converted to a CFS by addIndexes if MP disallows", w.segmentInfos.info(2).getUseCompoundFile());
++
++    w.close();
++
++    // cleanup
++    src.close();
++    target.close();
++  }
++
+ }
+diff --git a/lucene/src/test/org/apache/lucene/index/TestCompoundFile.java b/lucene/src/test/org/apache/lucene/index/TestCompoundFile.java
+index 88d499e..39eb2f6 100644
+--- a/lucene/src/test/org/apache/lucene/index/TestCompoundFile.java
++++ b/lucene/src/test/org/apache/lucene/index/TestCompoundFile.java
+@@ -648,4 +648,25 @@ public class TestCompoundFile extends LuceneTestCase
+         }
+ 
+     }
++    
++   public void testAddExternalFile() throws IOException {
++       createSequenceFile(dir, "d1", (byte) 0, 15);
++
++       Directory newDir = newDirectory();
++       CompoundFileWriter csw = new CompoundFileWriter(newDir, "d.csf");
++       csw.addFile("d1", dir);
++       csw.close();
++
++       CompoundFileReader csr = new CompoundFileReader(newDir, "d.csf");
++       IndexInput expected = dir.openInput("d1");
++       IndexInput actual = csr.openInput("d1");
++       assertSameStreams("d1", expected, actual);
++       assertSameSeekBehavior("d1", expected, actual);
++       expected.close();
++       actual.close();
++       csr.close();
++       
++       newDir.close();
++   }
++
+ }
+

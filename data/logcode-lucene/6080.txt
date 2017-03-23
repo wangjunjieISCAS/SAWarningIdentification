@@ -1,0 +1,530 @@
+GitDiffStart: a47b4f232ae1c9f80dc9777c5df0d04e3c56e427 | Mon Jun 2 17:26:37 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index f1cd7ea..06f486a 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -221,6 +221,10 @@ Optimizations
+ 
+ * LUCENE-5720: Optimize DirectPackedReader's decompression. (Robert Muir)
+ 
++* LUCENE-5722: Optimize ByteBufferIndexInput#seek() by specializing
++  implementations. This improves random access as used by docvalues codecs
++  if used with MMapDirectory.  (Robert Muir, Uwe Schindler)
++
+ Bug fixes
+ 
+ * LUCENE-5673: MMapDirectory: Work around a "bug" in the JDK that throws
+diff --git a/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java b/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java
+index ee2a413..c2a4bdb 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java
++++ b/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java
+@@ -37,34 +37,37 @@ import org.apache.lucene.util.WeakIdentityMap;
+  * are a power-of-two (<code>chunkSizePower</code>).
+  */
+ abstract class ByteBufferIndexInput extends IndexInput {
+-  private ByteBuffer[] buffers;
++  protected final BufferCleaner cleaner;  
++  protected final long length;
++  protected final long chunkSizeMask;
++  protected final int chunkSizePower;
+   
+-  private final long chunkSizeMask;
+-  private final int chunkSizePower;
+-  
+-  private int offset;
+-  private long length;
+-  private String sliceDescription;
+-
+-  private int curBufIndex = -1;
+-
+-  private ByteBuffer curBuf; // redundant for speed: buffers[curBufIndex]
++  protected ByteBuffer[] buffers;
++  protected int curBufIndex = -1;
++  protected ByteBuffer curBuf; // redundant for speed: buffers[curBufIndex]
+ 
+-  private boolean isClone = false;
+-  private final WeakIdentityMap<ByteBufferIndexInput,Boolean> clones;
++  protected boolean isClone = false;
++  protected final WeakIdentityMap<ByteBufferIndexInput,Boolean> clones;
++  
++  public static ByteBufferIndexInput newInstance(String resourceDescription, ByteBuffer[] buffers, long length, int chunkSizePower, BufferCleaner cleaner, boolean trackClones) {
++    final WeakIdentityMap<ByteBufferIndexInput,Boolean> clones = trackClones ? WeakIdentityMap.<ByteBufferIndexInput,Boolean>newConcurrentHashMap() : null;
++    if (buffers.length == 1) {
++      return new SingleBufferImpl(resourceDescription, buffers[0], length, chunkSizePower, cleaner, clones);
++    } else {
++      return new DefaultImpl(resourceDescription, buffers, length, chunkSizePower, cleaner, clones);
++    }
++  }
+   
+-  ByteBufferIndexInput(String resourceDescription, ByteBuffer[] buffers, long length, int chunkSizePower, boolean trackClones) throws IOException {
++  ByteBufferIndexInput(String resourceDescription, ByteBuffer[] buffers, long length, int chunkSizePower, BufferCleaner cleaner, WeakIdentityMap<ByteBufferIndexInput,Boolean> clones) {
+     super(resourceDescription);
+     this.buffers = buffers;
+     this.length = length;
+     this.chunkSizePower = chunkSizePower;
+     this.chunkSizeMask = (1L << chunkSizePower) - 1L;
+-    this.clones = trackClones ? WeakIdentityMap.<ByteBufferIndexInput,Boolean>newConcurrentHashMap() : null;
+-    
++    this.clones = clones;
++    this.cleaner = cleaner;
+     assert chunkSizePower >= 0 && chunkSizePower <= 30;   
+     assert (length >>> chunkSizePower) < Integer.MAX_VALUE;
+-
+-    seek(0L);
+   }
+   
+   @Override
+@@ -144,21 +147,16 @@ abstract class ByteBufferIndexInput extends IndexInput {
+   }
+   
+   @Override
+-  public final long getFilePointer() {
++  public long getFilePointer() {
+     try {
+-      return (((long) curBufIndex) << chunkSizePower) + curBuf.position() - offset;
++      return (((long) curBufIndex) << chunkSizePower) + curBuf.position();
+     } catch (NullPointerException npe) {
+       throw new AlreadyClosedException("Already closed: " + this);
+     }
+   }
+ 
+   @Override
+-  public final void seek(long pos) throws IOException {
+-    // necessary in case offset != 0 and pos < 0, but pos >= -offset
+-    if (pos < 0L) {
+-      throw new IllegalArgumentException("Seeking to negative position: " + this);
+-    }
+-    pos += offset;
++  public void seek(long pos) throws IOException {
+     // we use >> here to preserve negative, so we will catch AIOOBE,
+     // in case pos + offset overflows.
+     final int bi = (int) (pos >> chunkSizePower);
+@@ -188,11 +186,11 @@ abstract class ByteBufferIndexInput extends IndexInput {
+ 
+   @Override
+   public final ByteBufferIndexInput clone() {
+-    final ByteBufferIndexInput clone = buildSlice(0L, this.length);
++    final ByteBufferIndexInput clone = buildSlice((String) null, 0L, this.length);
+     try {
+       clone.seek(getFilePointer());
+     } catch(IOException ioe) {
+-      throw new RuntimeException("Should never happen: " + this, ioe);
++      throw new AssertionError(ioe);
+     }
+     
+     return clone;
+@@ -202,37 +200,26 @@ abstract class ByteBufferIndexInput extends IndexInput {
+    * Creates a slice of this index input, with the given description, offset, and length. The slice is seeked to the beginning.
+    */
+   @Override
+-  public final ByteBufferIndexInput slice(String sliceDescription, long offset, long length) {
+-    final ByteBufferIndexInput clone = buildSlice(offset, length);
+-    clone.sliceDescription = sliceDescription;
+-    try {
+-      clone.seek(0L);
+-    } catch(IOException ioe) {
+-      throw new RuntimeException("Should never happen: " + this, ioe);
++  public final ByteBufferIndexInput slice(String sliceDescription, long offset, long length) {    
++    if (offset < 0 || length < 0 || offset+length > this.length) {
++      throw new IllegalArgumentException("slice() " + sliceDescription + " out of bounds: offset=" + offset + ",length=" + length + ",fileLength="  + this.length + ": "  + this);
+     }
+     
+-    return clone;
++    return buildSlice(sliceDescription, offset, length);
+   }
+   
+-  private ByteBufferIndexInput buildSlice(long offset, long length) {
++  /** Builds the actual sliced IndexInput (may apply extra offset in subclasses). **/
++  protected ByteBufferIndexInput buildSlice(String sliceDescription, long offset, long length) {
+     if (buffers == null) {
+       throw new AlreadyClosedException("Already closed: " + this);
+     }
+-    if (offset < 0 || length < 0 || offset+length > this.length) {
+-      throw new IllegalArgumentException("slice() " + sliceDescription + " out of bounds: offset=" + offset + ",length=" + length + ",fileLength="  + this.length + ": "  + this);
+-    }
+-    
+-    // include our own offset into the final offset:
+-    offset += this.offset;
++
++    final ByteBuffer newBuffers[] = buildSlice(buffers, offset, length);
++    final String newResourceDescription = (sliceDescription == null) ? toString() : (toString() + " [slice=" + sliceDescription + "]");
++    final int ofs = (int) (offset & chunkSizeMask);
+     
+-    final ByteBufferIndexInput clone = (ByteBufferIndexInput)super.clone();
++    final ByteBufferIndexInput clone = newCloneInstance(newResourceDescription, newBuffers, ofs, length);
+     clone.isClone = true;
+-    // we keep clone.clones, so it shares the same map with original and we have no additional cost on clones
+-    assert clone.clones == this.clones;
+-    clone.buffers = buildSlice(buffers, offset, length);
+-    clone.offset = (int) (offset & chunkSizeMask);
+-    clone.length = length;
+-    clone.curBufIndex = -1;
+ 
+     // register the new clone in our clone list to clean it up on closing:
+     if (clones != null) {
+@@ -241,6 +228,19 @@ abstract class ByteBufferIndexInput extends IndexInput {
+     
+     return clone;
+   }
++
++  /** Factory method that creates a suitable implementation of this class for the given ByteBuffers. */
++  @SuppressWarnings("resource")
++  protected ByteBufferIndexInput newCloneInstance(String newResourceDescription, ByteBuffer[] newBuffers, int offset, long length) {
++    if (newBuffers.length == 1) {
++      newBuffers[0].position(offset);
++      return new SingleBufferImpl(newResourceDescription, newBuffers[0].slice(), length, chunkSizePower, this.cleaner, this.clones);
++    } else {
++      return (offset == 0) ?
++        new DefaultImpl(newResourceDescription, newBuffers, length, chunkSizePower, cleaner, clones) :
++        new WithOffsetImpl(newResourceDescription, newBuffers, offset, length, chunkSizePower, cleaner, clones);
++    }
++  }
+   
+   /** Returns a sliced view from a set of already-existing buffers: 
+    *  the last buffer's limit() will be correct, but
+@@ -264,12 +264,6 @@ abstract class ByteBufferIndexInput extends IndexInput {
+     return slices;
+   }
+ 
+-  private void unsetBuffers() {
+-    buffers = null;
+-    curBuf = null;
+-    curBufIndex = 0;
+-  }
+-
+   @Override
+   public final void close() throws IOException {
+     try {
+@@ -303,16 +297,116 @@ abstract class ByteBufferIndexInput extends IndexInput {
+   }
+   
+   /**
++   * Called to remove all references to byte buffers, so we can throw AlreadyClosed on NPE.
++   */
++  private void unsetBuffers() {
++    buffers = null;
++    curBuf = null;
++    curBufIndex = 0;
++  }
++
++  /**
+    * Called when the contents of a buffer will be no longer needed.
+    */
+-  protected abstract void freeBuffer(ByteBuffer b) throws IOException;
++  private void freeBuffer(ByteBuffer b) throws IOException {
++    if (cleaner != null) {
++      cleaner.freeBuffer(this, b);
++    }
++  }
++  
++  /**
++   * Pass in an implementation of this interface to cleanup ByteBuffers.
++   * MMapDirectory implements this to allow unmapping of bytebuffers with private Java APIs.
++   */
++  static interface BufferCleaner {
++    void freeBuffer(ByteBufferIndexInput parent, ByteBuffer b) throws IOException;
++  }
++  
++  /** Default implementation of ByteBufferIndexInput, supporting multiple buffers, but no offset. */
++  static final class DefaultImpl extends ByteBufferIndexInput {
+ 
+-  @Override
+-  public final String toString() {
+-    if (sliceDescription != null) {
+-      return super.toString() + " [slice=" + sliceDescription + "]";
+-    } else {
+-      return super.toString();
++    DefaultImpl(String resourceDescription, ByteBuffer[] buffers, long length, int chunkSizePower, 
++        BufferCleaner cleaner, WeakIdentityMap<ByteBufferIndexInput,Boolean> clones) {
++      super(resourceDescription, buffers, length, chunkSizePower, cleaner, clones);
++      try {
++        seek(0L);
++      } catch (IOException ioe) {
++        throw new AssertionError(ioe);
++      }
++    }
++    
++  }
++  
++  /** Optimization of ByteBufferIndexInput for when there is only one buffer */
++  static final class SingleBufferImpl extends ByteBufferIndexInput {
++
++    SingleBufferImpl(String resourceDescription, ByteBuffer buffer, long length, int chunkSizePower,
++        BufferCleaner cleaner, WeakIdentityMap<ByteBufferIndexInput,Boolean> clones) {
++      super(resourceDescription, new ByteBuffer[] { buffer }, length, chunkSizePower, cleaner, clones);
++      this.curBufIndex = 0;
++      this.curBuf = buffer;
++      buffer.position(0);
++    }
++    
++    // TODO: investigate optimizing readByte() & Co?
++    
++    @Override
++    public void seek(long pos) throws IOException {
++      try {
++        curBuf.position((int) pos);
++      } catch (IllegalArgumentException e) {
++        if (pos < 0) {
++          throw new IllegalArgumentException("Seeking to negative position: " + this, e);
++        } else {
++          throw new EOFException("seek past EOF: " + this);
++        }
++      } catch (NullPointerException npe) {
++        throw new AlreadyClosedException("Already closed: " + this);
++      }
++    }
++    
++    @Override
++    public long getFilePointer() {
++      try {
++        return curBuf.position();
++      } catch (NullPointerException npe) {
++        throw new AlreadyClosedException("Already closed: " + this);
++      }
++    }
++  }
++  
++  /** This class adds offset support to ByteBufferIndexInput, which is needed for slices. */
++  static final class WithOffsetImpl extends ByteBufferIndexInput {
++    private final int offset;
++    
++    WithOffsetImpl(String resourceDescription, ByteBuffer[] buffers, int offset, long length, int chunkSizePower,
++        BufferCleaner cleaner, WeakIdentityMap<ByteBufferIndexInput,Boolean> clones) {
++      super(resourceDescription, buffers, length, chunkSizePower, cleaner, clones);
++      this.offset = offset;
++      try {
++        seek(0L);
++      } catch (IOException ioe) {
++        throw new AssertionError(ioe);
++      }
++    }
++    
++    @Override
++    public void seek(long pos) throws IOException {
++      // necessary in case offset != 0 and pos < 0, but pos >= -offset
++      if (pos < 0L) {
++        throw new IllegalArgumentException("Seeking to negative position: " + this);
++      }
++      super.seek(pos + offset);
++    }
++    
++    @Override
++    public long getFilePointer() {
++      return super.getFilePointer() - offset;
++    }
++    
++    @Override
++    protected ByteBufferIndexInput buildSlice(String sliceDescription, long ofs, long length) {
++      return super.buildSlice(sliceDescription, this.offset + ofs, length);
+     }
+   }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java b/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java
+index d6de890..27efd2b 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java
+@@ -31,6 +31,7 @@ import java.security.PrivilegedActionException;
+ import java.util.Locale;
+ import java.lang.reflect.Method;
+ 
++import org.apache.lucene.store.ByteBufferIndexInput.BufferCleaner;
+ import org.apache.lucene.util.Constants;
+ 
+ /** File-based {@link Directory} implementation that uses
+@@ -193,48 +194,14 @@ public class MMapDirectory extends FSDirectory {
+     ensureOpen();
+     File file = new File(getDirectory(), name);
+     try (FileChannel c = FileChannel.open(file.toPath(), StandardOpenOption.READ)) {
+-      return new MMapIndexInput("MMapIndexInput(path=\"" + file.toString() + "\")", c);
++      final String resourceDescription = "MMapIndexInput(path=\"" + file.toString() + "\")";
++      final boolean useUnmap = getUseUnmap();
++      return ByteBufferIndexInput.newInstance(resourceDescription,
++          map(resourceDescription, c, 0, c.size()), 
++          c.size(), chunkSizePower, useUnmap ? CLEANER : null, useUnmap);
+     }
+   }
+ 
+-  private final class MMapIndexInput extends ByteBufferIndexInput {
+-    private final boolean useUnmapHack;
+-    
+-    MMapIndexInput(String resourceDescription, FileChannel fc) throws IOException {
+-      super(resourceDescription, map(resourceDescription, fc, 0, fc.size()), fc.size(), chunkSizePower, getUseUnmap());
+-      this.useUnmapHack = getUseUnmap();
+-    }
+-    
+-    /**
+-     * Try to unmap the buffer, this method silently fails if no support
+-     * for that in the JVM. On Windows, this leads to the fact,
+-     * that mmapped files cannot be modified or deleted.
+-     */
+-    @Override
+-    protected void freeBuffer(final ByteBuffer buffer) throws IOException {
+-      if (useUnmapHack) {
+-        try {
+-          AccessController.doPrivileged(new PrivilegedExceptionAction<Void>() {
+-            @Override
+-            public Void run() throws Exception {
+-              final Method getCleanerMethod = buffer.getClass()
+-                .getMethod("cleaner");
+-              getCleanerMethod.setAccessible(true);
+-              final Object cleaner = getCleanerMethod.invoke(buffer);
+-              if (cleaner != null) {
+-                cleaner.getClass().getMethod("clean")
+-                  .invoke(cleaner);
+-              }
+-              return null;
+-            }
+-          });
+-        } catch (PrivilegedActionException e) {
+-          throw new IOException("Unable to unmap the mapped buffer: " + toString(), e.getCause());
+-        }
+-      }
+-    }
+-  }
+-  
+   /** Maps a file into a set of buffers */
+   final ByteBuffer[] map(String resourceDescription, FileChannel fc, long offset, long length) throws IOException {
+     if ((length >>> chunkSizePower) >= Integer.MAX_VALUE)
+@@ -294,4 +261,28 @@ public class MMapDirectory extends FSDirectory {
+     newIoe.setStackTrace(ioe.getStackTrace());
+     return newIoe;
+   }
++  
++  private static final BufferCleaner CLEANER = new BufferCleaner() {
++    @Override
++    public void freeBuffer(final ByteBufferIndexInput parent, final ByteBuffer buffer) throws IOException {
++      try {
++        AccessController.doPrivileged(new PrivilegedExceptionAction<Void>() {
++          @Override
++          public Void run() throws Exception {
++            final Method getCleanerMethod = buffer.getClass()
++              .getMethod("cleaner");
++            getCleanerMethod.setAccessible(true);
++            final Object cleaner = getCleanerMethod.invoke(buffer);
++            if (cleaner != null) {
++              cleaner.getClass().getMethod("clean")
++                .invoke(cleaner);
++            }
++            return null;
++          }
++        });
++      } catch (PrivilegedActionException e) {
++        throw new IOException("Unable to unmap the mapped buffer: " + parent.toString(), e.getCause());
++      }
++    }
++  };
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/store/TestMultiMMap.java b/lucene/core/src/test/org/apache/lucene/store/TestMultiMMap.java
+index 710e408..ac1c98b 100644
+--- a/lucene/core/src/test/org/apache/lucene/store/TestMultiMMap.java
++++ b/lucene/core/src/test/org/apache/lucene/store/TestMultiMMap.java
+@@ -284,17 +284,49 @@ public class TestMultiMMap extends BaseDirectoryTestCase {
+       IndexInput slicer = mmapDir.openInput("bytes", newIOContext(random()));
+       for (int sliceStart = 0; sliceStart < bytes.length; sliceStart++) {
+         for (int sliceLength = 0; sliceLength < bytes.length - sliceStart; sliceLength++) {
+-          byte slice[] = new byte[sliceLength];
+-          IndexInput input = slicer.slice("bytesSlice", sliceStart, slice.length);
+-          input.readBytes(slice, 0, slice.length);
+-          input.close();
+-          assertEquals(new BytesRef(bytes, sliceStart, sliceLength), new BytesRef(slice));
++          assertSlice(bytes, slicer, 0, sliceStart, sliceLength);
+         }
+       }
+       slicer.close();
+       mmapDir.close();
+     }
+   }
++
++  public void testSliceOfSlice() throws Exception {
++    for (int i = 0; i < 10; i++) {
++      MMapDirectory mmapDir = new MMapDirectory(createTempDir("testSliceOfSlice"), null, 1<<i);
++      IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++      byte bytes[] = new byte[1<<(i+1)]; // make sure we switch buffers
++      random().nextBytes(bytes);
++      io.writeBytes(bytes, bytes.length);
++      io.close();
++      IndexInput ii = mmapDir.openInput("bytes", newIOContext(random()));
++      byte actual[] = new byte[1<<(i+1)]; // first read all bytes
++      ii.readBytes(actual, 0, actual.length);
++      ii.close();
++      assertEquals(new BytesRef(bytes), new BytesRef(actual));
++      IndexInput outerSlicer = mmapDir.openInput("bytes", newIOContext(random()));
++      final int outerSliceStart = random().nextInt(bytes.length / 2);
++      final int outerSliceLength = random().nextInt(bytes.length - outerSliceStart);
++      IndexInput innerSlicer = outerSlicer.slice("parentBytesSlice", outerSliceStart, outerSliceLength);
++      for (int sliceStart = 0; sliceStart < outerSliceLength; sliceStart++) {
++        for (int sliceLength = 0; sliceLength < outerSliceLength - sliceStart; sliceLength++) {
++          assertSlice(bytes, innerSlicer, outerSliceStart, sliceStart, sliceLength);
++        }
++      }
++      innerSlicer.close();
++      outerSlicer.close();
++      mmapDir.close();
++    }    
++  }
++  
++  private void assertSlice(byte[] bytes, IndexInput slicer, int outerSliceStart, int sliceStart, int sliceLength) throws IOException {
++    byte slice[] = new byte[sliceLength];
++    IndexInput input = slicer.slice("bytesSlice", sliceStart, slice.length);
++    input.readBytes(slice, 0, slice.length);
++    input.close();
++    assertEquals(new BytesRef(bytes, outerSliceStart + sliceStart, sliceLength), new BytesRef(slice));
++  }
+   
+   public void testRandomChunkSizes() throws Exception {
+     int num = atLeast(10);
+@@ -331,6 +363,53 @@ public class TestMultiMMap extends BaseDirectoryTestCase {
+       assertEquals("" + docID, reader.document(docID).get("docid"));
+     }
+     reader.close();
++    writer.close();
+     dir.close();
+   }
++  
++  public void testImplementations() throws Exception {
++    for (int i = 2; i < 12; i++) {
++      final int chunkSize = 1<<i;
++      MMapDirectory mmapDir = new MMapDirectory(createTempDir("testImplementations"), null, chunkSize);
++      IndexOutput io = mmapDir.createOutput("bytes", newIOContext(random()));
++      int size = random().nextInt(chunkSize * 2) + 3; // add some buffer of 3 for slice tests
++      byte bytes[] = new byte[size];
++      random().nextBytes(bytes);
++      io.writeBytes(bytes, bytes.length);
++      io.close();
++      IndexInput ii = mmapDir.openInput("bytes", newIOContext(random()));
++      byte actual[] = new byte[size]; // first read all bytes
++      ii.readBytes(actual, 0, actual.length);
++      assertEquals(new BytesRef(bytes), new BytesRef(actual));
++      // reinit:
++      ii.seek(0L);
++      
++      // check impl (we must check size < chunksize: currently, if size==chunkSize, we get 2 buffers, the second one empty:
++      assertTrue((size < chunkSize) ? (ii instanceof ByteBufferIndexInput.SingleBufferImpl) : (ii instanceof ByteBufferIndexInput.DefaultImpl));
++      
++      // clone tests:
++      assertSame(ii.getClass(), ii.clone().getClass());
++      
++      // slice test (offset 0)
++      int sliceSize = random().nextInt(size);
++      IndexInput slice = ii.slice("slice", 0, sliceSize);
++      assertTrue((sliceSize < chunkSize) ? (slice instanceof ByteBufferIndexInput.SingleBufferImpl) : (slice instanceof ByteBufferIndexInput.DefaultImpl));
++
++      // slice test (offset > 0 )
++      int offset = random().nextInt(size - 1) + 1;
++      sliceSize = random().nextInt(size - offset + 1);
++      slice = ii.slice("slice", offset, sliceSize);
++      //System.out.println(offset + "/" + sliceSize + " chunkSize=" + chunkSize + " " + slice.getClass());
++      if (offset % chunkSize + sliceSize < chunkSize) {
++        assertTrue(slice instanceof ByteBufferIndexInput.SingleBufferImpl);
++      } else if (offset % chunkSize == 0) {
++        assertTrue(slice instanceof ByteBufferIndexInput.DefaultImpl);
++      } else {
++        assertTrue(slice instanceof ByteBufferIndexInput.WithOffsetImpl);
++      }
++
++      ii.close();
++      mmapDir.close();
++    }    
++  }
+ }
+

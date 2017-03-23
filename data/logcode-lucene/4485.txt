@@ -1,0 +1,188 @@
+GitDiffStart: a6b2647c92106e520b501be74228a3c10c627714 | Wed Jan 14 18:38:20 2015 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index f71bf5b..e8ccd9c 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -447,6 +447,9 @@ Bug Fixes
+ 
+ * SOLR-6764: Field types need to be re-informed after reloading a managed schema from ZK
+   (Timothy Potter)
++  
++* SOLR-6931: We should do a limited retry when using HttpClient. 
++ (Mark Miller, Hrishikesh Gadre, Gregory Chanan)
+ 
+ Optimizations
+ ----------------------
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandlerFactory.java b/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandlerFactory.java
+index 402fe78..5ac7699 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandlerFactory.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandlerFactory.java
+@@ -16,8 +16,22 @@ package org.apache.solr.handler.component;
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
++import java.util.Collections;
++import java.util.List;
++import java.util.Random;
++import java.util.concurrent.ArrayBlockingQueue;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.CompletionService;
++import java.util.concurrent.ExecutorCompletionService;
++import java.util.concurrent.SynchronousQueue;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.http.client.HttpClient;
++import org.apache.http.impl.client.DefaultHttpClient;
++import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
+ import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.client.solrj.impl.HttpClientUtil;
+ import org.apache.solr.client.solrj.impl.LBHttpSolrClient;
+@@ -33,18 +47,6 @@ import org.apache.solr.util.DefaultSolrThreadFactory;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import java.io.IOException;
+-import java.util.Collections;
+-import java.util.List;
+-import java.util.Random;
+-import java.util.concurrent.ArrayBlockingQueue;
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.CompletionService;
+-import java.util.concurrent.ExecutorCompletionService;
+-import java.util.concurrent.SynchronousQueue;
+-import java.util.concurrent.ThreadPoolExecutor;
+-import java.util.concurrent.TimeUnit;
+-
+ 
+ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.apache.solr.util.plugin.PluginInfoInitialized {
+   protected static Logger log = LoggerFactory.getLogger(HttpShardHandlerFactory.class);
+@@ -76,6 +78,7 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
+   int keepAliveTime = 5;
+   int queueSize = -1;
+   boolean accessPolicy = false;
++  boolean useRetries = false;
+ 
+   private String scheme = null;
+ 
+@@ -98,6 +101,10 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
+ 
+   // Configure if the threadpool favours fairness over throughput
+   static final String INIT_FAIRNESS_POLICY = "fairnessPolicy";
++  
++  // Turn on retries for certain IOExceptions, many of which can happen
++  // due to connection pooling limitations / races
++  static final String USE_RETRIES = "useRetries";
+ 
+   /**
+    * Get {@link ShardHandler} that uses the default http client.
+@@ -130,6 +137,7 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
+     this.keepAliveTime = getParameter(args, MAX_THREAD_IDLE_TIME, keepAliveTime);
+     this.queueSize = getParameter(args, INIT_SIZE_OF_QUEUE, queueSize);
+     this.accessPolicy = getParameter(args, INIT_FAIRNESS_POLICY, accessPolicy);
++    this.useRetries = getParameter(args, USE_RETRIES, useRetries);
+     
+     // magic sysprop to make tests reproducible: set by SolrTestCaseJ4.
+     String v = System.getProperty("tests.shardhandler.randomSeed");
+@@ -154,8 +162,18 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
+     clientParams.set(HttpClientUtil.PROP_MAX_CONNECTIONS, maxConnections);
+     clientParams.set(HttpClientUtil.PROP_SO_TIMEOUT, soTimeout);
+     clientParams.set(HttpClientUtil.PROP_CONNECTION_TIMEOUT, connectionTimeout);
+-    clientParams.set(HttpClientUtil.PROP_USE_RETRY, false);
++    if (!useRetries) {
++      clientParams.set(HttpClientUtil.PROP_USE_RETRY, false);
++    }
+     this.defaultClient = HttpClientUtil.createClient(clientParams);
++    
++    // must come after createClient
++    if (useRetries) {
++      // our default retry handler will never retry on IOException if the request has been sent already,
++      // but for these read only requests we can use the standard DefaultHttpRequestRetryHandler rules
++      ((DefaultHttpClient) this.defaultClient).setHttpRequestRetryHandler(new DefaultHttpRequestRetryHandler());
++    }
++    
+     this.loadbalancer = createLoadbalancer(defaultClient);
+   }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/update/UpdateShardHandler.java b/solr/core/src/java/org/apache/solr/update/UpdateShardHandler.java
+index 8ad5907..891ccc8 100644
+--- a/solr/core/src/java/org/apache/solr/update/UpdateShardHandler.java
++++ b/solr/core/src/java/org/apache/solr/update/UpdateShardHandler.java
+@@ -61,7 +61,10 @@ public class UpdateShardHandler {
+       params.set(HttpClientUtil.PROP_CONNECTION_TIMEOUT,
+           cfg.getDistributedConnectionTimeout());
+     }
+-    params.set(HttpClientUtil.PROP_USE_RETRY, false);
++    // in the update case, we want to do retries, and to use
++    // the default Solr retry handler that createClient will 
++    // give us
++    params.set(HttpClientUtil.PROP_USE_RETRY, true);
+     log.info("Creating UpdateShardHandler HTTP client with params: {}", params);
+     client = HttpClientUtil.createClient(params, clientConnectionManager);
+   }
+diff --git a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientConfigurer.java b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientConfigurer.java
+index 2c953e6..1d370ff 100644
+--- a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientConfigurer.java
++++ b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientConfigurer.java
+@@ -51,16 +51,15 @@ public class HttpClientConfigurer {
+           config.getInt(HttpClientUtil.PROP_SO_TIMEOUT));
+     }
+     
+-    if (config.get(HttpClientUtil.PROP_USE_RETRY) != null) {
+-      HttpClientUtil.setUseRetry(httpClient,
+-          config.getBool(HttpClientUtil.PROP_USE_RETRY));
+-    }
+-    
+     if (config.get(HttpClientUtil.PROP_FOLLOW_REDIRECTS) != null) {
+       HttpClientUtil.setFollowRedirects(httpClient,
+           config.getBool(HttpClientUtil.PROP_FOLLOW_REDIRECTS));
+     }
+     
++    // always call setUseRetry, whether it is in config or not
++    HttpClientUtil.setUseRetry(httpClient,
++        config.getBool(HttpClientUtil.PROP_USE_RETRY, true));
++    
+     final String basicAuthUser = config
+         .get(HttpClientUtil.PROP_BASIC_AUTH_USER);
+     final String basicAuthPass = config
+diff --git a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientUtil.java b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientUtil.java
+index 63627e3..848729c 100644
+--- a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientUtil.java
++++ b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/HttpClientUtil.java
+@@ -241,7 +241,14 @@ public class HttpClientUtil {
+     if (!useRetry) {
+       httpClient.setHttpRequestRetryHandler(NO_RETRY);
+     } else {
+-      httpClient.setHttpRequestRetryHandler(new DefaultHttpRequestRetryHandler());
++      // if the request is not fully sent, we retry
++      // streaming updates are not a problem, because they are not retryable
++      httpClient.setHttpRequestRetryHandler(new DefaultHttpRequestRetryHandler(){
++        @Override
++        protected boolean handleAsIdempotent(final HttpRequest request) {
++          return false; // we can't tell if a Solr request is idempotent
++        }
++      });
+     }
+   }
+ 
+diff --git a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrClient.java b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrClient.java
+index 3df7041..e48e43e 100644
+--- a/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrClient.java
++++ b/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrClient.java
+@@ -223,7 +223,12 @@ public class LBHttpSolrClient extends SolrClient {
+     this.parser = parser;
+     if (httpClient == null) {
+       ModifiableSolrParams params = new ModifiableSolrParams();
+-      params.set(HttpClientUtil.PROP_USE_RETRY, false);
++      if (solrServerUrl.length > 1) {
++        // we prefer retrying another server
++        params.set(HttpClientUtil.PROP_USE_RETRY, false);
++      } else {
++        params.set(HttpClientUtil.PROP_USE_RETRY, true);
++      }
+       this.httpClient = HttpClientUtil.createClient(params);
+     } else {
+       this.httpClient = httpClient;
+

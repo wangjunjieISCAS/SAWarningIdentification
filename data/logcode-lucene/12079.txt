@@ -1,0 +1,876 @@
+GitDiffStart: 11f2885a123018e36e1f8e8f5d10340b3b5c2711 | Fri Jun 29 10:02:37 2012 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 6bae997..61fca0f 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -9,6 +9,12 @@ http://s.apache.org/luceneversions
+ 
+ ======================= Lucene 4.0.0-BETA =======================
+ 
++New features
++
++* LUCENE-3832: Added BasicAutomata.makeStringUnion method to efficiently
++  create automata from a fixed collection of UTF-8 encoded BytesRef
++  (Dawid Weiss, Robert Muir)
++
+ API Changes
+ 
+ * LUCENE-4138: update of morfologik (Polish morphological analyzer) to 1.5.3.
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/BasicAutomata.java b/lucene/core/src/java/org/apache/lucene/util/automaton/BasicAutomata.java
+index 7db891a..128c7d9 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/BasicAutomata.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/BasicAutomata.java
+@@ -29,8 +29,9 @@
+ 
+ package org.apache.lucene.util.automaton;
+ 
+-import java.util.ArrayList;
+-import java.util.Collection;
++import java.util.*;
++
++import org.apache.lucene.util.BytesRef;
+ 
+ /**
+  * Construction of basic automata.
+@@ -239,4 +240,25 @@ final public class BasicAutomata {
+     a.deterministic = true;
+     return a;
+   }
++
++  /**
++   * Returns a new (deterministic and minimal) automaton that accepts the union
++   * of the given collection of {@link BytesRef}s representing UTF-8 encoded
++   * strings.
++   * 
++   * @param utf8Strings
++   *          The input strings, UTF-8 encoded. The collection must be in sorted
++   *          order.
++   * 
++   * @return An {@link Automaton} accepting all input strings. The resulting
++   *         automaton is codepoint based (full unicode codepoints on
++   *         transitions).
++   */
++  public static Automaton makeStringUnion(Collection<BytesRef> utf8Strings) {
++    if (utf8Strings.isEmpty()) {
++      return makeEmpty();
++    } else {
++      return DaciukMihovAutomatonBuilder.build(utf8Strings);
++    }
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/DaciukMihovAutomatonBuilder.java b/lucene/core/src/java/org/apache/lucene/util/automaton/DaciukMihovAutomatonBuilder.java
+new file mode 100644
+index 0000000..c6be628
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/DaciukMihovAutomatonBuilder.java
+@@ -0,0 +1,332 @@
++package org.apache.lucene.util.automaton;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.*;
++
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.CharsRef;
++import org.apache.lucene.util.UnicodeUtil;
++
++/**
++ * Builds a minimal, deterministic {@link Automaton} that accepts a set of 
++ * strings. The algorithm requires sorted input data, but is very fast 
++ * (nearly linear with the input size).
++ * 
++ * @see #build(Collection)
++ * @see BasicAutomata#makeStringUnion(Collection)
++ */
++final class DaciukMihovAutomatonBuilder {
++  /**
++   * DFSA state with <code>char</code> labels on transitions.
++   */
++  private final static class State {
++    
++    /** An empty set of labels. */
++    private final static int[] NO_LABELS = new int[0];
++    
++    /** An empty set of states. */
++    private final static State[] NO_STATES = new State[0];
++    
++    /**
++     * Labels of outgoing transitions. Indexed identically to {@link #states}.
++     * Labels must be sorted lexicographically.
++     */
++    int[] labels = NO_LABELS;
++    
++    /**
++     * States reachable from outgoing transitions. Indexed identically to
++     * {@link #labels}.
++     */
++    State[] states = NO_STATES;
++    
++    /**
++     * <code>true</code> if this state corresponds to the end of at least one
++     * input sequence.
++     */
++    boolean is_final;
++    
++    /**
++     * Returns the target state of a transition leaving this state and labeled
++     * with <code>label</code>. If no such transition exists, returns
++     * <code>null</code>.
++     */
++    State getState(int label) {
++      final int index = Arrays.binarySearch(labels, label);
++      return index >= 0 ? states[index] : null;
++    }
++    
++    /**
++     * Two states are equal if:
++     * <ul>
++     * <li>they have an identical number of outgoing transitions, labeled with
++     * the same labels</li>
++     * <li>corresponding outgoing transitions lead to the same states (to states
++     * with an identical right-language).
++     * </ul>
++     */
++    @Override
++    public boolean equals(Object obj) {
++      final State other = (State) obj;
++      return is_final == other.is_final
++          && Arrays.equals(this.labels, other.labels)
++          && referenceEquals(this.states, other.states);
++    }
++    
++    /**
++     * Compute the hash code of the <i>current</i> status of this state.
++     */
++    @Override
++    public int hashCode() {
++      int hash = is_final ? 1 : 0;
++      
++      hash ^= hash * 31 + this.labels.length;
++      for (int c : this.labels)
++        hash ^= hash * 31 + c;
++      
++      /*
++       * Compare the right-language of this state using reference-identity of
++       * outgoing states. This is possible because states are interned (stored
++       * in registry) and traversed in post-order, so any outgoing transitions
++       * are already interned.
++       */
++      for (State s : this.states) {
++        hash ^= System.identityHashCode(s);
++      }
++      
++      return hash;
++    }
++    
++    /**
++     * Return <code>true</code> if this state has any children (outgoing
++     * transitions).
++     */
++    boolean hasChildren() {
++      return labels.length > 0;
++    }
++
++    /**
++     * Create a new outgoing transition labeled <code>label</code> and return
++     * the newly created target state for this transition.
++     */
++    State newState(int label) {
++      assert Arrays.binarySearch(labels, label) < 0 : "State already has transition labeled: "
++          + label;
++      
++      labels = Arrays.copyOf(labels, labels.length + 1);
++      states = Arrays.copyOf(states, states.length + 1);
++
++      labels[labels.length - 1] = label;
++      return states[states.length - 1] = new State();
++    }
++    
++    /**
++     * Return the most recent transitions's target state.
++     */
++    State lastChild() {
++      assert hasChildren() : "No outgoing transitions.";
++      return states[states.length - 1];
++    }
++    
++    /**
++     * Return the associated state if the most recent transition is labeled with
++     * <code>label</code>.
++     */
++    State lastChild(int label) {
++      final int index = labels.length - 1;
++      State s = null;
++      if (index >= 0 && labels[index] == label) {
++        s = states[index];
++      }
++      assert s == getState(label);
++      return s;
++    }
++    
++    /**
++     * Replace the last added outgoing transition's target state with the given
++     * state.
++     */
++    void replaceLastChild(State state) {
++      assert hasChildren() : "No outgoing transitions.";
++      states[states.length - 1] = state;
++    }
++    
++    /**
++     * Compare two lists of objects for reference-equality.
++     */
++    private static boolean referenceEquals(Object[] a1, Object[] a2) {
++      if (a1.length != a2.length) { 
++        return false;
++      }
++
++      for (int i = 0; i < a1.length; i++) {
++        if (a1[i] != a2[i]) { 
++          return false;
++        }
++      }
++
++      return true;
++    }
++  }
++  
++  /**
++   * A "registry" for state interning.
++   */
++  private HashMap<State,State> stateRegistry = new HashMap<State,State>();
++  
++  /**
++   * Root automaton state.
++   */
++  private State root = new State();
++  
++  /**
++   * Previous sequence added to the automaton in {@link #add(CharsRef)}.
++   */
++  private CharsRef previous;
++
++  /**
++   * A comparator used for enforcing sorted UTF8 order, used in assertions only.
++   */
++  @SuppressWarnings("deprecation")
++  private static final Comparator<CharsRef> comparator = CharsRef.getUTF16SortedAsUTF8Comparator();
++
++  /**
++   * Add another character sequence to this automaton. The sequence must be
++   * lexicographically larger or equal compared to any previous sequences added
++   * to this automaton (the input must be sorted).
++   */
++  public void add(CharsRef current) {
++    assert stateRegistry != null : "Automaton already built.";
++    assert previous == null
++        || comparator.compare(previous, current) <= 0 : "Input must be in sorted UTF-8 order: "
++        + previous + " >= " + current;
++    assert setPrevious(current);
++
++    // Descend in the automaton (find matching prefix).
++    int pos = 0, max = current.length();
++    State next, state = root;
++    while (pos < max && (next = state.lastChild(Character.codePointAt(current, pos))) != null) {
++      state = next;
++      // todo, optimize me
++      pos += Character.charCount(Character.codePointAt(current, pos));
++    }
++    
++    if (state.hasChildren()) replaceOrRegister(state);
++    
++    addSuffix(state, current, pos);
++  }
++  
++  /**
++   * Finalize the automaton and return the root state. No more strings can be
++   * added to the builder after this call.
++   * 
++   * @return Root automaton state.
++   */
++  public State complete() {
++    if (this.stateRegistry == null) throw new IllegalStateException();
++    
++    if (root.hasChildren()) replaceOrRegister(root);
++    
++    stateRegistry = null;
++    return root;
++  }
++  
++  /**
++   * Internal recursive traversal for conversion.
++   */
++  private static org.apache.lucene.util.automaton.State convert(State s,
++      IdentityHashMap<State,org.apache.lucene.util.automaton.State> visited) {
++    org.apache.lucene.util.automaton.State converted = visited.get(s);
++    if (converted != null) return converted;
++    
++    converted = new org.apache.lucene.util.automaton.State();
++    converted.setAccept(s.is_final);
++    
++    visited.put(s, converted);
++    int i = 0;
++    int[] labels = s.labels;
++    for (DaciukMihovAutomatonBuilder.State target : s.states) {
++      converted.addTransition(
++          new Transition(labels[i++], convert(target, visited)));
++    }
++    
++    return converted;
++  }
++
++  /**
++   * Build a minimal, deterministic automaton from a sorted list of {@link BytesRef} representing
++   * strings in UTF-8. These strings must be binary-sorted.
++   */
++  public static Automaton build(Collection<BytesRef> input) {
++    final DaciukMihovAutomatonBuilder builder = new DaciukMihovAutomatonBuilder();
++    
++    CharsRef scratch = new CharsRef();
++    for (BytesRef b : input) {
++      UnicodeUtil.UTF8toUTF16(b, scratch);
++      builder.add(scratch);
++    }
++    
++    Automaton a = new Automaton();
++    a.initial = convert(
++        builder.complete(), 
++        new IdentityHashMap<State,org.apache.lucene.util.automaton.State>());
++    a.deterministic = true;
++    return a;
++  }
++
++  /**
++   * Copy <code>current</code> into an internal buffer.
++   */
++  private boolean setPrevious(CharsRef current) {
++    // don't need to copy, once we fix https://issues.apache.org/jira/browse/LUCENE-3277
++    // still, called only from assert
++    previous = CharsRef.deepCopyOf(current);
++    return true;
++  }
++  
++  /**
++   * Replace last child of <code>state</code> with an already registered state
++   * or stateRegistry the last child state.
++   */
++  private void replaceOrRegister(State state) {
++    final State child = state.lastChild();
++    
++    if (child.hasChildren()) replaceOrRegister(child);
++    
++    final State registered = stateRegistry.get(child);
++    if (registered != null) {
++      state.replaceLastChild(registered);
++    } else {
++      stateRegistry.put(child, child);
++    }
++  }
++
++  /**
++   * Add a suffix of <code>current</code> starting at <code>fromIndex</code>
++   * (inclusive) to state <code>state</code>.
++   */
++  private void addSuffix(State state, CharSequence current, int fromIndex) {
++    final int len = current.length();
++    while (fromIndex < len) {
++      int cp = Character.codePointAt(current, fromIndex);
++      state = state.newState(cp);
++      fromIndex += Character.charCount(cp);
++    }
++    state.is_final = true;
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum.java b/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum.java
+index e5b0567..76de266 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum.java
+@@ -35,7 +35,6 @@ import org.apache.lucene.util._TestUtil;
+ import org.apache.lucene.util.automaton.Automaton;
+ import org.apache.lucene.util.automaton.BasicAutomata;
+ import org.apache.lucene.util.automaton.CompiledAutomaton;
+-import org.apache.lucene.util.automaton.DaciukMihovAutomatonBuilder;
+ import org.apache.lucene.util.automaton.RegExp;
+ 
+ @SuppressCodecs({ "SimpleText", "Memory" })
+@@ -257,7 +256,7 @@ public class TestTermsEnum extends LuceneTestCase {
+           acceptTerms.add(s2);
+           sortedAcceptTerms.add(new BytesRef(s2));
+         }
+-        a = DaciukMihovAutomatonBuilder.build(sortedAcceptTerms);
++        a = BasicAutomata.makeStringUnion(sortedAcceptTerms);
+       }
+       
+       if (random().nextBoolean()) {
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java b/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java
+index 7a16e5a..8b9dc7e 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestTermsEnum2.java
+@@ -35,13 +35,7 @@ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util._TestUtil;
+-import org.apache.lucene.util.automaton.Automaton;
+-import org.apache.lucene.util.automaton.AutomatonTestUtil;
+-import org.apache.lucene.util.automaton.BasicOperations;
+-import org.apache.lucene.util.automaton.CompiledAutomaton;
+-import org.apache.lucene.util.automaton.DaciukMihovAutomatonBuilder;
+-import org.apache.lucene.util.automaton.RegExp;
+-import org.apache.lucene.util.automaton.SpecialOperations;
++import org.apache.lucene.util.automaton.*;
+ 
+ public class TestTermsEnum2 extends LuceneTestCase {
+   private Directory dir;
+@@ -72,7 +66,7 @@ public class TestTermsEnum2 extends LuceneTestCase {
+       writer.addDocument(doc);
+     }
+     
+-    termsAutomaton = DaciukMihovAutomatonBuilder.build(terms);
++    termsAutomaton = BasicAutomata.makeStringUnion(terms);
+     
+     reader = writer.getReader();
+     searcher = newSearcher(reader);
+@@ -97,7 +91,7 @@ public class TestTermsEnum2 extends LuceneTestCase {
+         }
+       }
+ 
+-      Automaton alternate = DaciukMihovAutomatonBuilder.build(matchedTerms);
++      Automaton alternate = BasicAutomata.makeStringUnion(matchedTerms);
+       //System.out.println("match " + matchedTerms.size() + " " + alternate.getNumberOfStates() + " states, sigma=" + alternate.getStartPoints().length);
+       //AutomatonTestUtil.minimizeSimple(alternate);
+       //System.out.println("minmize done");
+@@ -164,7 +158,7 @@ public class TestTermsEnum2 extends LuceneTestCase {
+         found.add(BytesRef.deepCopyOf(te.term()));
+       }
+       
+-      Automaton actual = DaciukMihovAutomatonBuilder.build(found);     
++      Automaton actual = BasicAutomata.makeStringUnion(found);     
+       assertTrue(BasicOperations.sameLanguage(expected, actual));
+     }
+   }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestBasicOperations.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestBasicOperations.java
+index 5ceaf05..b209201 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestBasicOperations.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestBasicOperations.java
+@@ -17,10 +17,35 @@ package org.apache.lucene.util.automaton;
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.util.LuceneTestCase;
+-import org.apache.lucene.util.UnicodeUtil;
++import java.util.*;
++
++import org.apache.lucene.util.*;
++
++import com.carrotsearch.randomizedtesting.generators.RandomInts;
++
++public class TestBasicOperations extends LuceneTestCase {
++  /** Test string union. */
++  public void testStringUnion() {
++    List<BytesRef> strings = new ArrayList<BytesRef>();
++    for (int i = RandomInts.randomIntBetween(random(), 0, 1000); --i >= 0;) {
++      strings.add(new BytesRef(_TestUtil.randomUnicodeString(random())));
++    }
++
++    Collections.sort(strings);
++    Automaton union = BasicAutomata.makeStringUnion(strings);
++    assertTrue(union.isDeterministic());
++    assertTrue(BasicOperations.sameLanguage(union, naiveUnion(strings)));
++  }
++
++  private static Automaton naiveUnion(List<BytesRef> strings) {
++    Automaton [] eachIndividual = new Automaton [strings.size()];
++    int i = 0;
++    for (BytesRef bref : strings) {
++      eachIndividual[i++] = BasicAutomata.makeString(bref.utf8ToString());
++    }
++    return BasicOperations.union(Arrays.asList(eachIndividual));
++  }
+ 
+-public class TestBasicOperations extends LuceneTestCase { 
+   /** Test optimization to concatenate() */
+   public void testSingletonConcatenate() {
+     Automaton singleton = BasicAutomata.makeString("prefix");
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/util/automaton/DaciukMihovAutomatonBuilder.java b/lucene/test-framework/src/java/org/apache/lucene/util/automaton/DaciukMihovAutomatonBuilder.java
+deleted file mode 100644
+index 14fbab0..0000000
+--- a/lucene/test-framework/src/java/org/apache/lucene/util/automaton/DaciukMihovAutomatonBuilder.java
++++ /dev/null
+@@ -1,361 +0,0 @@
+-package org.apache.lucene.util.automaton;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.util.*;
+-
+-import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.CharsRef;
+-import org.apache.lucene.util.UnicodeUtil;
+-
+-/**
+- * Builds a minimal deterministic automaton that accepts a set of strings. The
+- * algorithm requires sorted input data, but is very fast (nearly linear with
+- * the input size).
+- */
+-public final class DaciukMihovAutomatonBuilder {
+-  /**
+-   * DFSA state with <code>char</code> labels on transitions.
+-   */
+-  public final static class State {
+-    
+-    /** An empty set of labels. */
+-    private final static int[] NO_LABELS = new int[0];
+-    
+-    /** An empty set of states. */
+-    private final static State[] NO_STATES = new State[0];
+-    
+-    /**
+-     * Labels of outgoing transitions. Indexed identically to {@link #states}.
+-     * Labels must be sorted lexicographically.
+-     */
+-    int[] labels = NO_LABELS;
+-    
+-    /**
+-     * States reachable from outgoing transitions. Indexed identically to
+-     * {@link #labels}.
+-     */
+-    State[] states = NO_STATES;
+-    
+-    /**
+-     * <code>true</code> if this state corresponds to the end of at least one
+-     * input sequence.
+-     */
+-    boolean is_final;
+-    
+-    /**
+-     * Returns the target state of a transition leaving this state and labeled
+-     * with <code>label</code>. If no such transition exists, returns
+-     * <code>null</code>.
+-     */
+-    public State getState(int label) {
+-      final int index = Arrays.binarySearch(labels, label);
+-      return index >= 0 ? states[index] : null;
+-    }
+-    
+-    /**
+-     * Returns an array of outgoing transition labels. The array is sorted in
+-     * lexicographic order and indexes correspond to states returned from
+-     * {@link #getStates()}.
+-     */
+-    public int[] getTransitionLabels() {
+-      return this.labels;
+-    }
+-    
+-    /**
+-     * Returns an array of outgoing transitions from this state. The returned
+-     * array must not be changed.
+-     */
+-    public State[] getStates() {
+-      return this.states;
+-    }
+-    
+-    /**
+-     * Two states are equal if:
+-     * <ul>
+-     * <li>they have an identical number of outgoing transitions, labeled with
+-     * the same labels</li>
+-     * <li>corresponding outgoing transitions lead to the same states (to states
+-     * with an identical right-language).
+-     * </ul>
+-     */
+-    @Override
+-    public boolean equals(Object obj) {
+-      final State other = (State) obj;
+-      return is_final == other.is_final
+-          && Arrays.equals(this.labels, other.labels)
+-          && referenceEquals(this.states, other.states);
+-    }
+-    
+-    /**
+-     * Return <code>true</code> if this state has any children (outgoing
+-     * transitions).
+-     */
+-    public boolean hasChildren() {
+-      return labels.length > 0;
+-    }
+-    
+-    /**
+-     * Is this state a final state in the automaton?
+-     */
+-    public boolean isFinal() {
+-      return is_final;
+-    }
+-    
+-    /**
+-     * Compute the hash code of the <i>current</i> status of this state.
+-     */
+-    @Override
+-    public int hashCode() {
+-      int hash = is_final ? 1 : 0;
+-      
+-      hash ^= hash * 31 + this.labels.length;
+-      for (int c : this.labels)
+-        hash ^= hash * 31 + c;
+-      
+-      /*
+-       * Compare the right-language of this state using reference-identity of
+-       * outgoing states. This is possible because states are interned (stored
+-       * in registry) and traversed in post-order, so any outgoing transitions
+-       * are already interned.
+-       */
+-      for (State s : this.states) {
+-        hash ^= System.identityHashCode(s);
+-      }
+-      
+-      return hash;
+-    }
+-    
+-    /**
+-     * Create a new outgoing transition labeled <code>label</code> and return
+-     * the newly created target state for this transition.
+-     */
+-    State newState(int label) {
+-      assert Arrays.binarySearch(labels, label) < 0 : "State already has transition labeled: "
+-          + label;
+-      
+-      labels = copyOf(labels, labels.length + 1);
+-      states = copyOf(states, states.length + 1);
+-      
+-      labels[labels.length - 1] = label;
+-      return states[states.length - 1] = new State();
+-    }
+-    
+-    /**
+-     * Return the most recent transitions's target state.
+-     */
+-    State lastChild() {
+-      assert hasChildren() : "No outgoing transitions.";
+-      return states[states.length - 1];
+-    }
+-    
+-    /**
+-     * Return the associated state if the most recent transition is labeled with
+-     * <code>label</code>.
+-     */
+-    State lastChild(int label) {
+-      final int index = labels.length - 1;
+-      State s = null;
+-      if (index >= 0 && labels[index] == label) {
+-        s = states[index];
+-      }
+-      assert s == getState(label);
+-      return s;
+-    }
+-    
+-    /**
+-     * Replace the last added outgoing transition's target state with the given
+-     * state.
+-     */
+-    void replaceLastChild(State state) {
+-      assert hasChildren() : "No outgoing transitions.";
+-      states[states.length - 1] = state;
+-    }
+-    
+-    /**
+-     * JDK1.5-replacement of {@link Arrays#copyOf(int[], int)}
+-     */
+-    private static int[] copyOf(int[] original, int newLength) {
+-      int[] copy = new int[newLength];
+-      System.arraycopy(original, 0, copy, 0,
+-          Math.min(original.length, newLength));
+-      return copy;
+-    }
+-    
+-    /**
+-     * JDK1.5-replacement of {@link Arrays#copyOf(char[], int)}
+-     */
+-    public static State[] copyOf(State[] original, int newLength) {
+-      State[] copy = new State[newLength];
+-      System.arraycopy(original, 0, copy, 0,
+-          Math.min(original.length, newLength));
+-      return copy;
+-    }
+-    
+-    /**
+-     * Compare two lists of objects for reference-equality.
+-     */
+-    private static boolean referenceEquals(Object[] a1, Object[] a2) {
+-      if (a1.length != a2.length) return false;
+-      
+-      for (int i = 0; i < a1.length; i++)
+-        if (a1[i] != a2[i]) return false;
+-      
+-      return true;
+-    }
+-  }
+-  
+-  /**
+-   * "register" for state interning.
+-   */
+-  private HashMap<State,State> register = new HashMap<State,State>();
+-  
+-  /**
+-   * Root automaton state.
+-   */
+-  private State root = new State();
+-  
+-  /**
+-   * Previous sequence added to the automaton in {@link #add(CharSequence)}.
+-   */
+-  private CharsRef previous;
+-  
+-  private static final Comparator<CharsRef> comparator = CharsRef.getUTF16SortedAsUTF8Comparator();
+-
+-  /**
+-   * Add another character sequence to this automaton. The sequence must be
+-   * lexicographically larger or equal compared to any previous sequences added
+-   * to this automaton (the input must be sorted).
+-   */
+-  public void add(CharsRef current) {
+-    assert register != null : "Automaton already built.";
+-    assert previous == null
+-        || comparator.compare(previous, current) <= 0 : "Input must be sorted: "
+-        + previous + " >= " + current;
+-    assert setPrevious(current);
+-    
+-    // Descend in the automaton (find matching prefix).
+-    int pos = 0, max = current.length();
+-    State next, state = root;
+-    while (pos < max && (next = state.lastChild(Character.codePointAt(current, pos))) != null) {
+-      state = next;
+-      // todo, optimize me
+-      pos += Character.charCount(Character.codePointAt(current, pos));
+-    }
+-    
+-    if (state.hasChildren()) replaceOrRegister(state);
+-    
+-    addSuffix(state, current, pos);
+-  }
+-  
+-  /**
+-   * Finalize the automaton and return the root state. No more strings can be
+-   * added to the builder after this call.
+-   * 
+-   * @return Root automaton state.
+-   */
+-  public State complete() {
+-    if (this.register == null) throw new IllegalStateException();
+-    
+-    if (root.hasChildren()) replaceOrRegister(root);
+-    
+-    register = null;
+-    return root;
+-  }
+-  
+-  /**
+-   * Internal recursive traversal for conversion.
+-   */
+-  private static org.apache.lucene.util.automaton.State convert(State s,
+-      IdentityHashMap<State,org.apache.lucene.util.automaton.State> visited) {
+-    org.apache.lucene.util.automaton.State converted = visited.get(s);
+-    if (converted != null) return converted;
+-    
+-    converted = new org.apache.lucene.util.automaton.State();
+-    converted.setAccept(s.is_final);
+-    
+-    visited.put(s, converted);
+-    int i = 0;
+-    int[] labels = s.labels;
+-    for (DaciukMihovAutomatonBuilder.State target : s.states) {
+-      converted.addTransition(new Transition(labels[i++], convert(target,
+-          visited)));
+-    }
+-    
+-    return converted;
+-  }
+-  
+-  /**
+-   * Build a minimal, deterministic automaton from a sorted list of strings.
+-   */
+-  public static Automaton build(Collection<BytesRef> input) {
+-    final DaciukMihovAutomatonBuilder builder = new DaciukMihovAutomatonBuilder();
+-    
+-    CharsRef scratch = new CharsRef();
+-    for (BytesRef b : input) {
+-      UnicodeUtil.UTF8toUTF16(b, scratch);
+-      builder.add(scratch);
+-    }
+-    
+-    Automaton a = new Automaton();
+-    a.initial = convert(builder.complete(), new IdentityHashMap<State,org.apache.lucene.util.automaton.State>());
+-    a.deterministic = true;
+-    return a;
+-  }
+-
+-  /**
+-   * Copy <code>current</code> into an internal buffer.
+-   */
+-  private boolean setPrevious(CharsRef current) {
+-    // don't need to copy, once we fix https://issues.apache.org/jira/browse/LUCENE-3277
+-    // still, called only from assert
+-    previous = CharsRef.deepCopyOf(current);
+-    return true;
+-  }
+-  
+-  /**
+-   * Replace last child of <code>state</code> with an already registered state
+-   * or register the last child state.
+-   */
+-  private void replaceOrRegister(State state) {
+-    final State child = state.lastChild();
+-    
+-    if (child.hasChildren()) replaceOrRegister(child);
+-    
+-    final State registered = register.get(child);
+-    if (registered != null) {
+-      state.replaceLastChild(registered);
+-    } else {
+-      register.put(child, child);
+-    }
+-  }
+-  
+-  /**
+-   * Add a suffix of <code>current</code> starting at <code>fromIndex</code>
+-   * (inclusive) to state <code>state</code>.
+-   */
+-  private void addSuffix(State state, CharSequence current, int fromIndex) {
+-    final int len = current.length();
+-    while (fromIndex < len) {
+-      int cp = Character.codePointAt(current, fromIndex);
+-      state = state.newState(cp);
+-      fromIndex += Character.charCount(cp);
+-    }
+-    state.is_final = true;
+-  }
+-}
+

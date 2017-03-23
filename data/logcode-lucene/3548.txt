@@ -1,0 +1,2093 @@
+GitDiffStart: 06ac78ae55c8c1e5f39205493887cda9ec6347ec | Thu May 7 17:58:58 2015 +0000
+diff --git a/lucene/ivy-versions.properties b/lucene/ivy-versions.properties
+index 9485046..79a198b 100644
+--- a/lucene/ivy-versions.properties
++++ b/lucene/ivy-versions.properties
+@@ -69,6 +69,7 @@ com.sun.jersey.version = 1.9
+ /dom4j/dom4j = 1.6.1
+ /hsqldb/hsqldb = 1.8.0.10
+ /io.netty/netty = 3.7.0.Final
++/it.unimi.dsi/fastutil = 6.5.11
+ /jakarta-regexp/jakarta-regexp = 1.4
+ /javax.activation/activation = 1.1.1
+ /javax.inject/javax.inject= 1
+@@ -80,6 +81,7 @@ com.sun.jersey.version = 1.9
+ /log4j/log4j = 1.2.17
+ /mecab/mecab-ipadic = 2.7.0-20070801
+ /mecab/mecab-naist-jdic = 0.6.3b-20111013
++/net.agkn/hll = 1.6.0
+ /net.arnx/jsonic = 1.2.7
+ /net.sf.saxon/Saxon-HE = 9.6.0-2
+ /net.sourceforge.argparse4j/argparse4j = 0.4.3
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index c1c1f2a..7b8c598 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -169,6 +169,8 @@ New Features
+ 
+ * SOLR-6220: Rule Based Replica Assignment during collection creation (Noble Paul)
+ 
++* SOLR-6968: New 'cardinality' option for stats.field, uses HyperLogLog to efficiently 
++  estimate the cardinality of a field w/bounded RAM. (hossman)
+ 
+ Bug Fixes
+ ----------------------
+diff --git a/solr/core/ivy.xml b/solr/core/ivy.xml
+index c8a169f..e56d313 100644
+--- a/solr/core/ivy.xml
++++ b/solr/core/ivy.xml
+@@ -89,6 +89,10 @@
+     <!-- StatsComponents percentiles Dependencies-->
+     <dependency org="com.tdunning" name="t-digest" rev="${/com.tdunning/t-digest}" conf="compile->*"/>
+ 
++    <!-- StatsComponents HLL Dependencies-->
++    <dependency org="net.agkn" name="hll" rev="${/net.agkn/hll}" conf="compile->*"/>
++    <dependency org="it.unimi.dsi" name="fastutil" rev="${/it.unimi.dsi/fastutil}" conf="compile->*"/>
++
+     <exclude org="*" ext="*" matcher="regexp" type="${ivy.exclude.types}"/> 
+   </dependencies>
+ </ivy-module>
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/StatsField.java b/solr/core/src/java/org/apache/solr/handler/component/StatsField.java
+index 62ae47f..0639dd1 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/StatsField.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/StatsField.java
+@@ -30,6 +30,7 @@ import java.util.Map;
+ import java.util.Set;
+ 
+ import org.apache.commons.lang.StringUtils;
++import org.apache.lucene.document.FieldType.NumericType;
+ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.queries.function.FunctionQuery;
+ import org.apache.lucene.queries.function.ValueSource;
+@@ -55,6 +56,10 @@ import org.apache.solr.search.QueryParsing;
+ import org.apache.solr.search.SolrIndexSearcher;
+ import org.apache.solr.search.SyntaxError;
+ 
++import net.agkn.hll.HLL;
++import com.google.common.hash.Hashing;
++import com.google.common.hash.HashFunction;
++
+ /**
+  * Models all of the information associated with a single {@link StatsParams#STATS_FIELD}
+  * instance.
+@@ -107,6 +112,19 @@ public class StatsField {
+         }
+         return false;
+       }
++    },
++    cardinality(true) { 
++      /** special for percentiles **/
++      boolean parseParams(StatsField sf) {
++        try {
++          sf.hllOpts = HllOptions.parseHllOptions(sf.localParams, sf.schemaField);
++          return (null != sf.hllOpts);
++        } catch (Exception e) {
++          throw new SolrException(ErrorCode.BAD_REQUEST, "Unable to parse "
++              + StatsParams.STATS_FIELD + " local params: " + sf.localParams + " due to: "
++              + e.getMessage(), e);
++        }
++      }
+     };
+ 
+     private final List<Stat> distribDeps;
+@@ -150,7 +168,10 @@ public class StatsField {
+       return EnumSet.copyOf(this.distribDeps);
+     }
+     
+-    /** return value of true means user is requesting this stat */
++    /** 
++     * Called when the name of a stat is found as a local param on this {@link StatsField}
++     * @return true if the user is requesting this stat, else false
++     */
+     boolean parseParams(StatsField sf) {
+       return sf.localParams.getBool(this.name(), false);
+     }
+@@ -180,7 +201,7 @@ public class StatsField {
+   private final boolean isShard;
+   
+   private double tdigestCompression = 100.0D;
+-  
++  private HllOptions hllOpts;
+   
+   /**
+    * @param rb the current request/response
+@@ -549,4 +570,163 @@ public class StatsField {
+   public double getTdigestCompression() {
+     return tdigestCompression;
+   }
++
++  public HllOptions getHllOptions() {
++    return hllOpts;
++  }
++
++  /**
++   * Helper Struct for parsing and encapsulating all of the options relaed to building a {@link HLL}
++   *
++   * @see Stat#cardinality
++   * @lucene.internal
++   */
++  public static final class HllOptions {
++    final HashFunction hasher;
++    
++    // NOTE: this explanation linked to from the java-hll jdocs...
++    // https://github.com/aggregateknowledge/postgresql-hll/blob/master/README.markdown#explanation-of-parameters-and-tuning
++    // ..if i'm understanding the regwidth chart correctly, a value of 6 should be a enough
++    // to support any max cardinality given that we're always dealing with hashes and 
++    // the cardinality of the set of all long values is 2**64 == 1.9e19
++    //
++    // But i guess that assumes a *perfect* hash and high log2m? ... if the hash algo is imperfect 
++    // and/or log2m is low (ie: user is less concerned about accuracy), then many diff hash values 
++    // might fall in the same register (ie: bucket) and having a wider register to count more of 
++    // them may be useful
++
++    final int log2m;  
++    final int regwidth;
++    
++    final static String ERR = "cardinality must be specified as 'true' (for default tunning) or decimal number between 0 and 1 to adjust accuracy vs memory usage (large number is more memory and more accuracy)";
++
++    private HllOptions(int log2m, int regwidth, HashFunction hasher) {
++      this.log2m = log2m;
++      this.regwidth = regwidth;
++      this.hasher = hasher;
++    }
++    /** 
++     * Creates an HllOptions based on the (local) params specified (if appropriate).
++     *
++     * @param localParams the LocalParams for this {@link StatsField}
++     * @param field the field corrisponding to this {@link StatsField}, may be null if these stats are over a value source
++     * @return the {@link HllOptions} to use basd on the params, or null if no {@link HLL} should be computed
++     * @throws SolrException if there are invalid options
++     */
++    public static HllOptions parseHllOptions(SolrParams localParams, SchemaField field) 
++      throws SolrException {
++
++      String cardinalityOpt = localParams.get(Stat.cardinality.name());
++      if (StringUtils.isBlank(cardinalityOpt)) {
++        return null;
++      }
++
++      final NumericType hashableNumType = getHashableNumericType(field);
++
++      // some sane defaults
++      int log2m = 13;   // roughly equivilent to "cardinality='0.33'"
++      int regwidth = 6; // with decent hash, this is plenty for all valid long hashes
++
++      if (NumericType.FLOAT.equals(hashableNumType) || NumericType.INT.equals(hashableNumType)) {
++        // for 32bit values, we can adjust our default regwidth down a bit
++        regwidth--;
++
++        // NOTE: EnumField uses NumericType.INT, and in theory we could be super conservative
++        // with it, but there's no point - just let the EXPLICIT HLL handle it
++      }
++
++      // TODO: we could attempt additional reductions in the default regwidth based on index
++      // statistics -- but thta doesn't seem worth the effort.  for tiny indexes, the 
++      // EXPLICIT and SPARSE HLL representations have us nicely covered, and in general we don't 
++      // want to be too aggresive about lowering regwidth or we could really poor results if 
++      // log2m is also low and  there is heavy hashkey collision
++
++      try {
++        // NFE will short out here if it's not a number
++        final double accuracyOpt = Double.parseDouble(cardinalityOpt);
++
++        // if a float between 0 and 1 is specified, treat it as a prefrence of accuracy
++        // - 0 means accuracy is not a concern, save RAM
++        // - 1 means be as accurate as possible, using as much RAM as needed.
++
++        if (accuracyOpt < 0D || 1.0D < accuracyOpt) {
++          throw new SolrException(ErrorCode.BAD_REQUEST, ERR);
++        }
++
++        // use accuracyOpt as a scaling factor between min & max legal log2m values
++        log2m = HLL.MINIMUM_LOG2M_PARAM
++          + (int) Math.round(accuracyOpt * (HLL.MAXIMUM_LOG2M_PARAM - HLL.MINIMUM_LOG2M_PARAM));
++
++        // use accuracyOpt as a scaling factor for regwidth as well, BUT...
++        // be more conservative -- HLL.MIN_REGWIDTH_PARAM is too absurdly low to be useful
++        // use previously computed (hashableNumType) default regwidth -1 as lower bound for scaling
++        final int MIN_HUERISTIC_REGWIDTH = regwidth-1;
++        regwidth = MIN_HUERISTIC_REGWIDTH
++          + (int) Math.round(accuracyOpt * (HLL.MAXIMUM_REGWIDTH_PARAM - MIN_HUERISTIC_REGWIDTH));
++
++      } catch (NumberFormatException nfe) {
++        // param value isn't a number -- let's check for simple true/false
++        if (! localParams.getBool(Stat.cardinality.name(), false)) {
++          return null;
++        }
++      }
++
++      // let explicit params override both the default and/or any accuracy specification
++      log2m = localParams.getInt("hllLog2m", log2m);
++      regwidth = localParams.getInt("hllRegwidth", regwidth);
++
++      // validate legal values
++      if (log2m < HLL.MINIMUM_LOG2M_PARAM || HLL.MAXIMUM_LOG2M_PARAM < log2m) {
++        throw new SolrException(ErrorCode.BAD_REQUEST, "hllLog2m must be at least " + 
++                                HLL.MINIMUM_LOG2M_PARAM + " and at most " + HLL.MAXIMUM_LOG2M_PARAM
++                                + " (" + log2m +")");
++      }
++      if (regwidth < HLL.MINIMUM_REGWIDTH_PARAM || HLL.MAXIMUM_REGWIDTH_PARAM < regwidth) {
++        throw new SolrException(ErrorCode.BAD_REQUEST, "hllRegwidth must be at least " + 
++                                HLL.MINIMUM_REGWIDTH_PARAM + " and at most " + HLL.MAXIMUM_REGWIDTH_PARAM);
++      }
++      
++      HashFunction hasher = localParams.getBool("hllPreHashed", false) ? null : Hashing.murmur3_128();
++
++      if (null == hasher) {
++        // if this is a function, or a non Long field, pre-hashed is invalid
++        // NOTE: we ignore hashableNumType - it's LONG for non numerics like Strings
++        if (null == field || !NumericType.LONG.equals(field.getType().getNumericType())) {
++          throw new SolrException(ErrorCode.BAD_REQUEST, "hllPreHashed is only supported with Long based fields");
++        }
++      }
++
++      // if we're still here, then we need an HLL...
++      return new HllOptions(log2m, regwidth, hasher);
++    }
++    /** @see HLL */
++    public int getLog2m() {
++      return log2m;
++    }
++    /** @see HLL */
++    public int getRegwidth() {
++      return regwidth;
++    }
++    /** May be null if user has indicated that field values are pre-hashed */
++    public HashFunction getHasher() {
++      return hasher;
++    }
++    public HLL newHLL() {
++      return new HLL(getLog2m(), getRegwidth());
++    }
++  }
++
++  /**
++   * Returns the effective {@link NumericType} for the field for the purposes of hash values.  
++   * ie: If the field has an explict NumericType that is returned; If the field has no explicit 
++   * NumericType then {@link NumericType#LONG} is returned;  If field is null, then 
++   * {@link NumericType#FLOAT} is assumed for ValueSource.
++   */
++  private static NumericType getHashableNumericType(SchemaField field) {
++    if (null == field) {
++      return NumericType.FLOAT;
++    }
++    final NumericType result = field.getType().getNumericType();
++    return null == result ? NumericType.LONG : result;
++  }
+ }
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/StatsValuesFactory.java b/solr/core/src/java/org/apache/solr/handler/component/StatsValuesFactory.java
+index e941a30..a1575aa 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/StatsValuesFactory.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/StatsValuesFactory.java
+@@ -34,6 +34,10 @@ import org.apache.solr.schema.*;
+ 
+ import com.tdunning.math.stats.AVLTreeDigest;
+ 
++import net.agkn.hll.HLL;
++import com.google.common.hash.Hashing;
++import com.google.common.hash.HashFunction;
++
+ /**
+  * Factory class for creating instance of 
+  * {@link org.apache.solr.handler.component.StatsValues}
+@@ -105,6 +109,7 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+   final protected boolean computeMin;
+   final protected boolean computeMax;
+   final protected boolean computeMinOrMax;
++  final protected boolean computeCardinality; 
+ 
+   /** 
+    * Either a function value source to collect from, or the ValueSource associated 
+@@ -129,7 +134,13 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+   protected long count;
+   protected long countDistinct;
+   protected final Set<T> distinctValues;
+-  
++
++  /**
++   * Hash function that must be used by implementations of {@link #hash}
++   */
++  protected final HashFunction hasher; 
++  private final HLL hll;
++
+   // facetField facetValue
+   protected Map<String,Map<String, StatsValues>> facets = new HashMap<>();
+   
+@@ -141,9 +152,20 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+     this.computeMin = statsField.calculateStats(Stat.min);
+     this.computeMax = statsField.calculateStats(Stat.max);
+     this.computeMinOrMax = computeMin || computeMax;
+-      
++    
+     this.distinctValues = computeCalcDistinct ? new TreeSet<>() : null;
+ 
++    this.computeCardinality = statsField.calculateStats(Stat.cardinality);
++    if ( computeCardinality ) {
++
++      hasher = statsField.getHllOptions().getHasher();
++      hll = statsField.getHllOptions().newHLL();
++      assert null != hll : "Cardinality requires an HLL";
++    } else {
++      hll = null;
++      hasher = null;
++    }
++
+     // alternatively, we could refactor a common base class that doesn't know/care
+     // about either SchemaField or ValueSource - but then there would be a lot of
+     // duplicate code between "NumericSchemaFieldStatsValues" and 
+@@ -186,6 +208,12 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+     if (computeMinOrMax) {
+       updateMinMax((T) stv.get("min"), (T) stv.get("max"));
+     }
++
++    if (computeCardinality) {
++      byte[] data = (byte[]) stv.get("cardinality");
++      hll.union(HLL.fromBytes(data));
++    }
++
+     updateTypeSpecificStats(stv);
+     
+     NamedList f = (NamedList) stv.get(FACETS);
+@@ -228,6 +256,8 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+   }
+ 
+   public void accumulate(T value, int count) { 
++    assert null != value : "Can't accumulate null";
++
+     if (computeCount) {
+       this.count += count;
+     }
+@@ -238,6 +268,14 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+     if (computeMinOrMax) {
+       updateMinMax(value, value);
+     }
++    if (computeCardinality) {
++      if (null == hasher) {
++        assert value instanceof Number : "pre-hashed value support only works with numeric longs";
++        hll.addRaw(((Number)value).longValue());
++      } else {
++        hll.addRaw(hash(value));
++      }
++    }
+     updateTypeSpecificStats(value, count);
+   }
+   
+@@ -290,6 +328,13 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+       res.add("distinctValues", distinctValues);
+       res.add("countDistinct", countDistinct);
+     }
++    if (statsField.includeInResponse(Stat.cardinality)) {
++      if (statsField.getIsShard()) {
++        res.add("cardinality", hll.toBytes());
++      } else {
++        res.add("cardinality", hll.cardinality());
++      }
++    }
+     
+     addTypeSpecificStats(res);
+     
+@@ -326,6 +371,18 @@ abstract class AbstractStatsValues<T> implements StatsValues {
+   }
+   
+   /**
++   * Hash function to be used for computing cardinality.
++   *
++   * This method will not be called in cases where the user has indicated the values 
++   * are already hashed.  If this method is called, then {@link #hasher} will be non-null, 
++   * and should be used to generate the appropriate hash value.
++   *
++   * @see Stat#cardinality
++   * @see #hasher
++   */
++  protected abstract long hash(T value);
++
++  /**
+    * Updates the minimum and maximum statistics based on the given values
+    *
+    * @param min
+@@ -388,9 +445,31 @@ class NumericStatsValues extends AbstractStatsValues<Number> {
+     
+     this.computePercentiles = statsField.calculateStats(Stat.percentiles);
+     if ( computePercentiles ) {
+-      
+       tdigest = new AVLTreeDigest(statsField.getTdigestCompression()); 
+     }
++
++  }
++
++  @Override
++  public long hash(Number v) {
++    // have to use a bit of reflection to ensure good hash values since
++    // we don't have truely type specific stats
++    if (v instanceof Long) {
++      return hasher.hashLong(v.longValue()).asLong();
++    } else if (v instanceof Integer) {
++      return hasher.hashInt(v.intValue()).asLong();
++    } else if (v instanceof Double) {
++      return hasher.hashLong(Double.doubleToRawLongBits(v.doubleValue())).asLong();
++    } else if (v instanceof Float) {
++      return hasher.hashInt(Float.floatToRawIntBits(v.floatValue())).asLong();
++    } else if (v instanceof Byte) {
++      return hasher.newHasher().putByte(v.byteValue()).hash().asLong();
++    } else if (v instanceof Short) {
++      return hasher.newHasher().putShort(v.shortValue()).hash().asLong();
++    } 
++    // else...
++    throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
++                            "Unsupported Numeric Type ("+v.getClass()+") for hashing: " +statsField);
+   }
+   
+   @Override
+@@ -540,6 +619,11 @@ class EnumStatsValues extends AbstractStatsValues<EnumFieldValue> {
+     super(statsField);
+   }
+   
++  @Override
++  public long hash(EnumFieldValue v) {
++    return hasher.hashInt(v.toInt().intValue()).asLong();
++  }
++
+   /**
+    * {@inheritDoc}
+    */
+@@ -617,6 +701,11 @@ class DateStatsValues extends AbstractStatsValues<Date> {
+     this.computeSum = statsField.calculateStats(Stat.sum);
+     this.computeSumOfSquares = statsField.calculateStats(Stat.sumOfSquares);
+   }
++
++  @Override
++  public long hash(Date v) {
++    return hasher.hashLong(v.getTime()).asLong();
++  }
+   
+   @Override
+   public void accumulate(int docID) {
+@@ -716,6 +805,12 @@ class StringStatsValues extends AbstractStatsValues<String> {
+   public StringStatsValues(StatsField statsField) {
+     super(statsField);
+   }
++
++  @Override
++  public long hash(String v) {
++    // NOTE: renamed hashUnencodedChars starting with guava 15
++    return hasher.hashString(v).asLong();
++  }
+   
+   @Override
+   public void accumulate(int docID) {
+diff --git a/solr/core/src/test/org/apache/solr/TestDistributedSearch.java b/solr/core/src/test/org/apache/solr/TestDistributedSearch.java
+index e18d300..d1b73d8 100644
+--- a/solr/core/src/test/org/apache/solr/TestDistributedSearch.java
++++ b/solr/core/src/test/org/apache/solr/TestDistributedSearch.java
+@@ -422,7 +422,47 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+     query("q","*:*", "sort",i1+" desc", "stats", "true", "stats.field", i1);
+     query("q","*:*", "sort",i1+" desc", "stats", "true", "stats.field", tdate_a);
+     query("q","*:*", "sort",i1+" desc", "stats", "true", "stats.field", tdate_b);
+-    
++
++
++    rsp = query("q", "*:*", "sort", i1 + " desc", "stats", "true", 
++                "stats.field", "{!cardinality='true'}" + oddField,
++                "stats.field", "{!cardinality='true'}" + tlong);
++
++    { // don't leak variabls
++
++      // long
++      FieldStatsInfo s = rsp.getFieldStatsInfo().get(tlong);
++      assertNotNull("missing stats", s);
++      assertEquals("wrong cardinality", new Long(13), s.getCardinality());
++      //
++      assertNull("expected null for min", s.getMin());
++      assertNull("expected null for mean", s.getMean());
++      assertNull("expected null for count", s.getCount());
++      assertNull("expected null for calcDistinct", s.getCountDistinct());
++      assertNull("expected null for distinct vals", s.getDistinctValues());
++      assertNull("expected null for max", s.getMax());
++      assertNull("expected null for missing", s.getMissing());
++      assertNull("expected null for stddev", s.getStddev());
++      assertNull("expected null for sum", s.getSum());
++      assertNull("expected null for percentiles", s.getSum());
++
++      // string
++      s = rsp.getFieldStatsInfo().get(oddField);
++      assertNotNull("missing stats", s);
++      assertEquals("wrong cardinality", new Long(1), s.getCardinality());
++      //
++      assertNull("expected null for min", s.getMin());
++      assertNull("expected null for mean", s.getMean());
++      assertNull("expected null for count", s.getCount());
++      assertNull("expected null for calcDistinct", s.getCountDistinct());
++      assertNull("expected null for distinct vals", s.getDistinctValues());
++      assertNull("expected null for max", s.getMax());
++      assertNull("expected null for missing", s.getMissing());
++      assertNull("expected null for stddev", s.getStddev());
++      assertNull("expected null for sum", s.getSum());
++      assertNull("expected null for percentiles", s.getSum());
++    }
++
+     query("q", "*:*", "sort", i1 + " desc", "stats", "true", "stats.field",
+         "{!percentiles='1,2,3,4,5'}" + i1);
+     
+@@ -510,6 +550,7 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+       assertNull("expected null for stddev", s.getStddev());
+       assertNull("expected null for sum", s.getSum());
+       assertNull("expected null for percentiles", s.getPercentiles());
++      assertNull("expected null for cardinality", s.getCardinality());
+ 
+       // sanity check deps relationship
+       for (Stat dep : EnumSet.of(Stat.sum, Stat.count)) {
+@@ -566,6 +607,7 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+       assertNull("expected null for missing", s.getMissing());
+       assertNull("expected null for sum", s.getSum());
+       assertNull("expected null for percentiles", s.getPercentiles());
++      assertNull("expected null for cardinality", s.getCardinality());
+     }
+ 
+     // request stats, but disable them all via param refs
+@@ -587,6 +629,7 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+       assertNull("expected null for missing", s.getMissing());
+       assertNull("expected null for sum", s.getSum());
+       assertNull("expected null for percentiles", s.getPercentiles());
++      assertNull("expected null for cardinality", s.getCardinality());
+     }
+ 
+     final String[] stats = new String[] {
+@@ -672,6 +715,7 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+       assertNull(p+" expected null for stddev", s.getStddev());
+       assertNull(p+" expected null for sum", s.getSum());
+       assertNull(p+" expected null for percentiles", s.getPercentiles());
++      assertNull(p+" expected null for cardinality", s.getCardinality());
+       
+     }
+ 
+@@ -706,7 +750,8 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+       assertNull(p+" expected null for missing", s.getMissing());
+       assertNull(p+" expected null for stddev", s.getStddev());
+       assertNull(p+" expected null for sum", s.getSum());
+-      assertNull(p+"expected null for percentiles", s.getPercentiles());
++      assertNull(p+" expected null for percentiles", s.getPercentiles());
++      assertNull(p+" expected null for cardinality", s.getCardinality());
+       
+     }
+ 
+@@ -732,6 +777,7 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+       assertNull("expected null for missing", s.getMissing());
+       assertNull("expected null for sum", s.getSum());
+       assertNull("expected null for percentiles", s.getPercentiles());
++      assertNull("expected null for cardinality", s.getCardinality());
+     }
+ 
+     // look at stats on non numeric fields
+@@ -793,7 +839,7 @@ public class TestDistributedSearch extends BaseDistributedSearchTestCase {
+     }
+     assertEquals("Sanity check failed: either test broke, or test changed, or you adjusted Stat enum" + 
+                  " (adjust constant accordingly if intentional)",
+-                 3465, numTotalStatQueries);
++                 4235, numTotalStatQueries);
+ 
+ 
+     /*** TODO: the failure may come back in "exception"
+diff --git a/solr/core/src/test/org/apache/solr/handler/component/StatsComponentTest.java b/solr/core/src/test/org/apache/solr/handler/component/StatsComponentTest.java
+index 402dcbc..9425c02 100644
+--- a/solr/core/src/test/org/apache/solr/handler/component/StatsComponentTest.java
++++ b/solr/core/src/test/org/apache/solr/handler/component/StatsComponentTest.java
+@@ -19,12 +19,14 @@ package org.apache.solr.handler.component;
+ import java.nio.ByteBuffer;
+ import java.text.DateFormat;
+ import java.text.SimpleDateFormat;
++import java.util.Arrays;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Date;
+ import java.util.Iterator;
+ import java.util.EnumSet;
+ import java.util.HashMap;
++import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+@@ -33,6 +35,8 @@ import java.util.TimeZone;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.queries.function.valuesource.QueryValueSource;
++import org.apache.solr.common.SolrException;
++import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.params.CommonParams;
+ import org.apache.solr.common.params.MapSolrParams;
+ import org.apache.solr.common.params.SolrParams;
+@@ -42,6 +46,7 @@ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.common.util.StrUtils;
+ import org.apache.solr.core.SolrCore;
+ import org.apache.solr.handler.component.StatsField.Stat;
++import org.apache.solr.handler.component.StatsField.HllOptions;
+ import org.apache.solr.request.LocalSolrQueryRequest;
+ import org.apache.solr.request.SolrQueryRequest;
+ import org.apache.solr.response.SolrQueryResponse;
+@@ -50,6 +55,9 @@ import org.apache.solr.util.AbstractSolrTestCase;
+ 
+ import org.apache.commons.math3.util.Combinations;
+ import com.tdunning.math.stats.AVLTreeDigest;
++import net.agkn.hll.HLL;
++import com.google.common.hash.Hashing; 
++import com.google.common.hash.HashFunction; 
+ 
+ import org.junit.BeforeClass;
+ 
+@@ -196,7 +204,6 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+                 , kpre + "double[@name='stddev'][.='12.909944487358056']"
+ 
+                 );
+-
+       }
+     }
+ 
+@@ -257,6 +264,17 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             , kpre + "double[@name='mean'][.='-50.0']" 
+             , kpre + "double[@name='stddev'][.='25.81988897471611']"
+             );
++
++    // simple cardinality over a numeric field
++    assertQ("test function statistics & key override", 
++            // NOTE: baseParams aren't used, we're looking only at the cardinality
++            req("q", "*:*", "stats", "true",
++                "fq", "{!tag=key_ex_tag}-id:4", 
++                "stats.field", "{!key="+key+" cardinality=true}"+f)
++
++            , kpre + "long[@name='cardinality'][.='3']"
++            , "count(" + kpre + "/*)=1"
++            );
+   }
+ 
+   
+@@ -358,6 +376,10 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+               );
+     }
+ 
++    assertQ("cardinality"
++            , req("q", "*:*", "rows", "0", "stats", "true", "stats.field", "{!cardinality=true}" + f) 
++            , "//long[@name='cardinality'][.='8']"
++            );
+   }
+ 
+   public void testFieldStatisticsResultsStringField() throws Exception {
+@@ -384,6 +406,13 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             "//long[@name='countDistinct'][.='3']",
+             "count(//arr[@name='distinctValues']/str)=3");
+ 
++    assertQ("test string cardinality"
++            , req("q", "*:*",
++                  "rows", "0",
++                  "stats","true",
++                  "stats.field","{!cardinality=true}active_s")
++            , "//long[@name='cardinality'][.='3']");
++
+     // stats over a string function
+     assertQ("strdist func stats",
+             req("q", "*:*",
+@@ -430,6 +459,11 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+         //  "//date[@name='sum'][.='1970-01-13T20:38:30Z']",  // sometimes 29.999Z
+         //  "//date[@name='mean'][.='1970-01-07T10:19:15Z']"  // sometiems 14.999Z
+             );
++
++    assertQ("cardinality", 
++            req("q","*:*", "stats", "true", "stats.field", "{!cardinality=true}active_dt")
++            , "//lst[@name='active_dt']/long[@name='cardinality'][.='2']");
++
+   }
+ 
+ 
+@@ -595,6 +629,16 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+               , pre+"/lst[@name='false']/double[@name='stddev'][.='7.0710678118654755']"
+               );
+     }
++
++    assertQ("stats.facet w/ cardinality"
++            , req("q", "*:*", "stats", "true", 
++                  "fq", "-other_s:bar",
++                  "stats.facet", "active_s", 
++                  "stats.field", "{!cardinality=true}"+f)
++            , pre+"/lst[@name='true' ]/long[@name='cardinality'][.='1']"
++            , pre+"/lst[@name='false']/long[@name='cardinality'][.='2']"
++            );
++
+   }
+   
+   public void doTestFacetStatisticsMissingResult(String f, SolrParams[] baseParamsSet) throws Exception {
+@@ -637,6 +681,13 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+               );
+     }
+ 
++    assertQ("stats.facet w/ cardinality"
++            , req("q", "*:*", "stats", "true", 
++                  "stats.facet", "active_s", 
++                  "stats.field", "{!cardinality=true}"+f)
++            , "//lst[@name='active_s']/lst[@name='true' ]/long[@name='cardinality'][.='2']"
++            , "//lst[@name='active_s']/lst[@name='false']/long[@name='cardinality'][.='1']"
++            );
+   }
+ 
+   public void testFieldStatisticsResultsNumericFieldAlwaysMissing() throws Exception {
+@@ -669,6 +720,14 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             ,"count(//lst[@name='active_i']/*)=8"
+             
+             );
++
++    // NOTE: empty set percentiles covered in testPercentiles()
++
++    assertQ("test cardinality of missing"
++            , req("q", "*:*", "stats", "true", "stats.field", "{!cardinality=true}active_i")
++            ,"//lst[@name='active_i']/long[@name='cardinality'][.='0']"
++            );
++
+   }
+ 
+   public void testFieldStatisticsResultsStringFieldAlwaysMissing() throws Exception {
+@@ -695,7 +754,13 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             ,"//lst[@name='active_s']/null[@name='max']"
+             // if new stats are supported, this will break - update test to assert values for each
+             ,"count(//lst[@name='active_s']/*)=4"
+-         );
++            );
++
++    assertQ("test string statistics values"
++            , req("q", "*:*", "stats", "true", "stats.field", "{!cardinality=true}active_s")
++            ,"//lst[@name='active_s']/long[@name='cardinality'][.='0']"
++            );
++
+   }
+ 
+   //SOLR-3160
+@@ -729,6 +794,12 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             // if new stats are supported, this will break - update test to assert values for each
+             ,"count(//lst[@name='active_dt']/*)=8"
+             );
++    
++    assertQ("cardinality"
++            , req("q","*:*", "stats", "true", "stats.field", "{!cardinality=true}active_dt")
++            ,"//lst[@name='active_dt']/long[@name='cardinality'][.='0']"
++            );
++
+   }
+ 
+   public void testStatsFacetMultivaluedErrorHandling() throws Exception {
+@@ -822,6 +893,10 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+         , "//lst[@name='cat_docValues']/str[@name='min'][.='test']"
+         , "//lst[@name='cat_docValues']/str[@name='max'][.='testtw']");
+     
++    assertQ("cardinality", 
++            req("q","*:*", "stats", "true", "stats.field", "{!cardinality=true}cat_docValues")
++            , "//lst[@name='cat_docValues']/long[@name='cardinality'][.='3']");
++    
+   }
+ 
+   public void testFieldStatisticsDocValuesAndMultiValuedInteger() throws Exception {
+@@ -868,7 +943,11 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+           , "//lst[@name='" + fieldName + "']/double[@name='sumOfSquares'][.='470.0']"
+           , "//lst[@name='" + fieldName + "']/long[@name='missing'][.='0']");
+ 
+-    }
++    assertQ("cardinality", 
++            req("q","*:*", "stats", "true", "stats.field", "{!cardinality=true}" + fieldName)
++            , "//lst[@name='"+fieldName+"']/long[@name='cardinality'][.='9']");
++
++  }
+ 
+   public void testFieldStatisticsDocValuesAndMultiValuedIntegerFacetStats() throws Exception {
+        SolrCore core = h.getCore();
+@@ -1054,6 +1133,11 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+               ,"count(//lst[@name='" + fieldName + "']/*)=10"
+               );
+     }
++
++    assertQ("cardinality", 
++            req("q","*:*", "stats", "true", "stats.field", "{!cardinality=true}"+fieldName)
++            , "//lst[@name='"+fieldName+"']/long[@name='cardinality'][.='9']");
++
+   }
+   
+   public void testEnumFieldTypeStatus() throws Exception {
+@@ -1088,7 +1172,10 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             , "//lst[@name='" + fieldName + "']/str[@name='max'][.='Critical']"
+             , "//lst[@name='" + fieldName + "']/long[@name='count'][.='15']"
+             , "//lst[@name='" + fieldName + "']/long[@name='missing'][.='11']");
+-    
++
++    assertQ("cardinality", 
++            req("q","*:*", "stats", "true", "stats.field", "{!cardinality=true}"+fieldName)
++            , "//lst[@name='" + fieldName + "']/long[@name='cardinality'][.='5']");
+     
+     assertQ("enum calcdistinct", req("q","*:*", "stats", "true", "stats.field", fieldName, 
+                                      StatsParams.STATS_CALC_DISTINCT, "true")
+@@ -1139,12 +1226,60 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+     return cat_docValues;
+   }
+   
++  /** Convinience struct used in {@link #testIndividualStatLocalParams} */
++  private static final class ExpectedStat {
++    public final static String KPRE = XPRE + "lst[@name='stats_fields']/lst[@name='k']/";
++    public final Stat stat;
++    public final String input;
++    public final int numResponseKeys; // all because calcdistinct is obnoxious
++    public final List<String> perShardXpaths;
++    public final List<String> finalXpaths;
++    
++    public final static Map<Stat,ExpectedStat> ALL = new LinkedHashMap<Stat,ExpectedStat>();
++    private ExpectedStat(Stat stat, String input, int numResponseKeys,
++                         List<String> perShardXpaths, List<String> finalXpaths) {
++      this.stat = stat;
++      this.input = input;
++      this.numResponseKeys = numResponseKeys;
++      this.perShardXpaths = perShardXpaths;
++      this.finalXpaths = finalXpaths;
++    }
++    
++    public static void createSimple(Stat stat, String input, String type, String result) {
++      EnumSet<Stat> deps = stat.getDistribDeps();
++      List<String> perShardXpaths = new ArrayList<String>(deps.size());
++      String xpath = KPRE + type + "[@name='" + stat + "'][.='" + result + "']";
++      for (Stat dep : deps) {
++        if (dep.equals(stat)) { // self dependency
++          perShardXpaths.add(xpath);;
++        } else {
++          ExpectedStat expectedDep = ALL.get(dep);
++          assertNotNull("can't find dep in ExpectedStat.ALL", expectedDep);
++          perShardXpaths.addAll(expectedDep.perShardXpaths);
++        }
++      }
++      ALL.put(stat, new ExpectedStat(stat, input, 1, 
++                                     perShardXpaths, Collections.singletonList(xpath)));
++    }
++    public static void create(Stat stat, String input, int numResponseKeys,
++                              List<String> perShardXpaths, List<String> finalXpaths) {
++      ALL.put(stat, new ExpectedStat(stat, input, numResponseKeys, perShardXpaths, finalXpaths));
++    }
++  }
++  
+   public void testIndividualStatLocalParams() throws Exception {
+-    final String kpre = XPRE + "lst[@name='stats_fields']/lst[@name='k']/";
++    final String kpre = ExpectedStat.KPRE;
+     
+     assertU(adoc("id", "1", "a_f", "2.3", "b_f", "9.7", "a_i", "9", "foo_t", "how now brown cow"));
+     assertU(commit());
++
++    SolrCore core = h.getCore();
++    SchemaField field = core.getLatestSchema().getField("a_i");
++    HllOptions hllOpts = HllOptions.parseHllOptions(params("cardinality","true"), field);
+     
++    HLL hll = hllOpts.newHLL();
++    HashFunction hasher = hllOpts.getHasher();
++
+     AVLTreeDigest tdigest = new AVLTreeDigest(100);
+     
+     // some quick sanity check assertions...
+@@ -1156,7 +1291,7 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             , kpre + "double[@name='min'][.='9.0']"
+             , "count(" + kpre + "*)=2"
+             );
+-
++    
+     // for stats that are true/false, sanity check false does it's job
+     assertQ("min=true & max=false: only min should come back",
+             req("q","*:*", "stats", "true",
+@@ -1173,147 +1308,127 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+             // ...but be empty 
+             , "count(" + kpre + "*)=0"
+             );
+-
++    
+     double sum = 0;
+     double sumOfSquares = 0;
+     final int count = 20;
+     for (int i = 0; i < count; i++) {
++      int a_i = i % 10;
+       assertU(adoc("id", String.valueOf(i), "a_f", "2.3", "b_f", "9.7", "a_i",
+-          String.valueOf(i % 10), "foo_t", "how now brown cow"));
+-      tdigest.add(i % 10);
+-      sum += i % 10;
+-      sumOfSquares += (i % 10) * (i % 10);
++                   String.valueOf(a_i), "foo_t", "how now brown cow"));
++      tdigest.add(a_i);
++      hll.addRaw(hasher.hashInt(a_i).asLong());
++      sum += a_i;
++      sumOfSquares += (a_i) * (a_i);
+     }
+-   
++    double stddev = Math.sqrt(((count * sumOfSquares) - (sum * sum))/ (20 * (count - 1.0D)));
++    
+     assertU(commit());
+     
+-    ByteBuffer buf = ByteBuffer.allocate(tdigest.smallByteSize());
+-    tdigest.asSmallBytes(buf);
++    ByteBuffer tdigestBuf = ByteBuffer.allocate(tdigest.smallByteSize());
++    tdigest.asSmallBytes(tdigestBuf);
++    byte[] hllBytes = hll.toBytes();
++
+     EnumSet<Stat> allStats = EnumSet.allOf(Stat.class);
+     
+-    Map<Stat,String> expectedStats = new HashMap<>();
+-    expectedStats.put(Stat.min, "0.0");
+-    expectedStats.put(Stat.max, "9.0");
+-    expectedStats.put(Stat.missing, "0");
+-    expectedStats.put(Stat.sum, String.valueOf(sum));
+-    expectedStats.put(Stat.count, String.valueOf(count));
+-    expectedStats.put(Stat.mean, String.valueOf(sum / count));
+-    expectedStats.put(Stat.sumOfSquares, String.valueOf(sumOfSquares));
+-    expectedStats.put(Stat.stddev, String.valueOf(Math.sqrt(((count * sumOfSquares) - (sum * sum))/ (20 * (count - 1.0D)))));
+-    expectedStats.put(Stat.calcdistinct, "10");
+-    // NOTE: per shard expected value
+-    expectedStats.put(Stat.percentiles, Base64.byteArrayToBase64(buf.array(), 0, buf.array().length));
++    final List<ExpectedStat> expected = new ArrayList<ExpectedStat>(allStats.size());
++    ExpectedStat.createSimple(Stat.min, "true", "double", "0.0");
++    ExpectedStat.createSimple(Stat.max, "true", "double", "9.0");
++    ExpectedStat.createSimple(Stat.missing, "true", "long", "0");
++    ExpectedStat.createSimple(Stat.sum, "true", "double", String.valueOf(sum));
++    ExpectedStat.createSimple(Stat.count, "true", "long", String.valueOf(count));
++    ExpectedStat.createSimple(Stat.mean, "true", "double", String.valueOf(sum / count));
++    ExpectedStat.createSimple(Stat.sumOfSquares, "true", "double", String.valueOf(sumOfSquares));
++    ExpectedStat.createSimple(Stat.stddev, "true", "double", String.valueOf(stddev));
++    final String countDistinctXpath = kpre + "long[@name='countDistinct'][.='10']";
++    ExpectedStat.create(Stat.calcdistinct, "true", 2,
++                        Arrays.asList("count(" + kpre + "arr[@name='distinctValues']/*)=10",
++                                      countDistinctXpath),
++                        Collections.singletonList(countDistinctXpath));
++    final String percentileShardXpath = kpre + "str[@name='percentiles'][.='" 
++      + Base64.byteArrayToBase64(tdigestBuf.array(), 0, tdigestBuf.array().length) + "']";
++    final String p90 = "" + tdigest.quantile(0.90D);
++    final String p99 = "" + tdigest.quantile(0.99D);
++    ExpectedStat.create(Stat.percentiles, "'90, 99'", 1,
++                        Collections.singletonList(percentileShardXpath),
++                        Arrays.asList("count(" + kpre + "lst[@name='percentiles']/*)=2",
++                                      kpre + "lst[@name='percentiles']/double[@name='90.0'][.="+p90+"]",
++                                      kpre + "lst[@name='percentiles']/double[@name='99.0'][.="+p99+"]"));
++    final String cardinalityShardXpath = kpre + "str[@name='cardinality'][.='" 
++      + Base64.byteArrayToBase64(hllBytes, 0, hllBytes.length) + "']";
++    final String cardinalityXpath = kpre + "long[@name='cardinality'][.='10']"; 
++    ExpectedStat.create(Stat.cardinality, "true", 1,
++                        Collections.singletonList(cardinalityShardXpath),
++                        Collections.singletonList(cardinalityXpath));
++
++    // canary in the coal mine
++    assertEquals("num of ExpectedStat doesn't match all known stats; " + 
++                 "enum was updated w/o updating test?",
++                 ExpectedStat.ALL.size(), allStats.size());
+     
+-    Map<Stat,String> expectedType = new HashMap<>();
+-    expectedType.put(Stat.min, "double");
+-    expectedType.put(Stat.max, "double");
+-    expectedType.put(Stat.missing, "long");
+-    expectedType.put(Stat.sum, "double");
+-    expectedType.put(Stat.count, "long");
+-    expectedType.put(Stat.mean, "double");
+-    expectedType.put(Stat.sumOfSquares, "double");
+-    expectedType.put(Stat.stddev, "double");
+-    expectedType.put(Stat.calcdistinct, "long");
+-    expectedType.put(Stat.percentiles, "str");
+-   
+-    Map<Stat,String> localParasInput = new HashMap<>();
+-    localParasInput.put(Stat.min, "true");
+-    localParasInput.put(Stat.max, "true");
+-    localParasInput.put(Stat.missing, "true");
+-    localParasInput.put(Stat.sum, "true");
+-    localParasInput.put(Stat.count, "true");
+-    localParasInput.put(Stat.mean, "true");
+-    localParasInput.put(Stat.sumOfSquares, "true");
+-    localParasInput.put(Stat.stddev, "true");
+-    localParasInput.put(Stat.calcdistinct, "true");
+-    localParasInput.put(Stat.percentiles, "'90, 99'");
+-
+-   // canary in the coal mine
+-   assertEquals("size of expectedStats doesn't match all known stats; " + 
+-                "enum was updated w/o updating test?",
+-                expectedStats.size(), allStats.size());
+-   assertEquals("size of expectedType doesn't match all known stats; " + 
+-                "enum was updated w/o updating test?",
+-                expectedType.size(), allStats.size());
+-
+-   // whitebox test: explicitly ask for isShard=true with an individual stat
+-   for (Stat stat : expectedStats.keySet()) {
+-     EnumSet<Stat> distribDeps = stat.getDistribDeps();
+-
+-     StringBuilder exclude = new StringBuilder();
+-     List<String> testParas = new ArrayList<String>(distribDeps.size() + 2);
+-     int calcdistinctFudge = 0;
+-
+-     for (Stat perShardStat : distribDeps ){
+-       String key = perShardStat.toString();
+-       if (perShardStat.equals(Stat.calcdistinct)) {
+-         // this abomination breaks all the rules - uses a diff response key and triggers
+-         // the additional "distinctValues" stat
+-         key = "countDistinct";
+-         calcdistinctFudge++;
+-         testParas.add("count(" + kpre + "arr[@name='distinctValues']/*)=10");
+-       }
+-       testParas.add(kpre + expectedType.get(perShardStat) + 
+-                     "[@name='" + key + "'][.='" + expectedStats.get(perShardStat) + "']");
+-       // even if we go out of our way to exclude the dependent stats, 
+-       // the shard should return them since they are a dependency for the requested stat
+-       if (!stat.equals(Stat.percentiles)){
+-         exclude.append(perShardStat + "=false ");
+-       }
+-     }
+-     testParas.add("count(" + kpre + "*)=" + (distribDeps.size() + calcdistinctFudge));
+-
+-     assertQ("ask for only "+stat+", with isShard=true, and expect only deps: " + distribDeps,
+-             req("q", "*:*", "isShard", "true", "stats", "true", 
+-                 "stats.field", "{!key=k " + exclude + stat +"=" + localParasInput.get(stat) + "}a_i")
+-             , testParas.toArray(new String[testParas.size()])
+-             );
+-   }
+-   
+-   // test all the possible combinations (of all possible sizes) of stats params
+-   for (int numParams = 1; numParams <= allStats.size(); numParams++) {
+-     for (EnumSet<Stat> set : new StatSetCombinations(numParams, allStats)) {
+-
+-       // EnumSets use natural ordering, we want to randomize the order of the params
+-       List<Stat> combo = new ArrayList<Stat>(set);
+-       Collections.shuffle(combo, random());
+-
+-       StringBuilder paras = new StringBuilder("{!key=k ");
+-       List<String> testParas = new ArrayList<String>(numParams + 2);
+-
+-       int calcdistinctFudge = 0;
+-       for (Stat stat : combo) {
+-         String key = stat.toString();
+-         if (stat.equals(Stat.calcdistinct)) {
+-           // this abomination breaks all the rules - uses a diff response key and triggers
+-           // the additional "distinctValues" stat
+-           key = "countDistinct";
+-           calcdistinctFudge++; 
+-           testParas.add("count(" + kpre + "arr[@name='distinctValues']/*)=10");
+-         }
+-         paras.append(stat + "=" + localParasInput.get(stat)+ " ");
+-         
+-         if (!stat.equals(Stat.percentiles)){
+-           testParas.add(kpre + expectedType.get(stat) + "[@name='" + key + "'][.='" + expectedStats.get(stat) + "']");
+-         } else {
+-           testParas.add("count(" + kpre + "lst[@name='percentiles']/*)=2");
+-           String p90 = "" + tdigest.quantile(0.90D);
+-           String p99 = "" + tdigest.quantile(0.99D);
+-           testParas.add(kpre + "lst[@name='percentiles']/double[@name='90.0'][.="+p90+"]");
+-           testParas.add(kpre + "lst[@name='percentiles']/double[@name='99.0'][.="+p99+"]");
+-         }
+-       }
+-
+-       paras.append("}a_i");
+-       testParas.add("count(" + kpre + "*)=" + (combo.size() + calcdistinctFudge));
+-
+-       assertQ("ask for an get only: "+ combo,
+-               req("q","*:*", "stats", "true",
+-                   "stats.field", paras.toString())
+-               , testParas.toArray(new String[testParas.size()])
+-               );
+-     }
+-   }
++    // whitebox test: explicitly ask for isShard=true with each individual stat
++    for (ExpectedStat expect : ExpectedStat.ALL.values()) {
++      Stat stat = expect.stat;
++
++      StringBuilder exclude = new StringBuilder();
++      List<String> testXpaths = new ArrayList<String>(5 + expect.perShardXpaths.size());
++      testXpaths.addAll(expect.perShardXpaths);
++
++      int numKeysExpected = 0;
++      EnumSet<Stat> distribDeps = stat.getDistribDeps();
++      for (Stat perShardDep : distribDeps) {
++        numKeysExpected += ExpectedStat.ALL.get(perShardDep).numResponseKeys;
++
++        // even if we go out of our way to exclude the dependent stats, 
++        // the shard should return them since they are a dependency for the requested stat
++        if (!stat.equals(perShardDep)){
++          // NOTE: this only works because all the cases where there are distribDeps
++          // beyond a self dependency are simple true/false options
++          exclude.append(perShardDep + "=false ");
++        }
++      }
++      // we don't want to find anything we aren't expecting
++      testXpaths.add("count(" + kpre + "*)=" + numKeysExpected);
++
++      assertQ("ask for only "+stat+", with isShard=true, and expect only deps: " + distribDeps,
++              req("q", "*:*", "isShard", "true", "stats", "true", 
++                  "stats.field", "{!key=k " + exclude + stat +"=" + expect.input + "}a_i")
++              , testXpaths.toArray(new String[testXpaths.size()])
++              );
++    }
++    
++    // test all the possible combinations (of all possible sizes) of stats params
++    for (int numParams = 1; numParams <= allStats.size(); numParams++) {
++      for (EnumSet<Stat> set : new StatSetCombinations(numParams, allStats)) {
++        // EnumSets use natural ordering, we want to randomize the order of the params
++        List<Stat> combo = new ArrayList<Stat>(set);
++        Collections.shuffle(combo, random());
++        
++        StringBuilder paras = new StringBuilder("{!key=k ");
++        List<String> testXpaths = new ArrayList<String>(numParams + 5);
++
++        int numKeysExpected = 0;
++        for (Stat stat : combo) {
++          ExpectedStat expect = ExpectedStat.ALL.get(stat);
++
++          paras.append(stat + "=" + expect.input + " ");
++
++          numKeysExpected += expect.numResponseKeys;
++          testXpaths.addAll(expect.finalXpaths);
++        }
++
++        paras.append("}a_i");
++
++        // we don't want to find anything we aren't expecting
++        testXpaths.add("count(" + kpre + "*)=" + numKeysExpected);
++
++        assertQ("ask for and get only: "+ combo,
++                req("q","*:*", "stats", "true",
++                    "stats.field", paras.toString())
++                , testXpaths.toArray(new String[testXpaths.size()])
++                );
++      }
++    }
+   }
+   
+   // Test for Solr-6349
+@@ -1436,6 +1551,285 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+     }
+   }
+ 
++  /** Helper used in {@link #testCardinality} */
++  public static String cardinalityXpath(String key, int cardinality) {
++    return XPRE + "lst[@name='stats_fields']/lst[@name='" + key + 
++      "']/long[@name='cardinality'][.='"+cardinality+"']";
++  }
++
++  /** @see #testHllOptions */
++  public void testCardinality() throws Exception {
++    SolrCore core = h.getCore();
++    // insure we have the same hasher a_l would use
++    HashFunction hasher = HllOptions.parseHllOptions
++      (params("cardinality","true"), core.getLatestSchema().getField("a_l")).getHasher();
++
++    String[] baseParams = new String[] { "q","*:*", "stats","true", "indent","true", "rows","0" };
++    assertQ("empty cardinalities"
++            , req(params("stats.field","{!key=a cardinality=true}a_l",
++                         "stats.field","{!key=pa cardinality=true}prehashed_a_l",
++                         "stats.field","{!key=b cardinality=true}b_l", 
++                         "stats.field","{!key=c cardinality=true}c_l"), 
++                  baseParams)
++            , cardinalityXpath("a", 0)
++            , cardinalityXpath("pa", 0)
++            , cardinalityXpath("b", 0)
++            , cardinalityXpath("c", 0)
++            );
++
++    int id = 0;
++    // add trivial docs to test basic cardinality
++    for (int i = 0; i < 100; i++) {
++      // add the same values multiple times (diff docs)
++      for (int j =0; j < 5; j++) {
++        ++id;
++        assertU(adoc("id", ""+id, 
++                     "a_l", ""+i, "prehashed_a_l", ""+hasher.hashLong((long)i).asLong(),
++                     "b_l", ""+(i % 7), "c_l", ""+id));
++      }
++    }
++    assertU(commit());
++
++    assertQ("various cardinalities"
++            , req(params("stats.field","{!key=a cardinality=true}a_l",
++                         "stats.field","{!key=pa hllPreHashed=true cardinality=true}prehashed_a_l",
++                         "stats.field","{!key=b cardinality=true}b_l", 
++                         "stats.field","{!key=c cardinality=true}c_l"), 
++                  baseParams)
++            , cardinalityXpath("a", 100)
++            , cardinalityXpath("pa", 100)
++            , cardinalityXpath("b", 7)
++            , cardinalityXpath("c", 500)
++            );
++    
++    // various ways of explicitly saying "don't bother to compute cardinality"
++    for (SolrParams p : new SolrParams[] {
++        params("stats.field","{!key=a min=true cardinality=false}a_l"),
++        params("stats.field","{!key=a min=true cardinality=$doit}a_l", "doit", "false"),
++        params("stats.field","{!key=a min=true cardinality=$doit}a_l"), // missing doit param
++        // other tunning options shouldn't change things
++        params("stats.field","{!key=a min=true hllPreHashed=true cardinality=false}a_l"),
++        params("stats.field","{!key=a min=true hllRegwidth=4 cardinality=$doit}a_l", "doit", "false"),
++        params("stats.field","{!key=a min=true hllLog2m=18 cardinality=$doit}a_l"), // missing doit param
++      }) {
++      assertQ("min w/cardinality explicitly disabled", req(p, baseParams),
++              "count(//lst[@name='stats_fields']/lst[@name='a']/double[@name='min'])=1",
++              "count(//lst[@name='stats_fields']/lst[@name='a']/long[@name='cardinality'])=0");
++    }
++  }
++
++  /**
++   * whitebox test that HLL Option parsing does the right thing
++   * @see #testCardinality 
++   * @see #testHllOptionsErrors
++   */
++  public void testHllOptions() throws Exception {
++    SolrCore core = h.getCore();
++
++    SchemaField field_l = core.getLatestSchema().getField("field_l");
++    SchemaField field_d = core.getLatestSchema().getField("field_d");
++    SchemaField field_dt = core.getLatestSchema().getField("field_dt");
++    SchemaField field_s = core.getLatestSchema().getField("field_s");
++    SchemaField field_i = core.getLatestSchema().getField("field_i");
++    SchemaField field_f = core.getLatestSchema().getField("field_f");
++    SchemaField field_severity = core.getLatestSchema().getField("severity");
++
++    // simple cases that shouldn't use HLL
++    assertNull(HllOptions.parseHllOptions(params(), field_l));
++    assertNull(HllOptions.parseHllOptions(params("cardinality","false"), field_l));
++
++    // sanity check, future proof againts the HLL library changing stuff on us
++    assertEquals("HLL Changed definition min for log2m, " + 
++                 "need to note in upgrade instructions and maybe adjust accuracy hueristic",
++                 4, HLL.MINIMUM_LOG2M_PARAM);
++    // NOTE: https://github.com/aggregateknowledge/java-hll/issues/14
++    assertEquals("HLL Changed definition max for log2m, " + 
++                 "need to note in upgrade instructions and maybe adjust accuracy hueristic",
++                 30, HLL.MAXIMUM_LOG2M_PARAM);
++    assertEquals("HLL Changed definition min for regwidth, " + 
++                 "need to note in upgrade instructions and probably adjust hueristic",
++                 1, HLL.MINIMUM_REGWIDTH_PARAM);
++    assertEquals("HLL Changed definition max for regwidth, " + 
++                 "need to note in upgrade instructions and probably adjust hueristic",
++                 8, HLL.MAXIMUM_REGWIDTH_PARAM);
++
++    // all of these should produce equivilent HLLOptions (Long, Double, or String using defaults)
++    SolrParams[] longDefaultParams = new SolrParams[] {
++      // basic usage
++      params("cardinality","true"),
++      params("cardinality","0.33"),
++
++      // expert level options
++      params("cardinality","true", "hllLog2m","13"), 
++      params("cardinality","true", "hllRegwidth","6"), 
++      params("cardinality","true", "hllPreHash","false"),
++      params("cardinality","true", "hllLog2m","13", "hllRegwidth","6", "hllPreHash", "false"),
++
++      // explicit hllLog2M should override numeric arg
++      params("cardinality","1.0", "hllLog2m","13", "hllRegwidth","6"),
++      params("cardinality","0.0", "hllLog2m","13", "hllRegwidth","6", "hllPreHash","false")
++    };
++    for (SchemaField field : new SchemaField[] { field_l, field_d, field_dt, field_s }) {
++      final String f = field.getName();
++      for (SolrParams p : longDefaultParams) {
++        HllOptions opts = HllOptions.parseHllOptions(p, field);
++        assertEquals(f + " long defaults: " + p, 13, opts.getLog2m());
++        assertEquals(f + " long defaults: " + p, 6, opts.getRegwidth());
++        assertNotNull(f + " long defaults: " + p, opts.getHasher());
++      }
++
++      // non defaults: lower/upper accuracy bounds should give min/max log2m & adjusted regwidth
++      HllOptions optsMin = HllOptions.parseHllOptions(params("cardinality","0"), field);
++      assertEquals(f + " min log2m", HLL.MINIMUM_LOG2M_PARAM, optsMin.getLog2m());
++      assertEquals(f + " min regwidth", 5, optsMin.getRegwidth()); // lowest hueristic for 64bit
++
++      HllOptions optsMax = HllOptions.parseHllOptions(params("cardinality","1"), field);
++      assertEquals(f + " max log2m", HLL.MAXIMUM_LOG2M_PARAM, optsMax.getLog2m());
++      assertEquals(f + " max regwidth", HLL.MAXIMUM_REGWIDTH_PARAM, optsMax.getRegwidth());
++
++    }
++
++    // all of these should produce equivilent HLLOptions (Int, Float, or ValueSource using defaults)
++    SolrParams[] intDefaultParams = new SolrParams[] {
++      // basic usage
++      params("cardinality","true"),
++      params("cardinality","0.33"),
++
++      // expert level options
++      params("cardinality","true", "hllLog2m","13"), 
++      params("cardinality","true", "hllRegwidth","5"), 
++      params("cardinality","true", "hllPreHash","false"),
++      params("cardinality","true", "hllLog2m","13", "hllRegwidth","5", "hllPreHash", "false"),
++
++      // explicit hllLog2M & hllRegwidth should override hueristic float arg
++      params("cardinality","1.0", "hllLog2m","13", "hllRegwidth","5"),
++      params("cardinality","0.0", "hllLog2m","13", "hllRegwidth","5", "hllPreHash","false")
++    };
++    for (SchemaField field : new SchemaField[] { field_i, field_f, field_severity, null }) {
++      final String f = null == field ? "(func)" : field.getName();
++      for (SolrParams p : intDefaultParams) {
++        HllOptions opts = HllOptions.parseHllOptions(p, field);
++        assertEquals(f + " int defaults: " + p, 13, opts.getLog2m());
++        assertEquals(f + " int defaults: " + p, 5, opts.getRegwidth());
++        assertNotNull(f + " int defaults: " + p, opts.getHasher());
++      }
++
++      // non defaults: lower/upper accuracy bounds should give min/max log2m & adjusted regwidth
++      HllOptions optsMin = HllOptions.parseHllOptions(params("cardinality","0"), field);
++      assertEquals(f + " min log2m", HLL.MINIMUM_LOG2M_PARAM, optsMin.getLog2m());
++      assertEquals(f + " min regwidth", 4, optsMin.getRegwidth()); // lowest hueristic for 32bit
++
++      HllOptions optsMax = HllOptions.parseHllOptions(params("cardinality","1"), field);
++      assertEquals(f + " max log2m", HLL.MAXIMUM_LOG2M_PARAM, optsMax.getLog2m());
++      assertEquals(f + " max regwidth", HLL.MAXIMUM_REGWIDTH_PARAM, optsMax.getRegwidth());
++
++    }
++
++    // basic pre-hashed arg check specifically for long fields
++    assertNotNull(HllOptions.parseHllOptions(params("cardinality","true"), field_l).getHasher());
++    assertNotNull(HllOptions.parseHllOptions(params("cardinality","true", "hllPreHashed", "false"), 
++                                             field_l).getHasher());
++    assertNull(HllOptions.parseHllOptions(params("cardinality","true", "hllPreHashed", "true"), 
++                                          field_l).getHasher());
++
++  }
++
++  /**
++   * Test user input errors (split into it's own test to isolate ignored exceptions
++   * @see #testCardinality 
++   * @see #testHllOptions
++   */
++  public void testHllOptionsErrors() throws Exception {
++    String[] baseParams = new String[] { "q","*:*", "stats","true", "indent","true", "rows","0" };
++    SolrCore core = h.getCore();
++    SchemaField foo_s = core.getLatestSchema().getField("foo_s");
++    SchemaField foo_i = core.getLatestSchema().getField("foo_i");
++
++    ignoreException("hllPreHashed");
++    for (SchemaField field : new SchemaField[] { foo_s, foo_i }) {
++      // whitebox - field
++      try {
++        HllOptions.parseHllOptions(params("cardinality","true", "hllPreHashed", "true"), field);
++        fail("hllPreHashed should have failed for " + field.getName());
++      } catch (SolrException e) {
++        assertTrue("MSG: " + e.getMessage(),
++                   e.getMessage().contains("hllPreHashed is only supported with Long"));
++      }
++      // blackbox - field
++      assertQEx("hllPreHashed " + field.getName(), "hllPreHashed is only supported with Long",
++                req(params("stats.field","{!cardinality=true hllPreHashed=true}" + field.getName()),
++                    baseParams),
++                ErrorCode.BAD_REQUEST);
++    }
++    // whitebox - function
++    try {
++      HllOptions.parseHllOptions(params("cardinality","true", "hllPreHashed", "true"), null);
++      fail("hllPreHashed should have failed for function");
++    } catch (SolrException e) {
++      assertTrue("MSG: " + e.getMessage(),
++                 e.getMessage().contains("hllPreHashed is only supported with Long"));
++    }
++    // blackbox - function
++    assertQEx("hllPreHashed function", "hllPreHashed is only supported with Long",
++              req(params("stats.field","{!func cardinality=true hllPreHashed=true}sum(foo_i,foo_l)"),
++                  baseParams),
++              ErrorCode.BAD_REQUEST);
++
++
++    ignoreException("accuracy");
++    for (String invalid : new String[] { "-1", "1.1", "100" }) {
++      // whitebox
++      try {
++        Object trash = HllOptions.parseHllOptions(params("cardinality",invalid), foo_s);
++        fail("Should have failed: " + invalid);
++      } catch (SolrException e) {
++        assertTrue("MSG: " + e.getMessage(),
++                   e.getMessage().contains("number between 0 and 1"));
++      }
++      // blackbox
++      assertQEx("cardinality="+invalid, "number between 0 and 1",
++                req(params("stats.field","{!cardinality="+invalid+"}foo_s"),
++                    baseParams),
++                ErrorCode.BAD_REQUEST);
++    }
++    
++    ignoreException("hllLog2m must be");
++    for (int invalid : new int[] { HLL.MINIMUM_LOG2M_PARAM-1, HLL.MAXIMUM_LOG2M_PARAM+11 }) {
++      // whitebox
++      try {
++        Object trash = HllOptions.parseHllOptions(params("cardinality","true",
++                                                         "hllLog2m", ""+invalid), foo_s);
++        fail("Should have failed: " + invalid);
++      } catch (SolrException e) {
++        assertTrue("MSG: " + e.getMessage(),
++                   e.getMessage().contains("hllLog2m must be"));
++      }
++      // blackbox
++      assertQEx("hllLog2m="+invalid, "hllLog2m must be",
++                req(params("stats.field","{!cardinality=true hllLog2m="+invalid+"}foo_s"),
++                    baseParams),
++                ErrorCode.BAD_REQUEST);
++    }
++
++    ignoreException("hllRegwidth must be");
++    for (int invalid : new int[] { HLL.MINIMUM_REGWIDTH_PARAM-1, HLL.MAXIMUM_REGWIDTH_PARAM+1 }) {
++      // whitebox
++      try {
++        Object trash = HllOptions.parseHllOptions(params("cardinality","true",
++                                                         "hllRegwidth", ""+invalid), foo_s);
++        fail("Should have failed: " + invalid);
++      } catch (SolrException e) {
++        assertTrue("MSG: " + e.getMessage(),
++                   e.getMessage().contains("hllRegwidth must be"));
++      }
++      // blackbox
++      assertQEx("hllRegwidth="+invalid, "hllRegwidth must be",
++                req(params("stats.field","{!cardinality=true hllRegwidth="+invalid+"}foo_s"),
++                    baseParams),
++                ErrorCode.BAD_REQUEST);
++    }
++  }
++
+   // simple percentiles test
+   public void testPercentiles() throws Exception {
+     
+@@ -1553,4 +1947,5 @@ public class StatsComponentTest extends AbstractSolrTestCase {
+       };
+     }
+   }
++
+ }
+diff --git a/solr/core/src/test/org/apache/solr/handler/component/TestDistributedStatsComponentCardinality.java b/solr/core/src/test/org/apache/solr/handler/component/TestDistributedStatsComponentCardinality.java
+new file mode 100644
+index 0000000..7cceea0
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/handler/component/TestDistributedStatsComponentCardinality.java
+@@ -0,0 +1,284 @@
++package org.apache.solr.handler.component;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.lucene.util.TestUtil;
++import org.apache.lucene.util.LuceneTestCase.Slow;
++
++import org.apache.solr.BaseDistributedSearchTestCase;
++import org.apache.solr.client.solrj.response.FieldStatsInfo;
++import org.apache.solr.client.solrj.response.QueryResponse;
++import org.apache.solr.common.params.SolrParams;
++import org.apache.solr.common.params.ModifiableSolrParams;
++
++import net.agkn.hll.HLL;
++import com.google.common.hash.Hashing;
++import com.google.common.hash.HashFunction;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++@Slow
++public class TestDistributedStatsComponentCardinality extends BaseDistributedSearchTestCase {
++  
++  public static final Logger log 
++    = LoggerFactory.getLogger(TestDistributedStatsComponentCardinality.class);
++  
++  final static HashFunction HASHER = Hashing.murmur3_128();
++
++  final static long BIG_PRIME = 982451653L;
++
++  final static int MIN_NUM_DOCS = 10000;
++  final static int MAX_NUM_DOCS = MIN_NUM_DOCS * 2;
++
++  final static List<String> STAT_FIELDS = 
++    Collections.unmodifiableList(Arrays.asList( "int_i", "long_l", "string_s" ));
++
++  final int NUM_DOCS;
++  final long MAX_LONG;
++  final long MIN_LONG;
++
++  public TestDistributedStatsComponentCardinality() {
++    super();
++    // we want some randomness in the shard number, but we don't want multiple iterations
++    fixShardCount(TEST_NIGHTLY ? 7 : random().nextInt(3) + 1);
++
++    handle.put("maxScore", SKIPVAL);
++    NUM_DOCS = TestUtil.nextInt(random(), 10000, 15000);
++    MAX_LONG = TestUtil.nextLong(random(), 0, NUM_DOCS * BIG_PRIME);
++    MIN_LONG = MAX_LONG - (((long)NUM_DOCS-1) * BIG_PRIME);
++  }
++
++  /** CAUTION: this builds a very large index */
++  public void buildIndex() throws Exception {
++    log.info("Building an index of {} docs", NUM_DOCS);
++
++    // we want a big spread in the long values we use, decrement by BIG_PRIME as we index
++    long longValue = MAX_LONG;
++
++    for (int i = 1; i <= NUM_DOCS; i++) {
++      // with these values, we know that every doc indexed has a unique value in all of the
++      // fields we will compute cardinality against.
++      // which means the number of docs matching a query is the true cardinality for each field
++
++      final String strValue = "s"+longValue;
++      indexDoc(sdoc("id","" + i, 
++                    "int_i", ""+i,
++                    "int_i_prehashed_l", ""+HASHER.hashInt(i).asLong(),
++                    "long_l", ""+longValue, 
++                    "long_l_prehashed_l", ""+HASHER.hashLong(longValue).asLong(),
++                    "string_s", strValue,
++                    // NOTE: renamed hashUnencodedChars starting with guava 15
++                    "string_s_prehashed_l", ""+HASHER.hashString(strValue).asLong()));
++
++      longValue -= BIG_PRIME;
++    }
++
++    commit();
++    
++  }
++
++
++  public void test() throws Exception {
++    buildIndex();
++    
++    { // simple sanity checks - don't leak variables
++      QueryResponse rsp = null;
++      rsp = query(params("rows", "0", "q", "id:42")); 
++      assertEquals(1, rsp.getResults().getNumFound());
++      
++      rsp = query(params("rows", "0", "q", "*:*", 
++                         "stats","true", "stats.field", "{!min=true max=true}long_l"));
++      assertEquals(NUM_DOCS, rsp.getResults().getNumFound());
++      assertEquals(MIN_LONG, Math.round((double) rsp.getFieldStatsInfo().get("long_l").getMin()));
++      assertEquals(MAX_LONG, Math.round((double) rsp.getFieldStatsInfo().get("long_l").getMax()));
++    }
++
++    final int NUM_QUERIES = atLeast(100);
++
++    // Some Randomized queries with randomized log2m and max regwidth
++    for (int i = 0; i < NUM_QUERIES; i++) {
++
++      // testing shows that on random data, at the size we're dealing with, 
++      // MINIMUM_LOG2M_PARAM is just too absurdly small to give anything remotely close the 
++      // the theoretically expected relative error.
++      //
++      // So we have to use a slightly higher lower bound on what log2m values we randomly test
++      final int log2m = TestUtil.nextInt(random(), 
++                                         2 + HLL.MINIMUM_LOG2M_PARAM, 
++                                         HLL.MAXIMUM_LOG2M_PARAM);
++
++      // use max regwidth to try and prevent hash collisions from introducing problems
++      final int regwidth = HLL.MAXIMUM_REGWIDTH_PARAM;
++
++      final int lowId = TestUtil.nextInt(random(), 1, NUM_DOCS-2000);
++      final int highId = TestUtil.nextInt(random(), lowId+1000, NUM_DOCS);
++      final int numMatches = 1+highId-lowId;
++
++      SolrParams p = buildCardinalityQ(lowId, highId, log2m, regwidth);
++      QueryResponse rsp = query(p);
++      assertEquals("sanity check num matches, p="+p, numMatches, rsp.getResults().getNumFound());
++
++      Map<String,FieldStatsInfo> stats = rsp.getFieldStatsInfo();
++
++      for (String f : STAT_FIELDS) {
++        // regardless of log2m and regwidth, the estimated cardinality of the 
++        // hashed vs prehashed values should be exactly the same for each field
++
++        assertEquals(f + ": hashed vs prehashed, real="+ numMatches + ", p=" + p,
++                     stats.get(f).getCardinality().longValue(),
++                     stats.get(f+"_prehashed_l").getCardinality().longValue());
++      }
++
++      for (String f : STAT_FIELDS) {
++        // check the relative error of the estimate returned against the known truth
++
++        final double relErr = expectedRelativeError(log2m);
++        final long estimate = stats.get(f).getCardinality().longValue();
++        assertTrue(f + ": relativeErr="+relErr+", estimate="+estimate+", real="+numMatches+", p=" + p,
++                   (Math.abs(numMatches - estimate) / numMatches) < relErr);
++        
++      }
++    }
++    
++    // Some Randomized queries with both low and high accuracy options
++    for (int i = 0; i < NUM_QUERIES; i++) {
++
++      final int lowId = TestUtil.nextInt(random(), 1, NUM_DOCS-2000);
++      final int highId = TestUtil.nextInt(random(), lowId+1000, NUM_DOCS);
++      final int numMatches = 1+highId-lowId;
++
++      // WTF? - https://github.com/aggregateknowledge/java-hll/issues/15
++      // 
++      // aparently we can't rely on estimates always being more accurate with higher log2m values?
++      // so for now, just try testing accuracy values that differ by at least 0.5
++      //
++      // (that should give us a significant enough log2m diff that the "highAccuracy" is always
++      // more accurate -- if, not then the entire premise of the float value is fundementally bogus)
++      // 
++      final double lowAccuracy = random().nextDouble() / 2;
++      // final double highAccuracy = Math.min(1.0D, lowAccuracy + (random().nextDouble() / 2));
++      final double highAccuracy = Math.min(1.0D, lowAccuracy + 0.5D);
++
++      SolrParams p = buildCardinalityQ(lowId, highId, lowAccuracy, highAccuracy);
++      QueryResponse rsp = query(p);
++      assertEquals("sanity check num matches, p="+p, numMatches, rsp.getResults().getNumFound());
++
++      Map<String,FieldStatsInfo> stats = rsp.getFieldStatsInfo();
++
++      // can't use STAT_FIELDS here ...
++      //
++      // hueristic differences for regwidth on 32 bit values mean we get differences 
++      // between estimates for the normal field vs the prehashed (long) field
++      //
++      // so we settle for only testing things where the regwidth is consistent 
++      // w/the prehashed long...
++      for (String f : new String[] { "long_l", "string_s" }) {
++
++        // regardless of accuracy, the estimated cardinality of the 
++        // hashed vs prehashed values should be exactly the same for each field
++
++        assertEquals(f + ": hashed vs prehashed (low), real="+ numMatches + ", p=" + p,
++                     stats.get("low_"+f).getCardinality().longValue(),
++                     stats.get("low_"+f+"_prehashed_l").getCardinality().longValue());
++        assertEquals(f + ": hashed vs prehashed (high), real="+ numMatches + ", p=" + p,
++                     stats.get("high_"+f).getCardinality().longValue(),
++                     stats.get("high_"+f+"_prehashed_l").getCardinality().longValue());
++      }
++      
++      for (String f : STAT_FIELDS) {
++        for (String ff : new String[] { f, f+"_prehashed_l"}) {
++          // for both the prehashed and regular fields, the high accuracy option 
++          // should always produce an estimate at least as good as the low accuracy option
++          
++          long poorEst = stats.get("low_"+ff).getCardinality();
++          long goodEst = stats.get("high_"+ff).getCardinality();
++          assertTrue(ff + ": goodEst="+goodEst+", poorEst="+poorEst+", real="+numMatches+", p=" + p,
++                     Math.abs(numMatches - goodEst) <= Math.abs(numMatches - poorEst));
++        }
++      }
++    }
++  }
++    
++  /**
++   * Returns the (max) expected relative error according ot the HLL algorithm docs
++   */
++  private static double expectedRelativeError(final int log2m) {
++    final long m = 1 << log2m;
++    // theoretical error is 1.04D * sqrt(m)
++    // fudge slightly to account for variance in random data
++    return 1.1D / Math.sqrt(m);
++  }
++
++  /** 
++   * Helper utility for building up a set of query params.  
++   *
++   * The main query is a simple range query against the id field (using lowId TO highId). 
++   * 2 stats.field params are generated for every field in {@link #STAT_FIELDS} --
++   * both with and w/o a prehashed_l suffix -- using the specified log2m and regwidth.
++   * 
++   * The response keys will be the full field names
++   */
++  private static SolrParams buildCardinalityQ(final int lowId, 
++                                              final int highId, 
++                                              final int log2m, 
++                                              final int regwidth) {
++    ModifiableSolrParams p = params("q", "id:["+lowId+" TO "+highId+"]", 
++                                    "rows", "0", "stats", "true");
++    final String prefix = "{!cardinality=true hllLog2m="+log2m+" hllRegwidth="+regwidth;
++    for (String f : STAT_FIELDS) {
++      p.add("stats.field", prefix+"}"+f);
++      p.add("stats.field", prefix+" hllPreHashed=true}"+f+"_prehashed_l");
++    }
++    return p;
++  }
++
++  /** 
++   * Helper utility for building up a set of query params.  
++   *
++   * The main query is a simple range query against the id field (using lowId TO highId). 
++   * 4 stats.field params are generated for every field in {@link #STAT_FIELDS} --
++   * both with and w/o a prehashed_l suffix, and using both the low and high accuracy values
++   *
++   * The response keys will be the full field names with either a "low_" or "high_" prefix
++   */
++  private static SolrParams buildCardinalityQ(final int lowId, 
++                                              final int highId, 
++                                              final double lowAccuracy,
++                                              final double highAccuracy) {
++    ModifiableSolrParams p = params("q", "id:["+lowId+" TO "+highId+"]", 
++                                    "rows", "0", "stats", "true");
++    final String[] prefixes = new String[] {
++      "{!cardinality=" + lowAccuracy + " key=low_",
++      "{!cardinality=" + highAccuracy + " key=high_"
++    };
++
++    for (String f : STAT_FIELDS) {
++      for (String prefix : prefixes) {
++        p.add("stats.field", prefix+f+"}"+f);
++        p.add("stats.field", prefix+f+"_prehashed_l hllPreHashed=true}"+f+"_prehashed_l");
++      }
++    }
++    return p;
++  }
++}
+diff --git a/solr/licenses/fastutil-6.5.11.jar.sha1 b/solr/licenses/fastutil-6.5.11.jar.sha1
+new file mode 100644
+index 0000000..bfe70be
+--- /dev/null
++++ b/solr/licenses/fastutil-6.5.11.jar.sha1
+@@ -0,0 +1 @@
++403289e76a91394944ded6056095bdf52b457249
+diff --git a/solr/licenses/fastutil-LICENSE-ASL.txt b/solr/licenses/fastutil-LICENSE-ASL.txt
+new file mode 100644
+index 0000000..d645695
+--- /dev/null
++++ b/solr/licenses/fastutil-LICENSE-ASL.txt
+@@ -0,0 +1,202 @@
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+diff --git a/solr/licenses/fastutil-NOTICE.txt b/solr/licenses/fastutil-NOTICE.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/solr/licenses/hll-1.6.0.jar.sha1 b/solr/licenses/hll-1.6.0.jar.sha1
+new file mode 100644
+index 0000000..1dafcdb
+--- /dev/null
++++ b/solr/licenses/hll-1.6.0.jar.sha1
+@@ -0,0 +1 @@
++48ab2ccfe7f3013052d639dd7a196902f9108960
+diff --git a/solr/licenses/hll-LICENSE-ASL.txt b/solr/licenses/hll-LICENSE-ASL.txt
+new file mode 100644
+index 0000000..59c03aa
+--- /dev/null
++++ b/solr/licenses/hll-LICENSE-ASL.txt
+@@ -0,0 +1,72 @@
++Apache License
++
++Version 2.0, January 2004
++
++http://www.apache.org/licenses/
++
++TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++1. Definitions.
++
++"License" shall mean the terms and conditions for use, reproduction, and distribution as defined by Sections 1 through 9 of this document.
++
++"Licensor" shall mean the copyright owner or entity authorized by the copyright owner that is granting the License.
++
++"Legal Entity" shall mean the union of the acting entity and all other entities that control, are controlled by, or are under common control with that entity. For the purposes of this definition, "control" means (i) the power, direct or indirect, to cause the direction or management of such entity, whether by contract or otherwise, or (ii) ownership of fifty percent (50%) or more of the outstanding shares, or (iii) beneficial ownership of such entity.
++
++"You" (or "Your") shall mean an individual or Legal Entity exercising permissions granted by this License.
++
++"Source" form shall mean the preferred form for making modifications, including but not limited to software source code, documentation source, and configuration files.
++
++"Object" form shall mean any form resulting from mechanical transformation or translation of a Source form, including but not limited to compiled object code, generated documentation, and conversions to other media types.
++
++"Work" shall mean the work of authorship, whether in Source or Object form, made available under the License, as indicated by a copyright notice that is included in or attached to the work (an example is provided in the Appendix below).
++
++"Derivative Works" shall mean any work, whether in Source or Object form, that is based on (or derived from) the Work and for which the editorial revisions, annotations, elaborations, or other modifications represent, as a whole, an original work of authorship. For the purposes of this License, Derivative Works shall not include works that remain separable from, or merely link (or bind by name) to the interfaces of, the Work and Derivative Works thereof.
++
++"Contribution" shall mean any work of authorship, including the original version of the Work and any modifications or additions to that Work or Derivative Works thereof, that is intentionally submitted to Licensor for inclusion in the Work by the copyright owner or by an individual or Legal Entity authorized to submit on behalf of the copyright owner. For the purposes of this definition, "submitted" means any form of electronic, verbal, or written communication sent to the Licensor or its representatives, including but not limited to communication on electronic mailing lists, source code control systems, and issue tracking systems that are managed by, or on behalf of, the Licensor for the purpose of discussing and improving the Work, but excluding communication that is conspicuously marked or otherwise designated in writing by the copyright owner as "Not a Contribution."
++
++"Contributor" shall mean Licensor and any individual or Legal Entity on behalf of whom a Contribution has been received by Licensor and subsequently incorporated within the Work.
++
++2. Grant of Copyright License. Subject to the terms and conditions of this License, each Contributor hereby grants to You a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable copyright license to reproduce, prepare Derivative Works of, publicly display, publicly perform, sublicense, and distribute the Work and such Derivative Works in Source or Object form.
++
++3. Grant of Patent License. Subject to the terms and conditions of this License, each Contributor hereby grants to You a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable (except as stated in this section) patent license to make, have made, use, offer to sell, sell, import, and otherwise transfer the Work, where such license applies only to those patent claims licensable by such Contributor that are necessarily infringed by their Contribution(s) alone or by combination of their Contribution(s) with the Work to which such Contribution(s) was submitted. If You institute patent litigation against any entity (including a cross-claim or counterclaim in a lawsuit) alleging that the Work or a Contribution incorporated within the Work constitutes direct or contributory patent infringement, then any patent licenses granted to You under this License for that Work shall terminate as of the date such litigation is filed.
++
++4. Redistribution. You may reproduce and distribute copies of the Work or Derivative Works thereof in any medium, with or without modifications, and in Source or Object form, provided that You meet the following conditions:
++
++You must give any other recipients of the Work or Derivative Works a copy of this License; and
++
++You must cause any modified files to carry prominent notices stating that You changed the files; and
++
++You must retain, in the Source form of any Derivative Works that You distribute, all copyright, patent, trademark, and attribution notices from the Source form of the Work, excluding those notices that do not pertain to any part of the Derivative Works; and
++
++If the Work includes a "NOTICE" text file as part of its distribution, then any Derivative Works that You distribute must include a readable copy of the attribution notices contained within such NOTICE file, excluding those notices that do not pertain to any part of the Derivative Works, in at least one of the following places: within a NOTICE text file distributed as part of the Derivative Works; within the Source form or documentation, if provided along with the Derivative Works; or, within a display generated by the Derivative Works, if and wherever such third-party notices normally appear. The contents of the NOTICE file are for informational purposes only and do not modify the License. You may add Your own attribution notices within Derivative Works that You distribute, alongside or as an addendum to the NOTICE text from the Work, provided that such additional attribution notices cannot be construed as modifying the License. You may add Your own copyright statement to Your modifications and may provide additional or different license terms and conditions for use, reproduction, or distribution of Your modifications, or for any such Derivative Works as a whole, provided Your use, reproduction, and distribution of the Work otherwise complies with the conditions stated in this License.
++
++5. Submission of Contributions. Unless You explicitly state otherwise, any Contribution intentionally submitted for inclusion in the Work by You to the Licensor shall be under the terms and conditions of this License, without any additional terms or conditions. Notwithstanding the above, nothing herein shall supersede or modify the terms of any separate license agreement you may have executed with Licensor regarding such Contributions.
++
++6. Trademarks. This License does not grant permission to use the trade names, trademarks, service marks, or product names of the Licensor, except as required for reasonable and customary use in describing the origin of the Work and reproducing the content of the NOTICE file.
++
++7. Disclaimer of Warranty. Unless required by applicable law or agreed to in writing, Licensor provides the Work (and each Contributor provides its Contributions) on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied, including, without limitation, any warranties or conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE. You are solely responsible for determining the appropriateness of using or redistributing the Work and assume any risks associated with Your exercise of permissions under this License.
++
++8. Limitation of Liability. In no event and under no legal theory, whether in tort (including negligence), contract, or otherwise, unless required by applicable law (such as deliberate and grossly negligent acts) or agreed to in writing, shall any Contributor be liable to You for damages, including any direct, indirect, special, incidental, or consequential damages of any character arising as a result of this License or out of the use or inability to use the Work (including but not limited to damages for loss of goodwill, work stoppage, computer failure or malfunction, or any and all other commercial damages or losses), even if such Contributor has been advised of the possibility of such damages.
++
++9. Accepting Warranty or Additional Liability. While redistributing the Work or Derivative Works thereof, You may choose to offer, and charge a fee for, acceptance of support, warranty, indemnity, or other liability obligations and/or rights consistent with this License. However, in accepting such obligations, You may act only on Your own behalf and on Your sole responsibility, not on behalf of any other Contributor, and only if You agree to indemnify, defend, and hold each Contributor harmless for any liability incurred by, or claims asserted against, such Contributor by reason of your accepting any such warranty or additional liability.
++
++END OF TERMS AND CONDITIONS
++
++APPENDIX: How to apply the Apache License to your work
++To apply the Apache License to your work, attach the following boilerplate notice, with the fields enclosed by brackets "[]" replaced with your own identifying information. (Don't include the brackets!) The text should be enclosed in the appropriate comment syntax for the file format. We also recommend that a file or class name and description of purpose be included on the same "printed page" as the copyright notice for easier identification within third-party archives.
++
++   Copyright 2013 Aggregate Knowledge, Inc.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+\ No newline at end of file
+diff --git a/solr/licenses/hll-NOTICE.txt b/solr/licenses/hll-NOTICE.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/solr/solrj/src/java/org/apache/solr/client/solrj/response/FieldStatsInfo.java b/solr/solrj/src/java/org/apache/solr/client/solrj/response/FieldStatsInfo.java
+index 4ca1a9a..96e4059 100644
+--- a/solr/solrj/src/java/org/apache/solr/client/solrj/response/FieldStatsInfo.java
++++ b/solr/solrj/src/java/org/apache/solr/client/solrj/response/FieldStatsInfo.java
+@@ -45,6 +45,7 @@ public class FieldStatsInfo implements Serializable {
+   Object mean = null;
+   Double sumOfSquares = null;
+   Double stddev = null;
++  Long cardinality = null;
+   
+   Map<String,List<FieldStatsInfo>> facets;
+   
+@@ -106,6 +107,8 @@ public class FieldStatsInfo implements Serializable {
+         for( Map.Entry<String, Object> ev : fields ) {
+           percentiles.put(Double.parseDouble(ev.getKey()), (Double)ev.getValue());
+         }
++      } else if ( "cardinality".equals(entry.getKey()) ) {
++        cardinality = (Long)entry.getValue();
+       }
+       else {
+         throw new RuntimeException( "unknown key: "+entry.getKey() + " ["+entry.getValue()+"]" );
+@@ -149,6 +152,9 @@ public class FieldStatsInfo implements Serializable {
+     if( percentiles != null ) {
+       sb.append( " percentiles:").append(percentiles);
+     }
++    if( cardinality != null ) {
++      sb.append( " cardinality:").append(cardinality);
++    }
+     
+     sb.append( " }" );
+     return sb.toString();
+@@ -175,7 +181,8 @@ public class FieldStatsInfo implements Serializable {
+   }
+ 
+   public Long getCountDistinct() {
+-    return countDistinct;
++    // :TODO: as client convinience, should we return cardinality if this is null?
++    return countDistinct; 
+   }
+ 
+   public Collection<Object> getDistinctValues() {
+@@ -209,4 +216,12 @@ public class FieldStatsInfo implements Serializable {
+   public Map<Double, Double> getPercentiles() {
+     return percentiles;
+   }
++
++  /**
++   * The cardinality of of the set of values if requested, otherwise null.
++   */
++  public Long getCardinality() {
++    // :TODO: as client convinience, should we return countDistinct if this is null?
++    return cardinality; 
++  }
+ }
+

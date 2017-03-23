@@ -1,0 +1,164 @@
+GitDiffStart: 369f2379c2e084c89e331c5b75cbcdcbb9d2347f | Sat Feb 2 10:35:54 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index c5947b8..5a6e66a 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -66,6 +66,9 @@ Optimizations
+   facets. Also added OrdinalPolicy.ALL_BUT_DIMENSION. 
+   (Shai Erera, Michael McCandless)
+ 
++* LUCENE-4740: Don't track clones of MMapIndexInput if unmapping
++  is disabled. This reduces GC overhead. (Kristofer Karlsson, Uwe Schindler)
++
+ New Features
+ 
+ * LUCENE-4686: New specialized DGapVInt8IntEncoder for facets (now the 
+diff --git a/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java b/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java
+index 161b5fe..d6c6bc3 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java
++++ b/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java
+@@ -51,14 +51,15 @@ abstract class ByteBufferIndexInput extends IndexInput {
+   private ByteBuffer curBuf; // redundant for speed: buffers[curBufIndex]
+ 
+   private boolean isClone = false;
+-  private final WeakIdentityMap<ByteBufferIndexInput,Boolean> clones = WeakIdentityMap.newConcurrentHashMap();
++  private final WeakIdentityMap<ByteBufferIndexInput,Boolean> clones;
+   
+-  ByteBufferIndexInput(String resourceDescription, ByteBuffer[] buffers, long length, int chunkSizePower) throws IOException {
++  ByteBufferIndexInput(String resourceDescription, ByteBuffer[] buffers, long length, int chunkSizePower, boolean trackClones) throws IOException {
+     super(resourceDescription);
+     this.buffers = buffers;
+     this.length = length;
+     this.chunkSizePower = chunkSizePower;
+     this.chunkSizeMask = (1L << chunkSizePower) - 1L;
++    this.clones = trackClones ? WeakIdentityMap.<ByteBufferIndexInput,Boolean>newConcurrentHashMap() : null;
+     
+     assert chunkSizePower >= 0 && chunkSizePower <= 30;   
+     assert (length >>> chunkSizePower) < Integer.MAX_VALUE;
+@@ -231,7 +232,9 @@ abstract class ByteBufferIndexInput extends IndexInput {
+     clone.length = length;
+ 
+     // register the new clone in our clone list to clean it up on closing:
+-    this.clones.put(clone, Boolean.TRUE);
++    if (clones != null) {
++      this.clones.put(clone, Boolean.TRUE);
++    }
+     
+     return clone;
+   }
+@@ -272,17 +275,21 @@ abstract class ByteBufferIndexInput extends IndexInput {
+       // make local copy, then un-set early
+       final ByteBuffer[] bufs = buffers;
+       unsetBuffers();
+-      clones.remove(this);
++      if (clones != null) {
++        clones.remove(this);
++      }
+       
+       if (isClone) return;
+       
+       // for extra safety unset also all clones' buffers:
+-      for (Iterator<ByteBufferIndexInput> it = this.clones.keyIterator(); it.hasNext();) {
+-        final ByteBufferIndexInput clone = it.next();
+-        assert clone.isClone;
+-        clone.unsetBuffers();
++      if (clones != null) {
++        for (Iterator<ByteBufferIndexInput> it = this.clones.keyIterator(); it.hasNext();) {
++          final ByteBufferIndexInput clone = it.next();
++          assert clone.isClone;
++          clone.unsetBuffers();
++        }
++        this.clones.clear();
+       }
+-      this.clones.clear();
+       
+       for (final ByteBuffer b : bufs) {
+         freeBuffer(b);
+diff --git a/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java b/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java
+index 9b73c70..f42dc01 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java
+@@ -178,36 +178,6 @@ public class MMapDirectory extends FSDirectory {
+   }
+   
+   /**
+-   * Try to unmap the buffer, this method silently fails if no support
+-   * for that in the JVM. On Windows, this leads to the fact,
+-   * that mmapped files cannot be modified or deleted.
+-   */
+-  final void cleanMapping(final ByteBuffer buffer) throws IOException {
+-    if (useUnmapHack) {
+-      try {
+-        AccessController.doPrivileged(new PrivilegedExceptionAction<Object>() {
+-          @Override
+-          public Object run() throws Exception {
+-            final Method getCleanerMethod = buffer.getClass()
+-              .getMethod("cleaner");
+-            getCleanerMethod.setAccessible(true);
+-            final Object cleaner = getCleanerMethod.invoke(buffer);
+-            if (cleaner != null) {
+-              cleaner.getClass().getMethod("clean")
+-                .invoke(cleaner);
+-            }
+-            return null;
+-          }
+-        });
+-      } catch (PrivilegedActionException e) {
+-        final IOException ioe = new IOException("unable to unmap the mapped buffer");
+-        ioe.initCause(e.getCause());
+-        throw ioe;
+-      }
+-    }
+-  }
+-  
+-  /**
+    * Returns the current mmap chunk size.
+    * @see #MMapDirectory(File, LockFactory, int)
+    */
+@@ -246,14 +216,42 @@ public class MMapDirectory extends FSDirectory {
+   }
+ 
+   private final class MMapIndexInput extends ByteBufferIndexInput {
++    private final boolean useUnmapHack;
+     
+     MMapIndexInput(String resourceDescription, RandomAccessFile raf) throws IOException {
+-      super(resourceDescription, map(raf, 0, raf.length()), raf.length(), chunkSizePower);
++      super(resourceDescription, map(raf, 0, raf.length()), raf.length(), chunkSizePower, getUseUnmap());
++      this.useUnmapHack = getUseUnmap();
+     }
+     
++    /**
++     * Try to unmap the buffer, this method silently fails if no support
++     * for that in the JVM. On Windows, this leads to the fact,
++     * that mmapped files cannot be modified or deleted.
++     */
+     @Override
+-    protected void freeBuffer(ByteBuffer buffer) throws IOException {
+-      cleanMapping(buffer);
++    protected void freeBuffer(final ByteBuffer buffer) throws IOException {
++      if (useUnmapHack) {
++        try {
++          AccessController.doPrivileged(new PrivilegedExceptionAction<Void>() {
++            @Override
++            public Void run() throws Exception {
++              final Method getCleanerMethod = buffer.getClass()
++                .getMethod("cleaner");
++              getCleanerMethod.setAccessible(true);
++              final Object cleaner = getCleanerMethod.invoke(buffer);
++              if (cleaner != null) {
++                cleaner.getClass().getMethod("clean")
++                  .invoke(cleaner);
++              }
++              return null;
++            }
++          });
++        } catch (PrivilegedActionException e) {
++          final IOException ioe = new IOException("unable to unmap the mapped buffer");
++          ioe.initCause(e.getCause());
++          throw ioe;
++        }
++      }
+     }
+   }
+   
+

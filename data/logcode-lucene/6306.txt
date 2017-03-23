@@ -1,0 +1,174 @@
+GitDiffStart: a1503232f30c44016765672747d654f4f953b957 | Mon May 5 19:37:11 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 1ebe776..e77b775 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -165,6 +165,12 @@ Bug fixes
+ * LUCENE-5641: SimpleRateLimiter would silently rate limit at 8 MB/sec
+   even if you asked for higher rates.  (Mike McCandless)
+ 
++* LUCENE-5644: IndexWriter clears which threads use which internal
++  thread states on flush, so that if an application reduces how many
++  threads it uses for indexing, that results in a reduction of how
++  many segments are flushed on a full-flush (e.g. to obtain a
++  near-real-time reader).  (Simon Willnauer, Mike McCandless)
++
+ Test Framework
+ 
+ * LUCENE-5622: Fail tests if they print over the given limit of bytes to 
+diff --git a/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java b/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java
+index cc46ebe..b47f0ba 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java
++++ b/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThreadPool.java
+@@ -18,9 +18,6 @@ package org.apache.lucene.index;
+ 
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+-import org.apache.lucene.index.FieldInfos.FieldNumbers;
+-import org.apache.lucene.util.SetOnce;
+-
+ /**
+  * {@link DocumentsWriterPerThreadPool} controls {@link ThreadState} instances
+  * and their thread assignments during indexing. Each {@link ThreadState} holds
+@@ -307,9 +304,9 @@ abstract class DocumentsWriterPerThreadPool implements Cloneable {
+       final ThreadState threadState = threadStates[i];
+       threadState.lock();
+       try {
+-       if (!threadState.isActive) {
+-         count++;
+-       }
++        if (!threadState.isActive) {
++          count++;
++        }
+       } finally {
+         threadState.unlock();
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/ThreadAffinityDocumentsWriterThreadPool.java b/lucene/core/src/java/org/apache/lucene/index/ThreadAffinityDocumentsWriterThreadPool.java
+index f353431..047e549 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/ThreadAffinityDocumentsWriterThreadPool.java
++++ b/lucene/core/src/java/org/apache/lucene/index/ThreadAffinityDocumentsWriterThreadPool.java
+@@ -16,6 +16,7 @@ package org.apache.lucene.index;
+  * limitations under the License.
+  */
+ import java.util.Map;
++import java.util.Iterator;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.lucene.index.DocumentsWriterPerThreadPool.ThreadState; //javadoc
+@@ -48,7 +49,6 @@ class ThreadAffinityDocumentsWriterThreadPool extends DocumentsWriterPerThreadPo
+       return threadState;
+     }
+     ThreadState minThreadState = null;
+-
+     
+     /* TODO -- another thread could lock the minThreadState we just got while 
+      we should somehow prevent this. */
+@@ -68,14 +68,36 @@ class ThreadAffinityDocumentsWriterThreadPool extends DocumentsWriterPerThreadPo
+          */
+         minThreadState = minContendedThreadState();
+       }
++    } else {
++      threadBindings.put(requestingThread, minThreadState);
+     }
++
+     assert minThreadState != null: "ThreadState is null";
+     
+     minThreadState.lock();
++
++    if (minThreadState.isInitialized() == false) {
++      // Another thread just flushed this thread state and cleared our binding; put it back:
++      threadBindings.put(requestingThread, minThreadState); // make sure we get the same state next time 
++    }
++
+     return minThreadState;
+   }
+ 
+   @Override
++  DocumentsWriterPerThread reset(ThreadState threadState, boolean closed) {
++    // Remove all previous bindings to this ThreadState on flush:
++    Iterator<Map.Entry<Thread,ThreadState>> it = threadBindings.entrySet().iterator();
++    while (it.hasNext()) {
++      Map.Entry<Thread,ThreadState> ent = it.next();
++      if (ent.getValue() == threadState) {
++        it.remove();
++      }
++    }
++    return super.reset(threadState, closed);
++  }
++
++  @Override
+   public ThreadAffinityDocumentsWriterThreadPool clone() {
+     ThreadAffinityDocumentsWriterThreadPool clone = (ThreadAffinityDocumentsWriterThreadPool) super.clone();
+     clone.threadBindings = new ConcurrentHashMap<>();
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
+index f6baf88..68acb07 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -2788,4 +2788,66 @@ public class TestIndexWriter extends LuceneTestCase {
+     r.close();
+     dir.close();
+   }
++
++  // LUCENE-5644
++  public void testSegmentCountOnFlush() throws Exception {
++    Directory dir = newDirectory();
++    final IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
++    final CountDownLatch startingGun = new CountDownLatch(1);
++    final CountDownLatch startDone = new CountDownLatch(2);
++    final CountDownLatch middleGun = new CountDownLatch(1);
++    final CountDownLatch finalGun = new CountDownLatch(1);
++    Thread[] threads = new Thread[2];
++    for(int i=0;i<threads.length;i++) {
++      final int threadID = i;
++      threads[i] = new Thread() {
++          @Override
++          public void run() {
++            try {
++              startingGun.await();
++              Document doc = new Document();
++              doc.add(newTextField("field", "here is some text", Field.Store.NO));
++              w.addDocument(doc);
++              startDone.countDown();
++
++              middleGun.await();
++              if (threadID == 0) {
++                w.addDocument(doc);
++              } else {
++                finalGun.await();
++                w.addDocument(doc);
++              }
++            } catch (Exception e) {
++              throw new RuntimeException(e);
++            }
++          }
++        };
++      threads[i].start();
++    }
++
++    startingGun.countDown();
++    startDone.await();
++
++    IndexReader r = DirectoryReader.open(w, true);
++    assertEquals(2, r.numDocs());
++    int numSegments = r.leaves().size();
++    // 1 segment if the threads ran sequentially, else 2:
++    assertTrue(numSegments <= 2);
++    r.close();
++
++    middleGun.countDown();
++    threads[0].join();
++
++    finalGun.countDown();
++    threads[1].join();
++
++    r = DirectoryReader.open(w, true);
++    assertEquals(4, r.numDocs());
++    // Both threads should have shared a single thread state since they did not try to index concurrently:
++    assertEquals(1+numSegments, r.leaves().size());
++    r.close();
++
++    w.close();
++    dir.close();
++  }
+ }
+

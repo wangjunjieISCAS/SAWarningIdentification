@@ -1,0 +1,953 @@
+GitDiffStart: 3e9b5a9893c07e2c9fac4cb877f2bbb104288c40 | Sun May 6 13:13:34 2012 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index dfb2acb..3d2ae0d 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -503,6 +503,10 @@ API Changes
+   and sometimes different depending on the type of set, and ultimately a CharArraySet
+   or CharArrayMap was always used anyway.  (Robert Muir)
+ 
++* LUCENE-3830: Switched to NormalizeCharMap.Builder to create
++  immutable instances of NormalizeCharMap. (Dawid Weiss, Mike
++  McCandless)
++
+ New features
+ 
+ * LUCENE-2604: Added RegexpQuery support to QueryParser. Regular expressions
+@@ -892,6 +896,11 @@ Optimizations
+ 
+ * LUCENE-3468: Replaced last() and remove() with pollLast() in
+   FirstPassGroupingCollector (Martijn van Groningen)
++
++* LUCENE-3830: Changed MappingCharFilter/NormalizeCharMap to use an
++  FST under the hood, which requires less RAM.  NormalizeCharMap no
++  longer accepts empty string match (it did previously, but ignored
++  it).  (Dawid Weiss, Mike McCandless)
+              
+ Bug fixes
+ 
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/MappingCharFilter.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/MappingCharFilter.java
+index cb608c7..48439cd 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/MappingCharFilter.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/MappingCharFilter.java
+@@ -19,126 +19,179 @@ package org.apache.lucene.analysis.charfilter;
+ 
+ import java.io.IOException;
+ import java.io.Reader;
+-import java.util.LinkedList;
++import java.util.Map;
+ 
+ import org.apache.lucene.analysis.CharReader;
+ import org.apache.lucene.analysis.CharStream;
++import org.apache.lucene.util.CharsRef;
++import org.apache.lucene.util.RollingCharBuffer;
++import org.apache.lucene.util.fst.CharSequenceOutputs;
++import org.apache.lucene.util.fst.FST;
++import org.apache.lucene.util.fst.Outputs;
+ 
+ /**
+  * Simplistic {@link CharFilter} that applies the mappings
+  * contained in a {@link NormalizeCharMap} to the character
+  * stream, and correcting the resulting changes to the
+- * offsets.
++ * offsets.  Matching is greedy (longest pattern matching at
++ * a given point wins).  Replacement is allowed to be the
++ * empty string.
+  */
++
+ public class MappingCharFilter extends BaseCharFilter {
+ 
+-  private final NormalizeCharMap normMap;
+-  private LinkedList<Character> buffer;
+-  private String replacement;
+-  private int charPointer;
+-  private int nextCharCounter;
++  private final Outputs<CharsRef> outputs = CharSequenceOutputs.getSingleton();
++  private final FST<CharsRef> map;
++  private final FST.BytesReader fstReader;
++  private final RollingCharBuffer buffer = new RollingCharBuffer();
++  private final FST.Arc<CharsRef> scratchArc = new FST.Arc<CharsRef>();
++  private final Map<Character,FST.Arc<CharsRef>> cachedRootArcs;
++
++  private CharsRef replacement;
++  private int replacementPointer;
++  private int inputOff;
+ 
+   /** Default constructor that takes a {@link CharStream}. */
+   public MappingCharFilter(NormalizeCharMap normMap, CharStream in) {
+     super(in);
+-    this.normMap = normMap;
++    buffer.reset(in);
++
++    map = normMap.map;
++    cachedRootArcs = normMap.cachedRootArcs;
++
++    if (map != null) {
++      fstReader = map.getBytesReader(0);
++    } else {
++      fstReader = null;
++    }
+   }
+ 
+   /** Easy-use constructor that takes a {@link Reader}. */
+   public MappingCharFilter(NormalizeCharMap normMap, Reader in) {
+-    super(CharReader.get(in));
+-    this.normMap = normMap;
++    this(normMap, CharReader.get(in));
++  }
++
++  @Override
++  public void reset() throws IOException {
++    super.reset();
++    buffer.reset(input);
++    replacement = null;
++    inputOff = 0;
+   }
+ 
+   @Override
+   public int read() throws IOException {
++
++    //System.out.println("\nread");
+     while(true) {
+-      if (replacement != null && charPointer < replacement.length()) {
+-        return replacement.charAt(charPointer++);
++
++      if (replacement != null && replacementPointer < replacement.length) {
++        //System.out.println("  return repl[" + replacementPointer + "]=" + replacement.chars[replacement.offset + replacementPointer]);
++        return replacement.chars[replacement.offset + replacementPointer++];
+       }
+ 
+-      int firstChar = nextChar();
+-      if (firstChar == -1) return -1;
+-      NormalizeCharMap nm = normMap.submap != null ?
+-        normMap.submap.get(Character.valueOf((char) firstChar)) : null;
+-      if (nm == null) return firstChar;
+-      NormalizeCharMap result = match(nm);
+-      if (result == null) return firstChar;
+-      replacement = result.normStr;
+-      charPointer = 0;
+-      if (result.diff != 0) {
+-        int prevCumulativeDiff = getLastCumulativeDiff();
+-        if (result.diff < 0) {
+-          for(int i = 0; i < -result.diff ; i++)
+-            addOffCorrectMap(nextCharCounter + i - prevCumulativeDiff, prevCumulativeDiff - 1 - i);
+-        } else {
+-          addOffCorrectMap(nextCharCounter - result.diff - prevCumulativeDiff, prevCumulativeDiff + result.diff);
++      // TODO: a more efficient approach would be Aho/Corasick's
++      // algorithm
++      // (http://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_string_matching_algorithm)
++      // or this generalizatio: www.cis.uni-muenchen.de/people/Schulz/Pub/dictle5.ps
++      //
++      // I think this would be (almost?) equivalent to 1) adding
++      // epsilon arcs from all final nodes back to the init
++      // node in the FST, 2) adding a .* (skip any char)
++      // loop on the initial node, and 3) determinizing
++      // that.  Then we would not have to restart matching
++      // at each position.
++
++      int lastMatchLen = -1;
++      CharsRef lastMatch = null;
++
++      final int firstCH = buffer.get(inputOff);
++      if (firstCH != -1) {
++        FST.Arc<CharsRef> arc = cachedRootArcs.get(Character.valueOf((char) firstCH));
++        if (arc != null) {
++          if (!FST.targetHasArcs(arc)) {
++            // Fast pass for single character match:
++            assert arc.isFinal();
++            lastMatchLen = 1;
++            lastMatch = arc.output;
++          } else {
++            int lookahead = 0;
++            CharsRef output = arc.output;
++            while (true) {
++              lookahead++;
++
++              if (arc.isFinal()) {
++                // Match! (to node is final)
++                lastMatchLen = lookahead;
++                lastMatch = outputs.add(output, arc.nextFinalOutput);
++                // Greedy: keep searching to see if there's a
++                // longer match...
++              }
++
++              if (!FST.targetHasArcs(arc)) {
++                break;
++              }
++
++              int ch = buffer.get(inputOff + lookahead);
++              if (ch == -1) {
++                break;
++              }
++              if ((arc = map.findTargetArc(ch, arc, scratchArc, fstReader)) == null) {
++                // Dead end
++                break;
++              }
++              output = outputs.add(output, arc.output);
++            }
++          }
+         }
+       }
+-    }
+-  }
+ 
+-  private int nextChar() throws IOException {
+-    if (buffer != null && !buffer.isEmpty()) {
+-      nextCharCounter++;
+-      return buffer.removeFirst().charValue();
+-    }
+-    int nextChar = input.read();
+-    if (nextChar != -1) {
+-      nextCharCounter++;
+-    }
+-    return nextChar;
+-  }
+-
+-  private void pushChar(int c) {
+-    nextCharCounter--;
+-    if(buffer == null)
+-      buffer = new LinkedList<Character>();
+-    buffer.addFirst(Character.valueOf((char) c));
+-  }
++      if (lastMatch != null) {
++        inputOff += lastMatchLen;
++        //System.out.println("  match!  len=" + lastMatchLen + " repl=" + lastMatch);
+ 
+-  private void pushLastChar(int c) {
+-    if (buffer == null) {
+-      buffer = new LinkedList<Character>();
+-    }
+-    buffer.addLast(Character.valueOf((char) c));
+-  }
++        final int diff = lastMatchLen - lastMatch.length;
+ 
+-  private NormalizeCharMap match(NormalizeCharMap map) throws IOException {
+-    NormalizeCharMap result = null;
+-    if (map.submap != null) {
+-      int chr = nextChar();
+-      if (chr != -1) {
+-        NormalizeCharMap subMap = map.submap.get(Character.valueOf((char) chr));
+-        if (subMap != null) {
+-          result = match(subMap);
++        if (diff != 0) {
++          final int prevCumulativeDiff = getLastCumulativeDiff();
++          if (diff > 0) {
++            // Replacement is shorter than matched input:
++            addOffCorrectMap(inputOff - diff - prevCumulativeDiff, prevCumulativeDiff + diff);
++          } else {
++            // Replacement is longer than matched input: remap
++            // the "extra" chars all back to the same input
++            // offset:
++            final int outputStart = inputOff - prevCumulativeDiff;
++            for(int extraIDX=0;extraIDX<-diff;extraIDX++) {
++              addOffCorrectMap(outputStart + extraIDX, prevCumulativeDiff - extraIDX - 1);
++            }
++          }
+         }
+-        if (result == null) {
+-          pushChar(chr);
++
++        replacement = lastMatch;
++        replacementPointer = 0;
++
++      } else {
++        final int ret = buffer.get(inputOff);
++        if (ret != -1) {
++          inputOff++;
++          buffer.freeBefore(inputOff);
+         }
++        return ret;
+       }
+     }
+-    if (result == null && map.normStr != null) {
+-      result = map;
+-    }
+-    return result;
+   }
+ 
+   @Override
+   public int read(char[] cbuf, int off, int len) throws IOException {
+-    char[] tmp = new char[len];
+-    int l = input.read(tmp, 0, len);
+-    if (l != -1) {
+-      for(int i = 0; i < l; i++)
+-        pushLastChar(tmp[i]);
+-    }
+-    l = 0;
++    int numRead = 0;
+     for(int i = off; i < off + len; i++) {
+       int c = read();
+       if (c == -1) break;
+       cbuf[i] = (char) c;
+-      l++;
++      numRead++;
+     }
+-    return l == 0 ? -1 : l;
++
++    return numRead == 0 ? -1 : numRead;
+   }
+ }
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/NormalizeCharMap.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/NormalizeCharMap.java
+index bed6e16..a7d93fc 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/NormalizeCharMap.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/charfilter/NormalizeCharMap.java
+@@ -17,45 +17,112 @@
+ 
+ package org.apache.lucene.analysis.charfilter;
+ 
++import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.TreeMap;
++
++import org.apache.lucene.util.CharsRef;
++import org.apache.lucene.util.IntsRef;
++import org.apache.lucene.util.fst.Builder;
++import org.apache.lucene.util.fst.CharSequenceOutputs;
++import org.apache.lucene.util.fst.FST;
++import org.apache.lucene.util.fst.Outputs;
++import org.apache.lucene.util.fst.Util;
++
++// TODO: save/load?
+ 
+ /**
+  * Holds a map of String input to String output, to be used
+- * with {@link MappingCharFilter}.
++ * with {@link MappingCharFilter}.  Use the {@link Builder}
++ * to create this.
+  */
+ public class NormalizeCharMap {
+ 
+-  Map<Character, NormalizeCharMap> submap;
+-  String normStr;
+-  int diff;
+-
+-  /** Records a replacement to be applied to the inputs
+-   *  stream.  Whenever <code>singleMatch</code> occurs in
+-   *  the input, it will be replaced with
+-   *  <code>replacement</code>.
+-   *
+-   * @param singleMatch input String to be replaced
+-   * @param replacement output String
++  final FST<CharsRef> map;
++  final Map<Character,FST.Arc<CharsRef>> cachedRootArcs = new HashMap<Character,FST.Arc<CharsRef>>();
++
++  // Use the builder to create:
++  private NormalizeCharMap(FST<CharsRef> map) {
++    this.map = map;
++    if (map != null) {
++      try {
++        // Pre-cache root arcs:
++        final FST.Arc<CharsRef> scratchArc = new FST.Arc<CharsRef>();
++        final FST.BytesReader fstReader = map.getBytesReader(0);
++        map.getFirstArc(scratchArc);
++        if (FST.targetHasArcs(scratchArc)) {
++          map.readFirstRealTargetArc(scratchArc.target, scratchArc, fstReader);
++          while(true) {
++            assert scratchArc.label != FST.END_LABEL;
++            cachedRootArcs.put(Character.valueOf((char) scratchArc.label), new FST.Arc<CharsRef>().copyFrom(scratchArc));
++            if (scratchArc.isLast()) {
++              break;
++            }
++            map.readNextRealArc(scratchArc, fstReader);
++          }
++        }
++        //System.out.println("cached " + cachedRootArcs.size() + " root arcs");
++      } catch (IOException ioe) {
++        // Bogus FST IOExceptions!!  (will never happen)
++        throw new RuntimeException(ioe);
++      }
++    }
++  }
++
++  /**
++   * Builds an NormalizeCharMap.
++   * <p>
++   * Call add() until you have added all the mappings, then call build() to get a NormalizeCharMap
++   * @lucene.experimental
+    */
+-  public void add(String singleMatch, String replacement) {
+-    NormalizeCharMap currMap = this;
+-    for(int i = 0; i < singleMatch.length(); i++) {
+-      char c = singleMatch.charAt(i);
+-      if (currMap.submap == null) {
+-        currMap.submap = new HashMap<Character, NormalizeCharMap>(1);
++  public static class Builder {
++
++    private final Map<String,String> pendingPairs = new TreeMap<String,String>();
++
++    /** Records a replacement to be applied to the input
++     *  stream.  Whenever <code>singleMatch</code> occurs in
++     *  the input, it will be replaced with
++     *  <code>replacement</code>.
++     *
++     * @param match input String to be replaced
++     * @param replacement output String
++     * @throws IllegalArgumentException if
++     * <code>match</code> is the empty string, or was
++     * already previously added
++     */
++    public void add(String match, String replacement) {
++      if (match.length() == 0 ){
++        throw new IllegalArgumentException("cannot match the empty string");
+       }
+-      NormalizeCharMap map = currMap.submap.get(Character.valueOf(c));
+-      if (map == null) {
+-        map = new NormalizeCharMap();
+-        currMap.submap.put(Character.valueOf(c), map);
++      if (pendingPairs.containsKey(match)) {
++        throw new IllegalArgumentException("match \"" + match + "\" was already added");
+       }
+-      currMap = map;
++      pendingPairs.put(match, replacement);
+     }
+-    if (currMap.normStr != null) {
+-      throw new RuntimeException("MappingCharFilter: there is already a mapping for " + singleMatch);
++
++    /** Builds the NormalizeCharMap; call this once you
++     *  are done calling {@link #add}. */
++    public NormalizeCharMap build() {
++
++      final FST<CharsRef> map;
++      try {
++        final Outputs<CharsRef> outputs = CharSequenceOutputs.getSingleton();
++        final org.apache.lucene.util.fst.Builder<CharsRef> builder = new org.apache.lucene.util.fst.Builder<CharsRef>(FST.INPUT_TYPE.BYTE2, outputs);
++        final IntsRef scratch = new IntsRef();
++        for(Map.Entry<String,String> ent : pendingPairs.entrySet()) {
++          builder.add(Util.toUTF32(ent.getKey(), scratch),
++                      new CharsRef(ent.getValue()));
++      
++        }
++        map = builder.finish();
++        pendingPairs.clear();
++      } catch (IOException ioe) {
++        // Bogus FST IOExceptions!!  (will never happen)
++        throw new RuntimeException(ioe);
++      }
++
++      return new NormalizeCharMap(map);
+     }
+-    currMap.normStr = replacement;
+-    currMap.diff = singleMatch.length() - replacement.length();
+   }
+ }
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/charfilter/TestMappingCharFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/charfilter/TestMappingCharFilter.java
+index 1fbf0f1..301a339 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/charfilter/TestMappingCharFilter.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/charfilter/TestMappingCharFilter.java
+@@ -19,7 +19,11 @@ package org.apache.lucene.analysis.charfilter;
+ 
+ import java.io.Reader;
+ import java.io.StringReader;
++import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
+ 
+@@ -39,18 +43,20 @@ public class TestMappingCharFilter extends BaseTokenStreamTestCase {
+   @Override
+   public void setUp() throws Exception {
+     super.setUp();
+-    normMap = new NormalizeCharMap();
++    NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
+ 
+-    normMap.add( "aa", "a" );
+-    normMap.add( "bbb", "b" );
+-    normMap.add( "cccc", "cc" );
++    builder.add( "aa", "a" );
++    builder.add( "bbb", "b" );
++    builder.add( "cccc", "cc" );
+ 
+-    normMap.add( "h", "i" );
+-    normMap.add( "j", "jj" );
+-    normMap.add( "k", "kkk" );
+-    normMap.add( "ll", "llll" );
++    builder.add( "h", "i" );
++    builder.add( "j", "jj" );
++    builder.add( "k", "kkk" );
++    builder.add( "ll", "llll" );
+ 
+-    normMap.add( "empty", "" );
++    builder.add( "empty", "" );
++
++    normMap = builder.build();
+   }
+ 
+   public void testReaderReset() throws Exception {
+@@ -197,11 +203,13 @@ public class TestMappingCharFilter extends BaseTokenStreamTestCase {
+ 
+   //@Ignore("wrong finalOffset: https://issues.apache.org/jira/browse/LUCENE-3971")
+   public void testFinalOffsetSpecialCase() throws Exception {  
+-    final NormalizeCharMap map = new NormalizeCharMap();
+-    map.add("t", "");
++    final NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++    builder.add("t", "");
+     // even though this below rule has no effect, the test passes if you remove it!!
+-    map.add("tmakdbl", "c");
++    builder.add("tmakdbl", "c");
+     
++    final NormalizeCharMap map = builder.build();
++
+     Analyzer analyzer = new Analyzer() {
+       @Override
+       protected TokenStreamComponents createComponents(String fieldName, Reader reader) {
+@@ -243,20 +251,194 @@ public class TestMappingCharFilter extends BaseTokenStreamTestCase {
+   
+   private NormalizeCharMap randomMap() {
+     Random random = random();
+-    NormalizeCharMap map = new NormalizeCharMap();
++    NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
+     // we can't add duplicate keys, or NormalizeCharMap gets angry
+     Set<String> keys = new HashSet<String>();
+     int num = random.nextInt(5);
+     //System.out.println("NormalizeCharMap=");
+     for (int i = 0; i < num; i++) {
+       String key = _TestUtil.randomSimpleString(random);
+-      if (!keys.contains(key)) {
++      if (!keys.contains(key) && key.length() != 0) {
+         String value = _TestUtil.randomSimpleString(random);
+-        map.add(key, value);
++        builder.add(key, value);
+         keys.add(key);
+         //System.out.println("mapping: '" + key + "' => '" + value + "'");
+       }
+     }
+-    return map;
++    return builder.build();
++  }
++
++  public void testRandomMaps2() throws Exception {
++    final Random random = random();
++    final int numIterations = atLeast(10);
++    for(int iter=0;iter<numIterations;iter++) {
++
++      if (VERBOSE) {
++        System.out.println("\nTEST iter=" + iter);
++      }
++
++      final char endLetter = (char) _TestUtil.nextInt(random, 'b', 'z');
++
++      final Map<String,String> map = new HashMap<String,String>();
++      final NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++      final int numMappings = atLeast(5);
++      if (VERBOSE) {
++        System.out.println("  mappings:");
++      }
++      while (map.size() < numMappings) {
++        final String key = _TestUtil.randomSimpleStringRange(random, 'a', endLetter, 7);
++        if (key.length() != 0 && !map.containsKey(key)) {
++          final String value = _TestUtil.randomSimpleString(random);
++          map.put(key, value);
++          builder.add(key, value);
++          if (VERBOSE) {
++            System.out.println("    " + key + " -> " + value);
++          }
++        }
++      }
++
++      final NormalizeCharMap charMap = builder.build();
++
++      if (VERBOSE) {
++        System.out.println("  test random documents...");
++      }
++
++      for(int iter2=0;iter2<100;iter2++) {
++        final String content = _TestUtil.randomSimpleStringRange(random, 'a', endLetter, atLeast(1000));
++
++        if (VERBOSE) {
++          System.out.println("  content=" + content);
++        }
++
++        // Do stupid dog-slow mapping:
++
++        // Output string:
++        final StringBuilder output = new StringBuilder();
++
++        // Maps output offset to input offset:
++        final List<Integer> inputOffsets = new ArrayList<Integer>();
++
++        int cumDiff = 0;
++        int charIdx = 0;
++        while(charIdx < content.length()) {
++
++          int matchLen = -1;
++          String matchRepl = null;
++
++          for(Map.Entry<String,String> ent : map.entrySet()) {
++            final String match = ent.getKey();
++            if (charIdx + match.length() <= content.length()) {
++              final int limit = charIdx+match.length();
++              boolean matches = true;
++              for(int charIdx2=charIdx;charIdx2<limit;charIdx2++) {
++                if (match.charAt(charIdx2-charIdx) != content.charAt(charIdx2)) {
++                  matches = false;
++                  break;
++                }
++              }
++
++              if (matches) {
++                final String repl = ent.getValue();
++                if (match.length() > matchLen) {
++                  // Greedy: longer match wins
++                  matchLen = match.length();
++                  matchRepl = repl;
++                }
++              }
++            }
++          }
++
++          if (matchLen != -1) {
++            // We found a match here!
++            if (VERBOSE) {
++              System.out.println("    match=" + content.substring(charIdx, charIdx+matchLen) + " @ off=" + charIdx + " repl=" + matchRepl);
++            }
++            output.append(matchRepl);
++            final int minLen = Math.min(matchLen, matchRepl.length());
++
++            // Common part, directly maps back to input
++            // offset:
++            for(int outIdx=0;outIdx<minLen;outIdx++) {
++              inputOffsets.add(output.length() - matchRepl.length() + outIdx + cumDiff);
++            }
++
++            cumDiff += matchLen - matchRepl.length();
++            charIdx += matchLen;
++
++            if (matchRepl.length() < matchLen) {
++              // Replacement string is shorter than matched
++              // input: nothing to do
++            } else if (matchRepl.length() > matchLen) {
++              // Replacement string is longer than matched
++              // input: for all the "extra" chars we map
++              // back to a single input offset:
++              for(int outIdx=matchLen;outIdx<matchRepl.length();outIdx++) {
++                inputOffsets.add(output.length() + cumDiff - 1);
++              }
++            } else {
++              // Same length: no change to offset
++            }
++
++            assert inputOffsets.size() == output.length(): "inputOffsets.size()=" + inputOffsets.size() + " vs output.length()=" + output.length();
++          } else {
++            inputOffsets.add(output.length() + cumDiff);
++            output.append(content.charAt(charIdx));
++            charIdx++;
++          }
++        }
++
++        final String expected = output.toString();
++        if (VERBOSE) {
++          System.out.print("    expected:");
++          for(int charIdx2=0;charIdx2<expected.length();charIdx2++) {
++            System.out.print(" " + expected.charAt(charIdx2) + "/" + inputOffsets.get(charIdx2));
++          }
++          System.out.println();
++        }
++
++        final MappingCharFilter mapFilter = new MappingCharFilter(charMap, new StringReader(content));
++
++        final StringBuilder actualBuilder = new StringBuilder();
++        final List<Integer> actualInputOffsets = new ArrayList<Integer>();
++
++        // Now consume the actual mapFilter, somewhat randomly:
++        while (true) {
++          if (random.nextBoolean()) {
++            final int ch = mapFilter.read();
++            if (ch == -1) {
++              break;
++            }
++            actualBuilder.append((char) ch);
++          } else {
++            final char[] buffer = new char[_TestUtil.nextInt(random, 1, 100)];
++            final int off = buffer.length == 1 ? 0 : random.nextInt(buffer.length-1);
++            final int count = mapFilter.read(buffer, off, buffer.length-off);
++            if (count == -1) {
++              break;
++            } else {
++              actualBuilder.append(buffer, off, count);
++            }
++          }
++
++          if (random.nextInt(10) == 7) {
++            // Map offsets
++            while(actualInputOffsets.size() < actualBuilder.length()) {
++              actualInputOffsets.add(mapFilter.correctOffset(actualInputOffsets.size()));
++            }
++          }
++        }
++
++        // Finish mappping offsets
++        while(actualInputOffsets.size() < actualBuilder.length()) {
++          actualInputOffsets.add(mapFilter.correctOffset(actualInputOffsets.size()));
++        }
++
++        final String actual = actualBuilder.toString();
++
++        // Verify:
++        assertEquals(expected, actual);
++        assertEquals(inputOffsets, actualInputOffsets);
++      }        
++    }
+   }
+ }
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/cjk/TestCJKAnalyzer.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/cjk/TestCJKAnalyzer.java
+index ec75c4f..2efb13c 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/cjk/TestCJKAnalyzer.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/cjk/TestCJKAnalyzer.java
+@@ -203,9 +203,10 @@ public class TestCJKAnalyzer extends BaseTokenStreamTestCase {
+   
+   /** test that offsets are correct when mappingcharfilter is previously applied */
+   public void testChangedOffsets() throws IOException {
+-    final NormalizeCharMap norm = new NormalizeCharMap();
+-    norm.add("a", "ä¸?äº?");
+-    norm.add("b", "äº??");
++    final NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++    builder.add("a", "ä¸?äº?");
++    builder.add("b", "äº??");
++    final NormalizeCharMap norm = builder.build();
+     Analyzer analyzer = new Analyzer() {
+       @Override
+       protected TokenStreamComponents createComponents(String fieldName, Reader reader) {
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/compound/TestCompoundWordTokenFilter.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/compound/TestCompoundWordTokenFilter.java
+index c926b9d..8db3333 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/compound/TestCompoundWordTokenFilter.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/compound/TestCompoundWordTokenFilter.java
+@@ -312,8 +312,9 @@ public class TestCompoundWordTokenFilter extends BaseTokenStreamTestCase {
+   // so in this case we behave like WDF, and preserve any modified offsets
+   public void testInvalidOffsets() throws Exception {
+     final CharArraySet dict = makeDictionary("fall");
+-    final NormalizeCharMap normMap = new NormalizeCharMap();
+-    normMap.add("Ã¼", "ue");
++    final NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++    builder.add("Ã¼", "ue");
++    final NormalizeCharMap normMap = builder.build();
+     
+     Analyzer analyzer = new Analyzer() {
+ 
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestBugInSomething.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestBugInSomething.java
+index 16716ee..d94c6cf 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestBugInSomething.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestBugInSomething.java
+@@ -41,11 +41,11 @@ public class TestBugInSomething extends BaseTokenStreamTestCase {
+     cas.add("wlmwoknt");
+     cas.add("tcgyreo");
+     
+-    final NormalizeCharMap map = new NormalizeCharMap();
+-    map.add("mtqlpi", "");
+-    map.add("mwoknt", "jjp");
+-    map.add("tcgyreo", "zpfpajyws");
+-    map.add("", "eethksv");
++    final NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++    builder.add("mtqlpi", "");
++    builder.add("mwoknt", "jjp");
++    builder.add("tcgyreo", "zpfpajyws");
++    final NormalizeCharMap map = builder.build();
+     
+     Analyzer a = new Analyzer() {
+       @Override
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java
+index 09f1d5e..82d9007 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/core/TestRandomChains.java
+@@ -56,7 +56,6 @@ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.analysis.Tokenizer;
+ import org.apache.lucene.analysis.wikipedia.WikipediaTokenizer;
+ import org.apache.lucene.analysis.ValidatingTokenFilter;
+-import org.apache.lucene.analysis.charfilter.CharFilter;
+ import org.apache.lucene.analysis.charfilter.NormalizeCharMap;
+ import org.apache.lucene.analysis.cjk.CJKBigramFilter;
+ import org.apache.lucene.analysis.commongrams.CommonGramsFilter;
+@@ -434,21 +433,21 @@ public class TestRandomChains extends BaseTokenStreamTestCase {
+     });
+     put(NormalizeCharMap.class, new ArgProducer() {
+       @Override public Object create(Random random) {
+-        NormalizeCharMap map = new NormalizeCharMap();
++        NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
+         // we can't add duplicate keys, or NormalizeCharMap gets angry
+         Set<String> keys = new HashSet<String>();
+         int num = random.nextInt(5);
+         //System.out.println("NormalizeCharMap=");
+         for (int i = 0; i < num; i++) {
+           String key = _TestUtil.randomSimpleString(random);
+-          if (!keys.contains(key)) {
++          if (!keys.contains(key) && key.length() > 0) {
+             String value = _TestUtil.randomSimpleString(random);
+-            map.add(key, value);
++            builder.add(key, value);
+             keys.add(key);
+             //System.out.println("mapping: '" + key + "' => '" + value + "'");
+           }
+         }
+-        return map;
++        return builder.build();
+       }
+     });
+     put(CharacterRunAutomaton.class, new ArgProducer() {
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/path/TestPathHierarchyTokenizer.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/path/TestPathHierarchyTokenizer.java
+index 9c3ac23..9533470 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/path/TestPathHierarchyTokenizer.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/path/TestPathHierarchyTokenizer.java
+@@ -119,8 +119,9 @@ public class TestPathHierarchyTokenizer extends BaseTokenStreamTestCase {
+   }
+ 
+   public void testNormalizeWinDelimToLinuxDelim() throws Exception {
+-    NormalizeCharMap normMap = new NormalizeCharMap();
+-    normMap.add("\\", "/");
++    NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++    builder.add("\\", "/");
++    NormalizeCharMap normMap = builder.build();
+     String path = "c:\\a\\b\\c";
+     CharStream cs = new MappingCharFilter(normMap, new StringReader(path));
+     PathHierarchyTokenizer t = new PathHierarchyTokenizer( cs );
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/pattern/TestPatternTokenizer.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/pattern/TestPatternTokenizer.java
+index 87eb49b..7d48abd 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/pattern/TestPatternTokenizer.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/pattern/TestPatternTokenizer.java
+@@ -80,8 +80,9 @@ public class TestPatternTokenizer extends BaseTokenStreamTestCase
+     // create MappingCharFilter
+     List<String> mappingRules = new ArrayList<String>();
+     mappingRules.add( "\"&uuml;\" => \"Ã¼\"" );
+-    NormalizeCharMap normMap = new NormalizeCharMap();
+-    normMap.add("&uuml;", "Ã¼");
++    NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++    builder.add("&uuml;", "Ã¼");
++    NormalizeCharMap normMap = builder.build();
+     CharStream charStream = new MappingCharFilter( normMap, CharReader.get( new StringReader( INPUT ) ) );
+ 
+     // create PatternTokenizer
+diff --git a/lucene/core/src/java/org/apache/lucene/util/CharsRef.java b/lucene/core/src/java/org/apache/lucene/util/CharsRef.java
+index 726c3f9..a1e34cd 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/CharsRef.java
++++ b/lucene/core/src/java/org/apache/lucene/util/CharsRef.java
+@@ -1,7 +1,5 @@
+ package org.apache.lucene.util;
+ 
+-import java.util.Comparator;
+-
+ /**
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -19,6 +17,8 @@ import java.util.Comparator;
+  * limitations under the License.
+  */
+ 
++import java.util.Comparator;
++
+ /**
+  * Represents char[], as a slice (offset + length) into an existing char[].
+  * The {@link #chars} member should never be null; use
+diff --git a/lucene/core/src/java/org/apache/lucene/util/RollingCharBuffer.java b/lucene/core/src/java/org/apache/lucene/util/RollingCharBuffer.java
+index 5320c30..04fc4a4 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/RollingCharBuffer.java
++++ b/lucene/core/src/java/org/apache/lucene/util/RollingCharBuffer.java
+@@ -32,7 +32,7 @@ public final class RollingCharBuffer {
+ 
+   private Reader reader;
+ 
+-  private char[] buffer = new char[32];
++  private char[] buffer = new char[512];
+ 
+   // Next array index to write to in buffer:
+   private int nextWrite;
+@@ -66,11 +66,6 @@ public final class RollingCharBuffer {
+       if (end) {
+         return -1;
+       }
+-      final int ch = reader.read();
+-      if (ch == -1) {
+-        end = true;
+-        return -1;
+-      }
+       if (count == buffer.length) {
+         // Grow
+         final char[] newBuffer = new char[ArrayUtil.oversize(1+count, RamUsageEstimator.NUM_BYTES_CHAR)];
+@@ -83,9 +78,17 @@ public final class RollingCharBuffer {
+       if (nextWrite == buffer.length) {
+         nextWrite = 0;
+       }
+-      buffer[nextWrite++] = (char) ch;
+-      count++;
+-      nextPos++;
++
++      final int toRead = buffer.length - Math.max(count, nextWrite);
++      final int readCount = reader.read(buffer, nextWrite, toRead);
++      if (readCount == -1) {
++        end = true;
++        return -1;
++      }
++      final int ch = buffer[nextWrite];
++      nextWrite += readCount;
++      count += readCount;
++      nextPos += readCount;
+       return ch;
+     } else {
+       // Cannot read from future (except by 1):
+@@ -94,8 +97,7 @@ public final class RollingCharBuffer {
+       // Cannot read from already freed past:
+       assert nextPos - pos <= count: "nextPos=" + nextPos + " pos=" + pos + " count=" + count;
+ 
+-      final int index = getIndex(pos);
+-      return buffer[index];
++      return buffer[getIndex(pos)];
+     }
+   }
+ 
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/util/_TestUtil.java b/lucene/test-framework/src/java/org/apache/lucene/util/_TestUtil.java
+index bbbb2c5..fb2fee8 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/util/_TestUtil.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/util/_TestUtil.java
+@@ -206,6 +206,19 @@ public class _TestUtil {
+     return new String(buffer, 0, end);
+   }
+ 
++  public static String randomSimpleStringRange(Random r, char minChar, char maxChar, int maxLength) {
++    final int end = nextInt(r, 0, maxLength);
++    if (end == 0) {
++      // allow 0 length
++      return "";
++    }
++    final char[] buffer = new char[end];
++    for (int i = 0; i < end; i++) {
++      buffer[i] = (char) _TestUtil.nextInt(r, minChar, maxChar);
++    }
++    return new String(buffer, 0, end);
++  }
++
+   public static String randomSimpleString(Random r) {
+     return randomSimpleString(r, 10);
+   }
+diff --git a/solr/core/src/java/org/apache/solr/analysis/MappingCharFilterFactory.java b/solr/core/src/java/org/apache/solr/analysis/MappingCharFilterFactory.java
+index 74b0310..1542d94 100644
+--- a/solr/core/src/java/org/apache/solr/analysis/MappingCharFilterFactory.java
++++ b/solr/core/src/java/org/apache/solr/analysis/MappingCharFilterFactory.java
+@@ -73,8 +73,9 @@ public class MappingCharFilterFactory extends BaseCharFilterFactory implements
+       catch( IOException e ){
+         throw new InitializationException("IOException thrown while loading mappings", e);
+       }
+-      normMap = new NormalizeCharMap();
+-      parseRules( wlist, normMap );
++      final NormalizeCharMap.Builder builder = new NormalizeCharMap.Builder();
++      parseRules( wlist, builder );
++      normMap = builder.build();
+     }
+   }
+ 
+@@ -85,12 +86,12 @@ public class MappingCharFilterFactory extends BaseCharFilterFactory implements
+   // "source" => "target"
+   static Pattern p = Pattern.compile( "\"(.*)\"\\s*=>\\s*\"(.*)\"\\s*$" );
+ 
+-  protected void parseRules( List<String> rules, NormalizeCharMap normMap ){
++  protected void parseRules( List<String> rules, NormalizeCharMap.Builder builder ){
+     for( String rule : rules ){
+       Matcher m = p.matcher( rule );
+       if( !m.find() )
+         throw new InitializationException("Invalid Mapping Rule : [" + rule + "], file = " + mapping);
+-      normMap.add( parseString( m.group( 1 ) ), parseString( m.group( 2 ) ) );
++      builder.add( parseString( m.group( 1 ) ), parseString( m.group( 2 ) ) );
+     }
+   }
+ 
+

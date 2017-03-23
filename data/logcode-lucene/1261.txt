@@ -1,0 +1,565 @@
+GitDiffStart: 44c9cd2fe8403e7b17e2706c241cb7268773e788 | Sun Apr 17 21:56:58 2016 +0530
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 2b6c868..8ae840a 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -120,7 +120,10 @@ Bug Fixes
+   (Nicolas Gavalda, Jorge Luis Betancourt Gonzalez via Mark Miller)
+ 
+ * SOLR-8946: bin/post failed to detect stdin usage on Ubuntu; maybe other unixes. (David Smiley)
+-  
++
++* SOLR-8662: SchemaManager waits correctly for replicas to be notified of a new change.
++  (sarowe, Noble Paul, Varun Thacker)
++
+ Optimizations
+ ----------------------
+ * SOLR-8722: Don't force a full ZkStateReader refresh on every Overseer operation.
+diff --git a/solr/core/src/java/org/apache/solr/cloud/ZkSolrResourceLoader.java b/solr/core/src/java/org/apache/solr/cloud/ZkSolrResourceLoader.java
+index 4d12db9..2b60e53 100644
+--- a/solr/core/src/java/org/apache/solr/cloud/ZkSolrResourceLoader.java
++++ b/solr/core/src/java/org/apache/solr/cloud/ZkSolrResourceLoader.java
+@@ -80,17 +80,42 @@ public class ZkSolrResourceLoader extends SolrResourceLoader {
+    */
+   @Override
+   public InputStream openResource(String resource) throws IOException {
+-    InputStream is = null;
++    InputStream is;
+     String file = configSetZkPath + "/" + resource;
+-    try {
+-      if (zkController.pathExists(file)) {
+-        Stat stat = new Stat();
+-        byte[] bytes = zkController.getZkClient().getData(file, null, stat, true);
+-        return new ZkByteArrayInputStream(bytes, stat);
++    int maxTries = 10;
++    Exception exception = null;
++    while (maxTries -- > 0) {
++      try {
++        if (zkController.pathExists(file)) {
++          Stat stat = new Stat();
++          byte[] bytes = zkController.getZkClient().getData(file, null, stat, true);
++          return new ZkByteArrayInputStream(bytes, stat);
++        } else {
++          //Path does not exists. We only retry for session expired exceptions.
++          break;
++        }
++      } catch (KeeperException.SessionExpiredException e) {
++        exception = e;
++        // Retry in case of session expiry
++        try {
++          Thread.sleep(1000);
++          log.debug("Sleeping for 1s before retrying fetching resource=" + resource);
++        } catch (InterruptedException ie) {
++          Thread.currentThread().interrupt();
++          throw new IOException("Could not load resource=" + resource, ie);
++        }
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++        throw new IOException("Error opening " + file, e);
++      } catch (KeeperException e) {
++        throw new IOException("Error opening " + file, e);
+       }
+-    } catch (Exception e) {
+-      throw new IOException("Error opening " + file, e);
+     }
++
++    if (exception != null) {
++      throw new IOException("We re-tried 10 times but was still unable to fetch resource=" + resource + " from ZK", exception);
++    }
++
+     try {
+       // delegate to the class loader (looking into $INSTANCE_DIR/lib jars)
+       is = classLoader.getResourceAsStream(resource.replace(File.separatorChar, '/'));
+diff --git a/solr/core/src/java/org/apache/solr/schema/SchemaManager.java b/solr/core/src/java/org/apache/solr/schema/SchemaManager.java
+index e70b84f..3b492a7 100644
+--- a/solr/core/src/java/org/apache/solr/schema/SchemaManager.java
++++ b/solr/core/src/java/org/apache/solr/schema/SchemaManager.java
+@@ -25,6 +25,7 @@ import org.apache.solr.core.SolrResourceLoader;
+ import org.apache.solr.request.SolrQueryRequest;
+ import org.apache.solr.rest.BaseSolrResource;
+ import org.apache.solr.util.CommandOperation;
++import org.apache.solr.util.TimeOut;
+ import org.apache.zookeeper.KeeperException;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -86,20 +87,27 @@ public class SchemaManager {
+     if (!errs.isEmpty()) return errs;
+ 
+     IndexSchema schema = req.getCore().getLatestSchema();
+-    if (!(schema instanceof ManagedIndexSchema)) {
++    if (schema instanceof ManagedIndexSchema && schema.isMutable()) {
++      synchronized (schema.getSchemaUpdateLock()) {
++        return doOperations(ops);
++      }
++    } else {
+       return singletonList(singletonMap(CommandOperation.ERR_MSGS, "schema is not editable"));
+     }
+-    synchronized (schema.getSchemaUpdateLock()) {
+-      return doOperations(ops);
+-    }
+   }
+ 
+   private List doOperations(List<CommandOperation> operations) throws InterruptedException, IOException, KeeperException {
+-    int timeout = req.getParams().getInt(BaseSolrResource.UPDATE_TIMEOUT_SECS, -1);
+-    long startTime = System.nanoTime();
+-    long endTime = timeout > 0 ? System.nanoTime() + (timeout * 1000 * 1000) : Long.MAX_VALUE;
++    //The default timeout is 10 minutes when no BaseSolrResource.UPDATE_TIMEOUT_SECS is specified
++    int timeout = req.getParams().getInt(BaseSolrResource.UPDATE_TIMEOUT_SECS, 600);
++
++    //If BaseSolrResource.UPDATE_TIMEOUT_SECS=0 or -1 then end time then we'll try for 10 mins ( default timeout )
++    if (timeout < 1) {
++      timeout = 600;
++    }
++    TimeOut timeOut = new TimeOut(timeout, TimeUnit.SECONDS);
+     SolrCore core = req.getCore();
+-    while (System.nanoTime() < endTime) {
++    String errorMsg = "Unable to persist managed schema. ";
++    while (!timeOut.hasTimedOut()) {
+       managedIndexSchema = getFreshManagedSchema();
+       for (CommandOperation op : operations) {
+         OpType opType = OpType.get(op.name);
+@@ -118,25 +126,18 @@ public class SchemaManager {
+         try {
+           managedIndexSchema.persist(sw);
+         } catch (IOException e) {
+-          log.info("race condition ");
+           throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "unable to serialize schema");
+           //unlikely
+         }
+ 
+         try {
+-          ZkController.persistConfigResourceToZooKeeper(zkLoader,
+-              managedIndexSchema.getSchemaZkVersion(),
+-              managedIndexSchema.getResourceName(),
+-              sw.toString().getBytes(StandardCharsets.UTF_8),
+-              true);
+-          waitForOtherReplicasToUpdate(timeout, startTime);
++          ZkController.persistConfigResourceToZooKeeper(zkLoader, managedIndexSchema.getSchemaZkVersion(),
++              managedIndexSchema.getResourceName(), sw.toString().getBytes(StandardCharsets.UTF_8), true);
++          waitForOtherReplicasToUpdate(timeOut);
++          core.setLatestSchema(managedIndexSchema);
+           return Collections.emptyList();
+         } catch (ZkController.ResourceModifiedInZkException e) {
+-          log.info("Race condition schema modified by another node");
+-        } catch (Exception e) {
+-          String s = "Exception persisting schema";
+-          log.warn(s, e);
+-          return singletonList(s + e.getMessage());
++          log.info("Schema was modified by another node. Retrying..");
+         }
+       } else {
+         try {
+@@ -144,36 +145,30 @@ public class SchemaManager {
+           managedIndexSchema.persistManagedSchema(false);
+           core.setLatestSchema(managedIndexSchema);
+           return Collections.emptyList();
+-        } catch (ManagedIndexSchema.SchemaChangedInZkException e) {
+-          String s = "Failed to update schema because schema is modified";
+-          log.warn(s, e);
+-        } catch (Exception e) {
+-          String s = "Exception persisting schema";
+-          log.warn(s, e);
+-          return singletonList(s + e.getMessage());
++        } catch (SolrException e) {
++          log.warn(errorMsg);
++          return singletonList(errorMsg + e.getMessage());
+         }
+       }
+     }
+-    return singletonList("Unable to persist schema");
++    log.warn(errorMsg + "Timed out.");
++    return singletonList(errorMsg + "Timed out.");
+   }
+ 
+-  private void waitForOtherReplicasToUpdate(int timeout, long startTime) {
+-    if (timeout > 0 && managedIndexSchema.getResourceLoader() instanceof ZkSolrResourceLoader) {
+-      CoreDescriptor cd = req.getCore().getCoreDescriptor();
+-      String collection = cd.getCollectionName();
+-      if (collection != null) {
+-        ZkSolrResourceLoader zkLoader = (ZkSolrResourceLoader) managedIndexSchema.getResourceLoader();
+-        long timeLeftSecs = timeout - TimeUnit.SECONDS.convert(System.nanoTime() - startTime, TimeUnit.NANOSECONDS);
+-        if (timeLeftSecs <= 0) {
+-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+-              "Not enough time left to update replicas. However, the schema is updated already.");
+-        }
+-        ManagedIndexSchema.waitForSchemaZkVersionAgreement(collection,
+-            cd.getCloudDescriptor().getCoreNodeName(),
+-            (managedIndexSchema).getSchemaZkVersion(),
+-            zkLoader.getZkController(),
+-            (int) timeLeftSecs);
++  private void waitForOtherReplicasToUpdate(TimeOut timeOut) {
++    CoreDescriptor cd = req.getCore().getCoreDescriptor();
++    String collection = cd.getCollectionName();
++    if (collection != null) {
++      ZkSolrResourceLoader zkLoader = (ZkSolrResourceLoader) managedIndexSchema.getResourceLoader();
++      if (timeOut.hasTimedOut()) {
++        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
++            "Not enough time left to update replicas. However, the schema is updated already.");
+       }
++      ManagedIndexSchema.waitForSchemaZkVersionAgreement(collection,
++          cd.getCloudDescriptor().getCoreNodeName(),
++          (managedIndexSchema).getSchemaZkVersion(),
++          zkLoader.getZkController(),
++          (int) timeOut.timeLeft(TimeUnit.SECONDS));
+     }
+   }
+ 
+@@ -198,7 +193,7 @@ public class SchemaManager {
+       @Override public boolean perform(CommandOperation op, SchemaManager mgr) {
+         String src  = op.getStr(SOURCE);
+         List<String> dests = op.getStrs(DESTINATION);
+-        
++
+         int maxChars = CopyField.UNLIMITED; // If maxChars is not specified, there is no limit on copied chars
+         String maxCharsStr = op.getStr(MAX_CHARS, null);
+         if (null != maxCharsStr) {
+@@ -241,7 +236,7 @@ public class SchemaManager {
+         }
+         try {
+           SchemaField field = SchemaField.create(name, ft, op.getValuesExcluding(NAME, TYPE));
+-          mgr.managedIndexSchema 
++          mgr.managedIndexSchema
+               = mgr.managedIndexSchema.addFields(singletonList(field), Collections.emptyMap(), false);
+           return true;
+         } catch (Exception e) {
+@@ -262,8 +257,8 @@ public class SchemaManager {
+           return  false;
+         }
+         try {
+-          SchemaField field = SchemaField.create(name, ft, op.getValuesExcluding(NAME, TYPE)); 
+-          mgr.managedIndexSchema 
++          SchemaField field = SchemaField.create(name, ft, op.getValuesExcluding(NAME, TYPE));
++          mgr.managedIndexSchema
+               = mgr.managedIndexSchema.addDynamicFields(singletonList(field), Collections.emptyMap(), false);
+           return true;
+         } catch (Exception e) {
+@@ -297,7 +292,7 @@ public class SchemaManager {
+         if (op.hasError())
+           return false;
+         if ( ! op.getValuesExcluding(SOURCE, DESTINATION).isEmpty()) {
+-          op.addError("Only the '" + SOURCE + "' and '" + DESTINATION 
++          op.addError("Only the '" + SOURCE + "' and '" + DESTINATION
+               + "' params are allowed with the 'delete-copy-field' operation");
+           return false;
+         }
+@@ -318,14 +313,14 @@ public class SchemaManager {
+         if ( ! op.getValuesExcluding(NAME).isEmpty()) {
+           op.addError("Only the '" + NAME + "' param is allowed with the 'delete-field' operation");
+           return false;
+-        }                                                            
++        }
+         try {
+           mgr.managedIndexSchema = mgr.managedIndexSchema.deleteFields(singleton(name));
+           return true;
+         } catch (Exception e) {
+           op.addError(getErrorStr(e));
+           return false;
+-        }                                                             
++        }
+       }
+     },
+     DELETE_DYNAMIC_FIELD("delete-dynamic-field") {
+@@ -436,7 +431,7 @@ public class SchemaManager {
+         int version = ((ZkSolrResourceLoader.ZkByteArrayInputStream) in).getStat().getVersion();
+         log.info("managed schema loaded . version : {} ", version);
+         return new ManagedIndexSchema
+-            (req.getCore().getSolrConfig(), req.getSchema().getResourceName(), new InputSource(in), 
++            (req.getCore().getSolrConfig(), req.getSchema().getResourceName(), new InputSource(in),
+                 true, req.getSchema().getResourceName(), version, req.getSchema().getSchemaUpdateLock());
+       } else {
+         return (ManagedIndexSchema) req.getCore().getLatestSchema();
+diff --git a/solr/core/src/test-files/solr/configsets/cloud-managed/conf/managed-schema b/solr/core/src/test-files/solr/configsets/cloud-managed/conf/managed-schema
+new file mode 100644
+index 0000000..fd7be83
+--- /dev/null
++++ b/solr/core/src/test-files/solr/configsets/cloud-managed/conf/managed-schema
+@@ -0,0 +1,31 @@
++<?xml version="1.0" encoding="UTF-8" ?>
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++<schema name="minimal" version="1.1">
++ <types>
++  <fieldType name="string" class="solr.StrField"/>
++  <fieldType name="int" class="solr.TrieIntField" precisionStep="0" omitNorms="true" positionIncrementGap="0"/>
++  <fieldType name="long" class="solr.TrieLongField" precisionStep="0" omitNorms="true" positionIncrementGap="0"/>
++ </types>
++ <fields>
++  <!-- for versioning -->
++  <field name="_version_" type="long" indexed="true" stored="true"/>
++  <field name="_root_" type="int" indexed="true" stored="true" multiValued="false" required="false"/>
++  <field name="id" type="string" indexed="true" stored="true"/>
++ </fields>
++ <uniqueKey>id</uniqueKey>
++</schema>
+diff --git a/solr/core/src/test-files/solr/configsets/cloud-managed/conf/solrconfig.xml b/solr/core/src/test-files/solr/configsets/cloud-managed/conf/solrconfig.xml
+new file mode 100644
+index 0000000..aabfa2f
+--- /dev/null
++++ b/solr/core/src/test-files/solr/configsets/cloud-managed/conf/solrconfig.xml
+@@ -0,0 +1,51 @@
++<?xml version="1.0" ?>
++
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++
++<!-- Minimal solrconfig.xml with /select, /admin and /update only -->
++
++<config>
++
++  <dataDir>${solr.data.dir:}</dataDir>
++
++  <directoryFactory name="DirectoryFactory"
++                    class="${solr.directoryFactory:solr.NRTCachingDirectoryFactory}"/>
++
++  <schemaFactory class="ManagedIndexSchemaFactory">
++    <bool name="mutable">${managed.schema.mutable}</bool>
++    <str name="managedSchemaResourceName">managed-schema</str>
++  </schemaFactory>
++
++  <luceneMatchVersion>${tests.luceneMatchVersion:LATEST}</luceneMatchVersion>
++
++  <updateHandler class="solr.DirectUpdateHandler2">
++    <commitWithin>
++      <softCommit>${solr.commitwithin.softcommit:true}</softCommit>
++    </commitWithin>
++    <updateLog></updateLog>
++  </updateHandler>
++
++  <requestHandler name="/select" class="solr.SearchHandler">
++    <lst name="defaults">
++      <str name="echoParams">explicit</str>
++      <str name="indent">true</str>
++      <str name="df">text</str>
++    </lst>
++
++  </requestHandler>
++</config>
+diff --git a/solr/core/src/test-files/solr/configsets/configset-1/conf/schema-minimal.xml b/solr/core/src/test-files/solr/configsets/configset-1/conf/schema-minimal.xml
+deleted file mode 100644
+index 9e2f947..0000000
+--- a/solr/core/src/test-files/solr/configsets/configset-1/conf/schema-minimal.xml
++++ /dev/null
+@@ -1,25 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8" ?>
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<schema name="minimal" version="1.1">
+- <types>
+-  <fieldType name="string" class="solr.StrField"/>
+- </types>
+- <fields>
+-   <dynamicField name="*" type="string" indexed="true" stored="true" />
+- </fields>
+-</schema>
+diff --git a/solr/core/src/test-files/solr/configsets/configset-1/conf/solrconfig-minimal.xml b/solr/core/src/test-files/solr/configsets/configset-1/conf/solrconfig-minimal.xml
+deleted file mode 100644
+index a6fe5ba..0000000
+--- a/solr/core/src/test-files/solr/configsets/configset-1/conf/solrconfig-minimal.xml
++++ /dev/null
+@@ -1,56 +0,0 @@
+-<?xml version="1.0" ?>
+-
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-
+-<!-- This is a "kitchen sink" config file that tests can use.
+-     When writting a new test, feel free to add *new* items (plugins,
+-     config options, etc...) as long as they don't break any existing
+-     tests.  if you need to test something esoteric please add a new
+-     "solrconfig-your-esoteric-purpose.xml" config file.
+-
+-     Note in particular that this test is used by MinimalSchemaTest so
+-     Anything added to this file needs to work correctly even if there
+-     is now uniqueKey or defaultSearch Field.
+-  -->
+-
+-<config>
+-
+-  <dataDir>${solr.data.dir:}</dataDir>
+-
+-  <directoryFactory name="DirectoryFactory"
+-                    class="${solr.directoryFactory:solr.NRTCachingDirectoryFactory}"/>
+-  <schemaFactory class="ClassicIndexSchemaFactory"/>
+-
+-  <luceneMatchVersion>${tests.luceneMatchVersion:LATEST}</luceneMatchVersion>
+-
+-  <updateHandler class="solr.DirectUpdateHandler2">
+-    <commitWithin>
+-      <softCommit>${solr.commitwithin.softcommit:true}</softCommit>
+-    </commitWithin>
+-
+-  </updateHandler>
+-  <requestHandler name="/select" class="solr.SearchHandler">
+-    <lst name="defaults">
+-      <str name="echoParams">explicit</str>
+-      <str name="indent">true</str>
+-      <str name="df">text</str>
+-    </lst>
+-
+-  </requestHandler>
+-</config>
+-
+diff --git a/solr/core/src/test/org/apache/solr/schema/TestManagedSchemaAPI.java b/solr/core/src/test/org/apache/solr/schema/TestManagedSchemaAPI.java
+new file mode 100644
+index 0000000..3bd4dea
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/schema/TestManagedSchemaAPI.java
+@@ -0,0 +1,101 @@
++package org.apache.solr.schema;
++
++import java.io.IOException;
++import java.lang.invoke.MethodHandles;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++import org.apache.solr.client.solrj.SolrServerException;
++import org.apache.solr.client.solrj.impl.CloudSolrClient;
++import org.apache.solr.client.solrj.request.CollectionAdminRequest;
++import org.apache.solr.client.solrj.request.UpdateRequest;
++import org.apache.solr.client.solrj.request.schema.SchemaRequest;
++import org.apache.solr.client.solrj.response.CollectionAdminResponse;
++import org.apache.solr.client.solrj.response.schema.SchemaResponse;
++import org.apache.solr.cloud.SolrCloudTestCase;
++import org.apache.solr.common.SolrInputDocument;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++public class TestManagedSchemaAPI extends SolrCloudTestCase {
++  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
++
++  @BeforeClass
++  public static void createCluster() throws Exception {
++    System.setProperty("managed.schema.mutable", "true");
++    configureCluster(2)
++        .addConfig("conf1", TEST_PATH().resolve("configsets").resolve("cloud-managed").resolve("conf"))
++        .configure();
++  }
++
++  @Test
++  public void test() throws Exception {
++    String collection = "testschemaapi";
++    cluster.createCollection(collection, 1, 2, "conf1", null);
++    testReloadAndAddSimple(collection);
++    testAddFieldAndDocument(collection);
++  }
++
++  private void testReloadAndAddSimple(String collection) throws IOException, SolrServerException {
++    CloudSolrClient cloudClient = cluster.getSolrClient();
++
++    String fieldName = "myNewField";
++    addStringField(fieldName, collection, cloudClient);
++
++    CollectionAdminRequest.Reload reloadRequest = CollectionAdminRequest.reloadCollection(collection);
++    CollectionAdminResponse response = reloadRequest.process(cloudClient);
++    assertEquals(0, response.getStatus());
++    assertTrue(response.isSuccess());
++
++    SolrInputDocument doc = new SolrInputDocument();
++    doc.addField("id", "1");
++    doc.addField(fieldName, "val");
++    UpdateRequest ureq = new UpdateRequest().add(doc);
++    cloudClient.request(ureq, collection);
++  }
++
++  private void testAddFieldAndDocument(String collection) throws IOException, SolrServerException {
++    CloudSolrClient cloudClient = cluster.getSolrClient();
++
++    String fieldName = "myNewField1";
++    addStringField(fieldName, collection, cloudClient);
++
++    SolrInputDocument doc = new SolrInputDocument();
++    doc.addField("id", "2");
++    doc.addField(fieldName, "val1");
++    UpdateRequest ureq = new UpdateRequest().add(doc);
++    cloudClient.request(ureq, collection);;
++  }
++
++  private void addStringField(String fieldName, String collection, CloudSolrClient cloudClient) throws IOException, SolrServerException {
++    Map<String, Object> fieldAttributes = new LinkedHashMap<>();
++    fieldAttributes.put("name", fieldName);
++    fieldAttributes.put("type", "string");
++    SchemaRequest.AddField addFieldUpdateSchemaRequest = new SchemaRequest.AddField(fieldAttributes);
++    SchemaResponse.UpdateResponse addFieldResponse = addFieldUpdateSchemaRequest.process(cloudClient, collection);
++    assertEquals(0, addFieldResponse.getStatus());
++    assertNull(addFieldResponse.getResponse().get("errors"));
++
++    log.info("added new field="+fieldName);
++  }
++
++}
+

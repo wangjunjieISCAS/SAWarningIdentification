@@ -1,0 +1,3687 @@
+GitDiffStart: 78d52bef1f0f382daece814f3e975529aace7c98 | Mon Oct 14 15:55:57 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 7d4b746..7b7ca42 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -49,6 +49,11 @@ New Features
+   encode term metadata, and all dictionary implementations can now plug in any 
+   PostingsBaseFormat. (Han Jiang, Mike McCandless)
+ 
++* LUCENE-5268: Full cutover of all postings formats to the "pull"
++  FieldsConsumer API, removing PushFieldsConsumer.  Added new
++  PushPostingsWriterBase for single-pass push of docs/positions to the
++  postings format.  (Mike McCandless)
++
+ Optimizations
+ 
+ * LUCENE-4848: Use Java 7 NIO2-FileChannel instead of RandomAccessFile
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsWriter.java b/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsWriter.java
+index a8abaea..6ac103b 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsWriter.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/blockterms/BlockTermsWriter.java
+@@ -17,26 +17,29 @@ package org.apache.lucene.codecs.blockterms;
+  * limitations under the License.
+  */
+ 
++import java.io.Closeable;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
++import org.apache.lucene.codecs.BlockTermState;
+ import org.apache.lucene.codecs.CodecUtil;
+-import org.apache.lucene.codecs.PostingsConsumer;
++import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.PushFieldsConsumer;
+ import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.codecs.BlockTermState;
+-import org.apache.lucene.codecs.TermsConsumer;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.FieldInfos;
++import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.RamUsageEstimator;
+ 
+@@ -52,7 +55,7 @@ import org.apache.lucene.util.RamUsageEstimator;
+  * @lucene.experimental
+  */
+ 
+-public class BlockTermsWriter extends PushFieldsConsumer {
++public class BlockTermsWriter extends FieldsConsumer implements Closeable {
+ 
+   final static String CODEC_NAME = "BLOCK_TERMS_DICT";
+ 
+@@ -70,6 +73,7 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+   final FieldInfos fieldInfos;
+   FieldInfo currentField;
+   private final TermsIndexWriterBase termsIndexWriter;
++  private final int maxDoc;
+ 
+   private static class FieldMetaData {
+     public final FieldInfo fieldInfo;
+@@ -99,9 +103,9 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+   public BlockTermsWriter(TermsIndexWriterBase termsIndexWriter,
+       SegmentWriteState state, PostingsWriterBase postingsWriter)
+       throws IOException {
+-    super(state);
+     final String termsFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, TERMS_EXTENSION);
+     this.termsIndexWriter = termsIndexWriter;
++    maxDoc = state.segmentInfo.getDocCount();
+     out = state.directory.createOutput(termsFileName, state.context);
+     boolean success = false;
+     try {
+@@ -127,7 +131,43 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+   }
+ 
+   @Override
+-  public TermsConsumer addField(FieldInfo field) throws IOException {
++  public void write(Fields fields) throws IOException {
++
++    boolean success = false;
++    try {
++      for(String field : fields) {
++
++        Terms terms = fields.terms(field);
++        if (terms == null) {
++          continue;
++        }
++
++        TermsEnum termsEnum = terms.iterator(null);
++
++        TermsWriter termsWriter = addField(fieldInfos.fieldInfo(field));
++
++        while (true) {
++          BytesRef term = termsEnum.next();
++          if (term == null) {
++            break;
++          }
++
++          termsWriter.write(term, termsEnum);
++        }
++
++        termsWriter.finish();
++      }
++      success = true;
++    } finally {
++      if (success) {
++        IOUtils.close(this);
++      } else {
++        IOUtils.closeWhileHandlingException(this);
++      }
++    }
++  }
++
++  private TermsWriter addField(FieldInfo field) throws IOException {
+     //System.out.println("\nBTW.addField seg=" + segment + " field=" + field.name);
+     assert currentField == null || currentField.name.compareTo(field.name) < 0;
+     currentField = field;
+@@ -135,7 +175,6 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+     return new TermsWriter(fieldIndexWriter, field, postingsWriter);
+   }
+ 
+-  @Override
+   public void close() throws IOException {
+     try {
+       final long dirStart = out.getFilePointer();
+@@ -169,12 +208,13 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+     public BlockTermState state;
+   }
+ 
+-  class TermsWriter extends TermsConsumer {
++  class TermsWriter {
+     private final FieldInfo fieldInfo;
+     private final PostingsWriterBase postingsWriter;
+     private final long termsStartPointer;
+     private long numTerms;
+     private final TermsIndexWriterBase.FieldWriter fieldIndexWriter;
++    private final FixedBitSet docsSeen;
+     long sumTotalTermFreq;
+     long sumDocFreq;
+     int docCount;
+@@ -191,6 +231,7 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+     {
+       this.fieldInfo = fieldInfo;
+       this.fieldIndexWriter = fieldIndexWriter;
++      this.docsSeen = new FixedBitSet(maxDoc);
+       pendingTerms = new TermEntry[32];
+       for(int i=0;i<pendingTerms.length;i++) {
+         pendingTerms[i] = new TermEntry();
+@@ -200,21 +241,22 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+       this.longsSize = postingsWriter.setField(fieldInfo);
+     }
+     
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) throws IOException {
+-      //System.out.println("BTW: startTerm term=" + fieldInfo.name + ":" + text.utf8ToString() + " " + text + " seg=" + segment);
+-      postingsWriter.startTerm();
+-      return postingsWriter;
+-    }
+-
+     private final BytesRef lastPrevTerm = new BytesRef();
+ 
+-    @Override
+-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
++    void write(BytesRef text, TermsEnum termsEnum) throws IOException {
++
++      BlockTermState state = postingsWriter.writeTerm(text, termsEnum, docsSeen);
++      if (state == null) {
++        // No docs for this term:
++        return;
++      }
++      sumDocFreq += state.docFreq;
++      sumTotalTermFreq += state.totalTermFreq;
+ 
+-      assert stats.docFreq > 0;
++      assert state.docFreq > 0;
+       //System.out.println("BTW: finishTerm term=" + fieldInfo.name + ":" + text.utf8ToString() + " " + text + " seg=" + segment + " df=" + stats.docFreq);
+ 
++      TermStats stats = new TermStats(state.docFreq, state.totalTermFreq);
+       final boolean isIndexTerm = fieldIndexWriter.checkIndexTerm(text, stats);
+ 
+       if (isIndexTerm) {
+@@ -238,18 +280,14 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+       }
+       final TermEntry te = pendingTerms[pendingCount];
+       te.term.copyBytes(text);
+-      te.state = postingsWriter.newTermState();
+-      te.state.docFreq = stats.docFreq;
+-      te.state.totalTermFreq = stats.totalTermFreq;
+-      postingsWriter.finishTerm(te.state);
++      te.state = state;
+ 
+       pendingCount++;
+       numTerms++;
+     }
+ 
+     // Finishes all terms in this field
+-    @Override
+-    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
++    void finish() throws IOException {
+       if (pendingCount > 0) {
+         flushBlock();
+       }
+@@ -264,9 +302,9 @@ public class BlockTermsWriter extends PushFieldsConsumer {
+         fields.add(new FieldMetaData(fieldInfo,
+                                      numTerms,
+                                      termsStartPointer,
+-                                     sumTotalTermFreq,
++                                     fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS) >= 0 ? sumTotalTermFreq : -1,
+                                      sumDocFreq,
+-                                     docCount,
++                                     docsSeen.cardinality(),
+                                      longsSize));
+       }
+     }
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/bloom/BloomFilteringPostingsFormat.java b/lucene/codecs/src/java/org/apache/lucene/codecs/bloom/BloomFilteringPostingsFormat.java
+index f32a101..c1941ef 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/bloom/BloomFilteringPostingsFormat.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/bloom/BloomFilteringPostingsFormat.java
+@@ -28,15 +28,12 @@ import java.util.Map;
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.FieldsProducer;
+-import org.apache.lucene.codecs.PostingsConsumer;
+ import org.apache.lucene.codecs.PostingsFormat;
+-import org.apache.lucene.codecs.PushFieldsConsumer;
+-import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.codecs.TermsConsumer;
+ import org.apache.lucene.codecs.bloom.FuzzySet.ContainsResult;
+ import org.apache.lucene.index.DocsAndPositionsEnum;
+ import org.apache.lucene.index.DocsEnum;
+ import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.SegmentWriteState;
+@@ -118,9 +115,7 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
+    * "blm" file. This PostingsFormat delegates to a choice of delegate
+    * PostingsFormat for encoding all other postings data. This choice of
+    * constructor defaults to the {@link DefaultBloomFilterFactory} for
+-   * configuring per-field BloomFilters.  Note that the
+-   * wrapped PostingsFormat must use a {@link PushFieldsConsumer}
+-   * for writing.
++   * configuring per-field BloomFilters.
+    * 
+    * @param delegatePostingsFormat
+    *          The PostingsFormat that records all the non-bloom filter data i.e.
+@@ -144,11 +139,7 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
+           + " has been constructed without a choice of PostingsFormat");
+     }
+     FieldsConsumer fieldsConsumer = delegatePostingsFormat.fieldsConsumer(state);
+-    if (!(fieldsConsumer instanceof PushFieldsConsumer)) {
+-      throw new UnsupportedOperationException("Wrapped PostingsFormat must return a PushFieldsConsumer");
+-    }
+-    return new BloomFilteredFieldsConsumer(
+-              (PushFieldsConsumer) fieldsConsumer, state);
++    return new BloomFilteredFieldsConsumer(fieldsConsumer, state);
+   }
+   
+   @Override
+@@ -315,7 +306,7 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
+         this.delegateTermsEnum = null;
+       }
+       
+-      private final TermsEnum delegate() throws IOException {
++      private TermsEnum delegate() throws IOException {
+         if (delegateTermsEnum == null) {
+           /* pull the iterator only if we really need it -
+            * this can be a relativly heavy operation depending on the 
+@@ -327,12 +318,12 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
+       }
+       
+       @Override
+-      public final BytesRef next() throws IOException {
++      public BytesRef next() throws IOException {
+         return delegate().next();
+       }
+       
+       @Override
+-      public final boolean seekExact(BytesRef text)
++      public boolean seekExact(BytesRef text)
+           throws IOException {
+         // The magical fail-fast speed up that is the entire point of all of
+         // this code - save a disk seek if there is a match on an in-memory
+@@ -346,33 +337,33 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
+       }
+       
+       @Override
+-      public final SeekStatus seekCeil(BytesRef text)
++      public SeekStatus seekCeil(BytesRef text)
+           throws IOException {
+         return delegate().seekCeil(text);
+       }
+       
+       @Override
+-      public final void seekExact(long ord) throws IOException {
++      public void seekExact(long ord) throws IOException {
+         delegate().seekExact(ord);
+       }
+       
+       @Override
+-      public final BytesRef term() throws IOException {
++      public BytesRef term() throws IOException {
+         return delegate().term();
+       }
+       
+       @Override
+-      public final long ord() throws IOException {
++      public long ord() throws IOException {
+         return delegate().ord();
+       }
+       
+       @Override
+-      public final int docFreq() throws IOException {
++      public int docFreq() throws IOException {
+         return delegate().docFreq();
+       }
+       
+       @Override
+-      public final long totalTermFreq() throws IOException {
++      public long totalTermFreq() throws IOException {
+         return delegate().totalTermFreq();
+       }
+       
+@@ -401,35 +392,60 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
+     }
+   }
+   
+-  class BloomFilteredFieldsConsumer extends PushFieldsConsumer {
+-    private PushFieldsConsumer delegateFieldsConsumer;
++  class BloomFilteredFieldsConsumer extends FieldsConsumer {
++    private FieldsConsumer delegateFieldsConsumer;
+     private Map<FieldInfo,FuzzySet> bloomFilters = new HashMap<FieldInfo,FuzzySet>();
+     private SegmentWriteState state;
+     
+-    public BloomFilteredFieldsConsumer(PushFieldsConsumer fieldsConsumer,
++    public BloomFilteredFieldsConsumer(FieldsConsumer fieldsConsumer,
+         SegmentWriteState state) {
+-      super(state);
+       this.delegateFieldsConsumer = fieldsConsumer;
+       this.state = state;
+     }
+-    
++
+     @Override
+-    public TermsConsumer addField(FieldInfo field) throws IOException {
+-      FuzzySet bloomFilter = bloomFilterFactory.getSetForField(state,field);
+-      if (bloomFilter != null) {
+-        assert bloomFilters.containsKey(field) == false;
+-        bloomFilters.put(field, bloomFilter);
+-        return new WrappedTermsConsumer(delegateFieldsConsumer.addField(field), bloomFilter);
+-      } else {
+-        // No, use the unfiltered fieldsConsumer - we are not interested in
+-        // recording any term Bitsets.
+-        return delegateFieldsConsumer.addField(field);
++    public void write(Fields fields) throws IOException {
++      try {
++        for(String field : fields) {
++          Terms terms = fields.terms(field);
++          if (terms == null) {
++            continue;
++          }
++          FieldInfo fieldInfo = state.fieldInfos.fieldInfo(field);
++          TermsEnum termsEnum = terms.iterator(null);
++
++          FuzzySet bloomFilter = null;
++
++          DocsEnum docsEnum = null;
++          while (true) {
++            BytesRef term = termsEnum.next();
++            if (term == null) {
++              break;
++            }
++            if (bloomFilter == null) {
++              bloomFilter = bloomFilterFactory.getSetForField(state, fieldInfo);
++              if (bloomFilter == null) {
++                // Field not bloom'd
++                break;
++              }
++              assert bloomFilters.containsKey(field) == false;
++              bloomFilters.put(fieldInfo, bloomFilter);
++            }
++            // Make sure there's at least one doc for this term:
++            docsEnum = termsEnum.docs(null, docsEnum, 0);
++            if (docsEnum.nextDoc() != DocsEnum.NO_MORE_DOCS) {
++              bloomFilter.addValue(term);
++            }
++          }
++        }
++      } finally {
++        close();
+       }
++
++      delegateFieldsConsumer.write(fields);
+     }
+-    
+-    @Override
++
+     public void close() throws IOException {
+-      delegateFieldsConsumer.close();
+       // Now we are done accumulating values for these fields
+       List<Entry<FieldInfo,FuzzySet>> nonSaturatedBlooms = new ArrayList<Map.Entry<FieldInfo,FuzzySet>>();
+       
+@@ -475,37 +491,5 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
+       }
+       rightSizedSet.serialize(bloomOutput);
+     }
+-    
+-  }
+-  
+-  class WrappedTermsConsumer extends TermsConsumer {
+-    private TermsConsumer delegateTermsConsumer;
+-    private FuzzySet bloomFilter;
+-    
+-    public WrappedTermsConsumer(TermsConsumer termsConsumer,FuzzySet bloomFilter) {
+-      this.delegateTermsConsumer = termsConsumer;
+-      this.bloomFilter = bloomFilter;
+-    }
+-    
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) throws IOException {
+-      return delegateTermsConsumer.startTerm(text);
+-    }
+-    
+-    @Override
+-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
+-      
+-      // Record this term in our BloomFilter
+-      if (stats.docFreq > 0) {
+-        bloomFilter.addValue(text);
+-      }
+-      delegateTermsConsumer.finishTerm(text, stats);
+-    }
+-    
+-    @Override
+-    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount)
+-        throws IOException {
+-      delegateTermsConsumer.finish(sumTotalTermFreq, sumDocFreq, docCount);
+-    }
+   }
+ }
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPostingsFormat.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPostingsFormat.java
+index 285bae1..516ee84 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPostingsFormat.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPostingsFormat.java
+@@ -25,9 +25,8 @@ import org.apache.lucene.codecs.FieldsProducer;
+ import org.apache.lucene.codecs.PostingsFormat;
+ import org.apache.lucene.codecs.PostingsReaderBase;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsWriter;
+ import org.apache.lucene.codecs.lucene41.Lucene41PostingsReader;
+-import org.apache.lucene.index.FieldInfo.IndexOptions;
++import org.apache.lucene.codecs.lucene41.Lucene41PostingsWriter;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.util.IOUtils;
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPulsing41PostingsFormat.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPulsing41PostingsFormat.java
+index ad10794..c6033b2 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPulsing41PostingsFormat.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdPulsing41PostingsFormat.java
+@@ -25,12 +25,9 @@ import org.apache.lucene.codecs.PostingsBaseFormat;
+ import org.apache.lucene.codecs.PostingsFormat;
+ import org.apache.lucene.codecs.PostingsReaderBase;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsWriter;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsReader;
+ import org.apache.lucene.codecs.lucene41.Lucene41PostingsBaseFormat;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsFormat;
+-import org.apache.lucene.codecs.pulsing.PulsingPostingsWriter;
+ import org.apache.lucene.codecs.pulsing.PulsingPostingsReader;
++import org.apache.lucene.codecs.pulsing.PulsingPostingsWriter;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.util.IOUtils;
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsWriter.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsWriter.java
+index 1330e84..f1eec36 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsWriter.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTOrdTermsWriter.java
+@@ -23,20 +23,21 @@ import java.util.List;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+ import org.apache.lucene.codecs.CodecUtil;
+-import org.apache.lucene.codecs.PostingsConsumer;
++import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.PushFieldsConsumer;
+-import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.codecs.TermsConsumer;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.FieldInfos;
++import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.fst.Builder;
+@@ -142,7 +143,7 @@ import org.apache.lucene.util.fst.Util;
+  * @lucene.experimental 
+  */
+ 
+-public class FSTOrdTermsWriter extends PushFieldsConsumer {
++public class FSTOrdTermsWriter extends FieldsConsumer {
+   static final String TERMS_INDEX_EXTENSION = "tix";
+   static final String TERMS_BLOCK_EXTENSION = "tbk";
+   static final String TERMS_CODEC_NAME = "FST_ORD_TERMS_DICT";
+@@ -152,17 +153,18 @@ public class FSTOrdTermsWriter extends PushFieldsConsumer {
+   
+   final PostingsWriterBase postingsWriter;
+   final FieldInfos fieldInfos;
++  final int maxDoc;
+   final List<FieldMetaData> fields = new ArrayList<FieldMetaData>();
+   IndexOutput blockOut = null;
+   IndexOutput indexOut = null;
+ 
+   public FSTOrdTermsWriter(SegmentWriteState state, PostingsWriterBase postingsWriter) throws IOException {
+-    super(state);
+     final String termsIndexFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, TERMS_INDEX_EXTENSION);
+     final String termsBlockFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, TERMS_BLOCK_EXTENSION);
+ 
+     this.postingsWriter = postingsWriter;
+     this.fieldInfos = state.fieldInfos;
++    this.maxDoc = state.segmentInfo.getDocCount();
+ 
+     boolean success = false;
+     try {
+@@ -180,11 +182,41 @@ public class FSTOrdTermsWriter extends PushFieldsConsumer {
+   }
+ 
+   @Override
+-  public TermsConsumer addField(FieldInfo field) throws IOException {
+-    return new TermsWriter(field);
++  public void write(Fields fields) throws IOException {
++    try {
++      for(String field : fields) {
++        Terms terms = fields.terms(field);
++        if (terms == null) {
++          continue;
++        }
++        FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
++        boolean hasFreq = fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
++        TermsEnum termsEnum = terms.iterator(null);
++        TermsWriter termsWriter = new TermsWriter(fieldInfo);
++
++        long sumTotalTermFreq = 0;
++        long sumDocFreq = 0;
++        FixedBitSet docsSeen = new FixedBitSet(maxDoc);
++        while (true) {
++          BytesRef term = termsEnum.next();
++          if (term == null) {
++            break;
++          }
++          BlockTermState termState = postingsWriter.writeTerm(term, termsEnum, docsSeen);
++          if (termState != null) {
++            termsWriter.finishTerm(term, termState);
++            sumTotalTermFreq += termState.totalTermFreq;
++            sumDocFreq += termState.docFreq;
++          }
++        }
++
++        termsWriter.finish(hasFreq ? sumTotalTermFreq : -1, sumDocFreq, docsSeen.cardinality());
++      }
++    } finally {
++      close();
++    }
+   }
+ 
+-  @Override
+   public void close() throws IOException {
+     IOException ioe = null;
+     try {
+@@ -247,7 +279,7 @@ public class FSTOrdTermsWriter extends PushFieldsConsumer {
+     public RAMOutputStream metaBytesOut;
+   }
+ 
+-  final class TermsWriter extends TermsConsumer {
++  final class TermsWriter {
+     private final Builder<Long> builder;
+     private final PositiveIntOutputs outputs;
+     private final FieldInfo fieldInfo;
+@@ -284,34 +316,23 @@ public class FSTOrdTermsWriter extends PushFieldsConsumer {
+       this.lastMetaBytesFP = 0;
+     }
+ 
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) throws IOException {
+-      postingsWriter.startTerm();
+-      return postingsWriter;
+-    }
+-
+-    @Override
+-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
++    public void finishTerm(BytesRef text, BlockTermState state) throws IOException {
+       if (numTerms > 0 && numTerms % SKIP_INTERVAL == 0) {
+         bufferSkip();
+       }
+       // write term meta data into fst
+       final long longs[] = new long[longsSize];
+-      final long delta = stats.totalTermFreq - stats.docFreq;
+-      if (stats.totalTermFreq > 0) {
++      final long delta = state.totalTermFreq - state.docFreq;
++      if (state.totalTermFreq > 0) {
+         if (delta == 0) {
+-          statsOut.writeVInt(stats.docFreq<<1|1);
++          statsOut.writeVInt(state.docFreq<<1|1);
+         } else {
+-          statsOut.writeVInt(stats.docFreq<<1|0);
+-          statsOut.writeVLong(stats.totalTermFreq-stats.docFreq);
++          statsOut.writeVInt(state.docFreq<<1|0);
++          statsOut.writeVLong(state.totalTermFreq-state.docFreq);
+         }
+       } else {
+-        statsOut.writeVInt(stats.docFreq);
++        statsOut.writeVInt(state.docFreq);
+       }
+-      BlockTermState state = postingsWriter.newTermState();
+-      state.docFreq = stats.docFreq;
+-      state.totalTermFreq = stats.totalTermFreq;
+-      postingsWriter.finishTerm(state);
+       postingsWriter.encodeTerm(longs, metaBytesOut, fieldInfo, state, true);
+       for (int i = 0; i < longsSize; i++) {
+         metaLongsOut.writeVLong(longs[i] - lastLongs[i]);
+@@ -325,7 +346,6 @@ public class FSTOrdTermsWriter extends PushFieldsConsumer {
+       lastMetaBytesFP = metaBytesOut.getFilePointer();
+     }
+ 
+-    @Override
+     public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
+       if (numTerms > 0) {
+         final FieldMetaData metadata = new FieldMetaData();
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPostingsFormat.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPostingsFormat.java
+index a671f44..4b31783 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPostingsFormat.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPostingsFormat.java
+@@ -25,9 +25,8 @@ import org.apache.lucene.codecs.FieldsProducer;
+ import org.apache.lucene.codecs.PostingsFormat;
+ import org.apache.lucene.codecs.PostingsReaderBase;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsWriter;
+ import org.apache.lucene.codecs.lucene41.Lucene41PostingsReader;
+-import org.apache.lucene.index.FieldInfo.IndexOptions;
++import org.apache.lucene.codecs.lucene41.Lucene41PostingsWriter;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.util.IOUtils;
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPulsing41PostingsFormat.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPulsing41PostingsFormat.java
+index dfff5b5..0e85e8a 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPulsing41PostingsFormat.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTPulsing41PostingsFormat.java
+@@ -25,12 +25,9 @@ import org.apache.lucene.codecs.PostingsBaseFormat;
+ import org.apache.lucene.codecs.PostingsFormat;
+ import org.apache.lucene.codecs.PostingsReaderBase;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsWriter;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsReader;
+ import org.apache.lucene.codecs.lucene41.Lucene41PostingsBaseFormat;
+-import org.apache.lucene.codecs.lucene41.Lucene41PostingsFormat;
+-import org.apache.lucene.codecs.pulsing.PulsingPostingsWriter;
+ import org.apache.lucene.codecs.pulsing.PulsingPostingsReader;
++import org.apache.lucene.codecs.pulsing.PulsingPostingsWriter;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.util.IOUtils;
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermOutputs.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermOutputs.java
+index 2ddcfb9..3acbde2 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermOutputs.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermOutputs.java
+@@ -25,7 +25,6 @@ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.store.DataInput;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.util.fst.Outputs;
+-import org.apache.lucene.util.LongsRef;
+ 
+ /**
+  * An FST {@link Outputs} implementation for 
+@@ -89,6 +88,11 @@ class FSTTermOutputs extends Outputs<FSTTermOutputs.TermData> {
+     }
+ 
+     @Override
++    public String toString() {
++      return "FSTTermOutputs$TermData longs=" + Arrays.toString(longs) + " bytes=" + Arrays.toString(bytes) + " docFreq=" + docFreq + " totalTermFreq=" + totalTermFreq;
++    }
++
++    @Override
+     public boolean equals(Object other_) {
+       if (other_ == this) {
+         return true;
+@@ -221,6 +225,7 @@ class FSTTermOutputs extends Outputs<FSTTermOutputs.TermData> {
+ 
+   @Override
+   public void write(TermData data, DataOutput out) throws IOException {
++    assert hasPos || data.totalTermFreq == -1;
+     int bit0 = allZero(data.longs) ? 0 : 1;
+     int bit1 = ((data.bytes == null || data.bytes.length == 0) ? 0 : 1) << 1;
+     int bit2 = ((data.docFreq == 0)  ? 0 : 1) << 2;
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsWriter.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsWriter.java
+index 3edc0df..4d3b9f9 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsWriter.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/FSTTermsWriter.java
+@@ -23,20 +23,21 @@ import java.util.List;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+ import org.apache.lucene.codecs.CodecUtil;
+-import org.apache.lucene.codecs.PostingsConsumer;
++import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.PushFieldsConsumer;
+-import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.codecs.TermsConsumer;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.FieldInfos;
++import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.fst.Builder;
+@@ -119,7 +120,7 @@ import org.apache.lucene.util.fst.Util;
+  * @lucene.experimental
+  */
+ 
+-public class FSTTermsWriter extends PushFieldsConsumer {
++public class FSTTermsWriter extends FieldsConsumer {
+   static final String TERMS_EXTENSION = "tmp";
+   static final String TERMS_CODEC_NAME = "FST_TERMS_DICT";
+   public static final int TERMS_VERSION_START = 0;
+@@ -128,15 +129,16 @@ public class FSTTermsWriter extends PushFieldsConsumer {
+   final PostingsWriterBase postingsWriter;
+   final FieldInfos fieldInfos;
+   final IndexOutput out;
++  final int maxDoc;
+   final List<FieldMetaData> fields = new ArrayList<FieldMetaData>();
+ 
+   public FSTTermsWriter(SegmentWriteState state, PostingsWriterBase postingsWriter) throws IOException {
+-    super(state);
+     final String termsFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, TERMS_EXTENSION);
+ 
+     this.postingsWriter = postingsWriter;
+     this.fieldInfos = state.fieldInfos;
+     this.out = state.directory.createOutput(termsFileName, state.context);
++    this.maxDoc = state.segmentInfo.getDocCount();
+ 
+     boolean success = false;
+     try {
+@@ -149,19 +151,53 @@ public class FSTTermsWriter extends PushFieldsConsumer {
+       }
+     }
+   }
++
+   private void writeHeader(IndexOutput out) throws IOException {
+     CodecUtil.writeHeader(out, TERMS_CODEC_NAME, TERMS_VERSION_CURRENT);   
+   }
++
+   private void writeTrailer(IndexOutput out, long dirStart) throws IOException {
+     out.writeLong(dirStart);
+   }
+ 
+   @Override
+-  public TermsConsumer addField(FieldInfo field) throws IOException {
+-    return new TermsWriter(field);
++  public void write(Fields fields) throws IOException {
++    try {
++      for(String field : fields) {
++        Terms terms = fields.terms(field);
++        if (terms == null) {
++          continue;
++        }
++        FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
++        boolean hasFreq = fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
++        TermsEnum termsEnum = terms.iterator(null);
++        TermsWriter termsWriter = termsWriter = new TermsWriter(fieldInfo);
++
++        long sumTotalTermFreq = 0;
++        long sumDocFreq = 0;
++        FixedBitSet docsSeen = new FixedBitSet(maxDoc);
++
++        while (true) {
++          BytesRef term = termsEnum.next();
++          if (term == null) {
++            break;
++          }
++            
++          BlockTermState termState = postingsWriter.writeTerm(term, termsEnum, docsSeen);
++          if (termState != null) {
++            termsWriter.finishTerm(term, termState);
++            sumTotalTermFreq += termState.totalTermFreq;
++            sumDocFreq += termState.docFreq;
++          }
++        }
++
++        termsWriter.finish(hasFreq ? sumTotalTermFreq : -1, sumDocFreq, docsSeen.cardinality());
++      }
++    } finally {
++      close();
++    }
+   }
+ 
+-  @Override
+   public void close() throws IOException {
+     IOException ioe = null;
+     try {
+@@ -208,7 +244,7 @@ public class FSTTermsWriter extends PushFieldsConsumer {
+     }
+   }
+ 
+-  final class TermsWriter extends TermsConsumer {
++  final class TermsWriter {
+     private final Builder<FSTTermOutputs.TermData> builder;
+     private final FSTTermOutputs outputs;
+     private final FieldInfo fieldInfo;
+@@ -226,22 +262,13 @@ public class FSTTermsWriter extends PushFieldsConsumer {
+       this.builder = new Builder<FSTTermOutputs.TermData>(FST.INPUT_TYPE.BYTE1, outputs);
+     }
+ 
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) throws IOException {
+-      postingsWriter.startTerm();
+-      return postingsWriter;
+-    }
+-
+-    @Override
+-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
++    public void finishTerm(BytesRef text, BlockTermState state) throws IOException {
+       // write term meta data into fst
+-      final BlockTermState state = postingsWriter.newTermState();
+       final FSTTermOutputs.TermData meta = new FSTTermOutputs.TermData();
+       meta.longs = new long[longsSize];
+       meta.bytes = null;
+-      meta.docFreq = state.docFreq = stats.docFreq;
+-      meta.totalTermFreq = state.totalTermFreq = stats.totalTermFreq;
+-      postingsWriter.finishTerm(state);
++      meta.docFreq = state.docFreq;
++      meta.totalTermFreq = state.totalTermFreq;
+       postingsWriter.encodeTerm(meta.longs, metaWriter, fieldInfo, state, true);
+       final int bytesSize = (int)metaWriter.getFilePointer();
+       if (bytesSize > 0) {
+@@ -253,7 +280,6 @@ public class FSTTermsWriter extends PushFieldsConsumer {
+       numTerms++;
+     }
+ 
+-    @Override
+     public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
+       // save FST dict
+       if (numTerms > 0) {
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/MemoryPostingsFormat.java b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/MemoryPostingsFormat.java
+index 3f502c4..728e1eb 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/memory/MemoryPostingsFormat.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/memory/MemoryPostingsFormat.java
+@@ -17,6 +17,7 @@ package org.apache.lucene.codecs.memory;
+  * limitations under the License.
+  */
+ 
++import java.io.Closeable;
+ import java.io.IOException;
+ import java.util.Collections;
+ import java.util.Iterator;
+@@ -26,16 +27,14 @@ import java.util.TreeMap;
+ 
+ import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.FieldsProducer;
+-import org.apache.lucene.codecs.PostingsConsumer;
+ import org.apache.lucene.codecs.PostingsFormat;
+-import org.apache.lucene.codecs.PushFieldsConsumer;
+ import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.codecs.TermsConsumer;
+ import org.apache.lucene.index.DocsAndPositionsEnum;
+ import org.apache.lucene.index.DocsEnum;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.FieldInfos;
++import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.SegmentWriteState;
+@@ -49,6 +48,8 @@ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.RamUsageEstimator;
+ import org.apache.lucene.util.fst.Builder;
+@@ -104,7 +105,7 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+     return "PostingsFormat(name=" + getName() + " doPackFST= " + doPackFST + ")";
+   }
+ 
+-  private final static class TermsWriter extends TermsConsumer {
++  private final static class TermsWriter {
+     private final IndexOutput out;
+     private final FieldInfo field;
+     private final Builder<BytesRef> builder;
+@@ -121,7 +122,7 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+       builder = new Builder<BytesRef>(FST.INPUT_TYPE.BYTE1, 0, 0, true, true, Integer.MAX_VALUE, outputs, null, doPackFST, acceptableOverheadRatio, true, 15);
+     }
+ 
+-    private class PostingsWriter extends PostingsConsumer {
++    private class PostingsWriter {
+       private int lastDocID;
+       private int lastPos;
+       private int lastPayloadLen;
+@@ -133,7 +134,6 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+       int lastOffsetLength;
+       int lastOffset;
+ 
+-      @Override
+       public void startDoc(int docID, int termDocFreq) throws IOException {
+         //System.out.println("    startDoc docID=" + docID + " freq=" + termDocFreq);
+         final int delta = docID - lastDocID;
+@@ -155,7 +155,6 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+         lastOffset = 0;
+       }
+ 
+-      @Override
+       public void addPosition(int pos, BytesRef payload, int startOffset, int endOffset) throws IOException {
+         assert payload == null || field.hasPayloads();
+ 
+@@ -200,10 +199,6 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+         }
+       }
+ 
+-      @Override
+-      public void finishDoc() {
+-      }
+-
+       public PostingsWriter reset() {
+         assert buffer.getFilePointer() == 0;
+         lastDocID = 0;
+@@ -215,13 +210,7 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+       }
+     }
+ 
+-    private final PostingsWriter postingsWriter = new PostingsWriter();
+-
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) {
+-      //System.out.println("  startTerm term=" + text.utf8ToString());
+-      return postingsWriter.reset();
+-    }
++    final PostingsWriter postingsWriter = new PostingsWriter();
+ 
+     private final RAMOutputStream buffer2 = new RAMOutputStream();
+     private final BytesRef spare = new BytesRef();
+@@ -229,9 +218,11 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+ 
+     private final IntsRef scratchIntsRef = new IntsRef();
+ 
+-    @Override
+-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
++    private void finishTerm(BytesRef text, TermStats stats) throws IOException {
+ 
++      if (stats.docFreq == 0) {
++        return;
++      }
+       assert postingsWriter.docCount == stats.docFreq;
+ 
+       assert buffer2.getFilePointer() == 0;
+@@ -263,7 +254,6 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+       termCount++;
+     }
+ 
+-    @Override
+     public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
+       if (termCount > 0) {
+         out.writeVInt(termCount);
+@@ -282,29 +272,146 @@ public final class MemoryPostingsFormat extends PostingsFormat {
+ 
+   private static String EXTENSION = "ram";
+ 
+-  @Override
+-  public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
++  private class MemoryFieldsConsumer extends FieldsConsumer implements Closeable {
++    private final SegmentWriteState state;
++    private final IndexOutput out;
+ 
+-    final String fileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, EXTENSION);
+-    final IndexOutput out = state.directory.createOutput(fileName, state.context);
+-    
+-    return new PushFieldsConsumer(state) {
+-      @Override
+-      public TermsConsumer addField(FieldInfo field) {
+-        //System.out.println("\naddField field=" + field.name);
+-        return new TermsWriter(out, field, doPackFST, acceptableOverheadRatio);
+-      }
++    private MemoryFieldsConsumer(SegmentWriteState state) throws IOException {
++      final String fileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, EXTENSION);
++      out = state.directory.createOutput(fileName, state.context);
++      this.state = state;
++    }
+ 
+-      @Override
+-      public void close() throws IOException {
+-        // EOF marker:
+-        try {
+-          out.writeVInt(0);
+-        } finally {
+-          out.close();
++    @Override
++    public void write(Fields fields) throws IOException {
++      boolean success = false;
++      try {
++        for(String field : fields) {
++
++          Terms terms = fields.terms(field);
++          if (terms == null) {
++            continue;
++          }
++
++          TermsEnum termsEnum = terms.iterator(null);
++
++          FieldInfo fieldInfo = state.fieldInfos.fieldInfo(field);
++          TermsWriter termsWriter = new TermsWriter(out, fieldInfo,
++                                                    doPackFST, acceptableOverheadRatio);
++
++          FixedBitSet docsSeen = new FixedBitSet(state.segmentInfo.getDocCount());
++          long sumTotalTermFreq = 0;
++          long sumDocFreq = 0;
++          DocsEnum docsEnum = null;
++          DocsAndPositionsEnum posEnum = null;
++          int enumFlags;
++
++          IndexOptions indexOptions = fieldInfo.getIndexOptions();
++          boolean writeFreqs = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
++          boolean writePositions = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
++          boolean writeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;        
++          boolean writePayloads = fieldInfo.hasPayloads();
++
++          if (writeFreqs == false) {
++            enumFlags = 0;
++          } else if (writePositions == false) {
++            enumFlags = DocsEnum.FLAG_FREQS;
++          } else if (writeOffsets == false) {
++            if (writePayloads) {
++              enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS;
++            } else {
++              enumFlags = 0;
++            }
++          } else {
++            if (writePayloads) {
++              enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS | DocsAndPositionsEnum.FLAG_OFFSETS;
++            } else {
++              enumFlags = DocsAndPositionsEnum.FLAG_OFFSETS;
++            }
++          }
++
++          while (true) {
++            BytesRef term = termsEnum.next();
++            if (term == null) {
++              break;
++            }
++            termsWriter.postingsWriter.reset();
++
++            if (writePositions) {
++              posEnum = termsEnum.docsAndPositions(null, posEnum, enumFlags);
++              docsEnum = posEnum;
++            } else {
++              docsEnum = termsEnum.docs(null, docsEnum, enumFlags);
++              posEnum = null;
++            }
++
++            int docFreq = 0;
++            long totalTermFreq = 0;
++            while (true) {
++              int docID = docsEnum.nextDoc();
++              if (docID == DocsEnum.NO_MORE_DOCS) {
++                break;
++              }
++              docsSeen.set(docID);
++              docFreq++;
++
++              int freq;
++              if (writeFreqs) {
++                freq = docsEnum.freq();
++                totalTermFreq += freq;
++              } else {
++                freq = -1;
++              }
++
++              termsWriter.postingsWriter.startDoc(docID, freq);
++              if (writePositions) {
++                for (int i=0;i<freq;i++) {
++                  int pos = posEnum.nextPosition();
++                  BytesRef payload = writePayloads ? posEnum.getPayload() : null;
++                  int startOffset;
++                  int endOffset;
++                  if (writeOffsets) {
++                    startOffset = posEnum.startOffset();
++                    endOffset = posEnum.endOffset();
++                  } else {
++                    startOffset = -1;
++                    endOffset = -1;
++                  }
++                  termsWriter.postingsWriter.addPosition(pos, payload, startOffset, endOffset);
++                }
++              }
++            }
++            termsWriter.finishTerm(term, new TermStats(docFreq, totalTermFreq));
++            sumDocFreq += docFreq;
++            sumTotalTermFreq += totalTermFreq;
++          }
++
++          termsWriter.finish(sumTotalTermFreq, sumDocFreq, docsSeen.cardinality());
++        }
++        success = true;
++      } finally {
++        if (success) {
++          IOUtils.close(this);
++        } else {
++          IOUtils.closeWhileHandlingException(this);
+         }
+       }
+-    };
++    }
++
++    @Override
++    public void close() throws IOException {
++      // EOF marker:
++      try {
++        out.writeVInt(0);
++      } finally {
++        out.close();
++      }
++    }
++  }
++
++  @Override
++  public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
++    return new MemoryFieldsConsumer(state);
+   }
+ 
+   private final static class FSTDocsEnum extends DocsEnum {
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/pulsing/PulsingPostingsWriter.java b/lucene/codecs/src/java/org/apache/lucene/codecs/pulsing/PulsingPostingsWriter.java
+index db16035..4a3c214 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/pulsing/PulsingPostingsWriter.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/pulsing/PulsingPostingsWriter.java
+@@ -18,21 +18,24 @@ package org.apache.lucene.codecs.pulsing;
+  */
+ 
+ import java.io.IOException;
+-import java.util.List;
+ import java.util.ArrayList;
++import java.util.List;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.DocsAndPositionsEnum;
++import org.apache.lucene.index.DocsEnum;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
++import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+ 
+ // TODO: we now inline based on total TF of the term,
+@@ -66,21 +69,31 @@ public final class PulsingPostingsWriter extends PostingsWriterBase {
+   final static int VERSION_CURRENT = VERSION_META_ARRAY;
+ 
+   private SegmentWriteState segmentState;
+-  private IndexOutput termsOut;
+ 
+   private List<FieldMetaData> fields;
+ 
++  // Reused by writeTerm:
++  private DocsEnum docsEnum;
++  private DocsAndPositionsEnum posEnum;
++  private int enumFlags;
++
++  private final RAMOutputStream buffer = new RAMOutputStream();
++
+   private IndexOptions indexOptions;
+-  private boolean storePayloads;
+ 
+   // information for wrapped PF, in current field
+   private int longsSize;
+   private long[] longs;
++  private boolean fieldHasFreqs;
++  private boolean fieldHasPositions;
++  private boolean fieldHasOffsets;
++  private boolean fieldHasPayloads;
+   boolean absolute;
+ 
+   private static class PulsingTermState extends BlockTermState {
+     private byte[] bytes;
+     private BlockTermState wrappedState;
++
+     @Override
+     public String toString() {
+       if (bytes != null) {
+@@ -91,20 +104,6 @@ public final class PulsingPostingsWriter extends PostingsWriterBase {
+     }
+   }
+ 
+-  // one entry per position
+-  private final Position[] pending;
+-  private int pendingCount = 0;                           // -1 once we've hit too many positions
+-  private Position currentDoc;                    // first Position entry of current doc
+-
+-  private static final class Position {
+-    BytesRef payload;
+-    int termFreq;                                 // only incremented on first position for a given doc
+-    int pos;
+-    int docID;
+-    int startOffset;
+-    int endOffset;
+-  }
+-
+   private static final class FieldMetaData {
+     int fieldNumber;
+     int longsSize;
+@@ -120,17 +119,14 @@ public final class PulsingPostingsWriter extends PostingsWriterBase {
+   // non-inlined terms:
+   final PostingsWriterBase wrappedPostingsWriter;
+ 
++  final int maxPositions;
++
+   /** If the total number of positions (summed across all docs
+    *  for this term) is <= maxPositions, then the postings are
+    *  inlined into terms dict */
+   public PulsingPostingsWriter(SegmentWriteState state, int maxPositions, PostingsWriterBase wrappedPostingsWriter) {
+-
+-    pending = new Position[maxPositions];
+-    for(int i=0;i<maxPositions;i++) {
+-      pending[i] = new Position();
+-    }
+     fields = new ArrayList<FieldMetaData>();
+-
++    this.maxPositions = maxPositions;
+     // We simply wrap another postings writer, but only call
+     // on it when tot positions is >= the cutoff:
+     this.wrappedPostingsWriter = wrappedPostingsWriter;
+@@ -139,144 +135,63 @@ public final class PulsingPostingsWriter extends PostingsWriterBase {
+ 
+   @Override
+   public void init(IndexOutput termsOut) throws IOException {
+-    this.termsOut = termsOut;
+     CodecUtil.writeHeader(termsOut, CODEC, VERSION_CURRENT);
+-    termsOut.writeVInt(pending.length); // encode maxPositions in header
++    termsOut.writeVInt(maxPositions); // encode maxPositions in header
+     wrappedPostingsWriter.init(termsOut);
+   }
+ 
+   @Override
+-  public BlockTermState newTermState() throws IOException {
+-    PulsingTermState state = new PulsingTermState();
+-    state.wrappedState = wrappedPostingsWriter.newTermState();
+-    return state;
+-  }
+-
+-  @Override
+-  public void startTerm() {
+-    //if (DEBUG) System.out.println("PW   startTerm");
+-    assert pendingCount == 0;
+-  }
+-
+-  // TODO: -- should we NOT reuse across fields?  would
+-  // be cleaner
+-
+-  // Currently, this instance is re-used across fields, so
+-  // our parent calls setField whenever the field changes
+-  @Override
+-  public int setField(FieldInfo fieldInfo) {
+-    this.indexOptions = fieldInfo.getIndexOptions();
+-    //if (DEBUG) System.out.println("PW field=" + fieldInfo.name + " indexOptions=" + indexOptions);
+-    storePayloads = fieldInfo.hasPayloads();
+-    absolute = false;
+-    longsSize = wrappedPostingsWriter.setField(fieldInfo);
+-    longs = new long[longsSize];
+-    fields.add(new FieldMetaData(fieldInfo.number, longsSize));
+-    return 0;
+-    //DEBUG = BlockTreeTermsWriter.DEBUG;
+-  }
+-
+-  private boolean DEBUG;
+-
+-  @Override
+-  public void startDoc(int docID, int termDocFreq) throws IOException {
+-    assert docID >= 0: "got docID=" + docID;
+-
+-    /*
+-    if (termID != -1) {
+-      if (docID == 0) {
+-        baseDocID = termID;
+-      } else if (baseDocID + docID != termID) {
+-        throw new RuntimeException("WRITE: baseDocID=" + baseDocID + " docID=" + docID + " termID=" + termID);
+-      }
+-    }
+-    */
+-
+-    //if (DEBUG) System.out.println("PW     doc=" + docID);
+-
+-    if (pendingCount == pending.length) {
+-      push();
+-      //if (DEBUG) System.out.println("PW: wrapped.finishDoc");
+-      wrappedPostingsWriter.finishDoc();
+-    }
+-
+-    if (pendingCount != -1) {
+-      assert pendingCount < pending.length;
+-      currentDoc = pending[pendingCount];
+-      currentDoc.docID = docID;
+-      if (indexOptions == IndexOptions.DOCS_ONLY) {
+-        pendingCount++;
+-      } else if (indexOptions == IndexOptions.DOCS_AND_FREQS) { 
+-        pendingCount++;
+-        currentDoc.termFreq = termDocFreq;
+-      } else {
+-        currentDoc.termFreq = termDocFreq;
++  public BlockTermState writeTerm(BytesRef term, TermsEnum termsEnum, FixedBitSet docsSeen) throws IOException {
++
++    // First pass: figure out whether we should pulse this term
++    long posCount = 0;
++
++    if (fieldHasPositions == false) {
++      // No positions:
++      docsEnum = termsEnum.docs(null, docsEnum, enumFlags);
++      assert docsEnum != null;
++      while (posCount <= maxPositions) {
++        if (docsEnum.nextDoc() == DocsEnum.NO_MORE_DOCS) {
++          break;
++        }
++        posCount++;
+       }
+     } else {
+-      // We've already seen too many docs for this term --
+-      // just forward to our fallback writer
+-      wrappedPostingsWriter.startDoc(docID, termDocFreq);
+-    }
+-  }
+-
+-  @Override
+-  public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) throws IOException {
+-
+-    //if (DEBUG) System.out.println("PW       pos=" + position + " payload=" + (payload == null ? "null" : payload.length + " bytes"));
+-    if (pendingCount == pending.length) {
+-      push();
+-    }
+-
+-    if (pendingCount == -1) {
+-      // We've already seen too many docs for this term --
+-      // just forward to our fallback writer
+-      wrappedPostingsWriter.addPosition(position, payload, startOffset, endOffset);
+-    } else {
+-      // buffer up
+-      final Position pos = pending[pendingCount++];
+-      pos.pos = position;
+-      pos.startOffset = startOffset;
+-      pos.endOffset = endOffset;
+-      pos.docID = currentDoc.docID;
+-      if (payload != null && payload.length > 0) {
+-        if (pos.payload == null) {
+-          pos.payload = BytesRef.deepCopyOf(payload);
+-        } else {
+-          pos.payload.copyBytes(payload);
++      posEnum = termsEnum.docsAndPositions(null, posEnum, enumFlags);
++      assert posEnum != null;
++      while (posCount <= maxPositions) {
++        if (posEnum.nextDoc() == DocsEnum.NO_MORE_DOCS) {
++          break;
+         }
+-      } else if (pos.payload != null) {
+-        pos.payload.length = 0;
++        posCount += posEnum.freq();
+       }
+     }
+-  }
+ 
+-  @Override
+-  public void finishDoc() throws IOException {
+-    // if (DEBUG) System.out.println("PW     finishDoc");
+-    if (pendingCount == -1) {
+-      wrappedPostingsWriter.finishDoc();
++    if (posCount == 0) {
++      // All docs were deleted
++      return null;
+     }
+-  }
+ 
+-  private final RAMOutputStream buffer = new RAMOutputStream();
+-
+-  // private int baseDocID;
+-
+-  /** Called when we are done adding docs to this term */
+-  @Override
+-  public void finishTerm(BlockTermState _state) throws IOException {
+-    PulsingTermState state = (PulsingTermState) _state;
++    // Second pass: write postings
++    if (posCount > maxPositions) {
++      // Too many positions; do not pulse.  Just lset
++      // wrapped postingsWriter encode the postings:
+ 
+-    // if (DEBUG) System.out.println("PW   finishTerm docCount=" + stats.docFreq + " pendingCount=" + pendingCount + " pendingTerms.size()=" + pendingTerms.size());
+-
+-    assert pendingCount > 0 || pendingCount == -1;
+-
+-    if (pendingCount == -1) {
+-      state.wrappedState.docFreq = state.docFreq;
+-      state.wrappedState.totalTermFreq = state.totalTermFreq;
+-      state.bytes = null;
+-      wrappedPostingsWriter.finishTerm(state.wrappedState);
++      PulsingTermState state = new PulsingTermState();
++      state.wrappedState = wrappedPostingsWriter.writeTerm(term, termsEnum, docsSeen);
++      state.docFreq = state.wrappedState.docFreq;
++      state.totalTermFreq = state.wrappedState.totalTermFreq;
++      return state;
+     } else {
++      // Pulsed:
++      if (fieldHasPositions == false) {
++        docsEnum = termsEnum.docs(null, docsEnum, enumFlags);
++      } else {
++        posEnum = termsEnum.docsAndPositions(null, posEnum, enumFlags);
++        docsEnum = posEnum;
++      }
++      assert docsEnum != null;
++
+       // There were few enough total occurrences for this
+       // term, so we fully inline our postings data into
+       // terms dict, now:
+@@ -287,95 +202,135 @@ public final class PulsingPostingsWriter extends PostingsWriterBase {
+       // given codec wants to store other interesting
+       // stuff, it could use this pulsing codec to do so
+ 
+-      if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
+-        int lastDocID = 0;
+-        int pendingIDX = 0;
+-        int lastPayloadLength = -1;
+-        int lastOffsetLength = -1;
+-        while(pendingIDX < pendingCount) {
+-          final Position doc = pending[pendingIDX];
++      int lastDocID = 0;
++      int lastPayloadLength = -1;
++      int lastOffsetLength = -1;
++
++      int docFreq = 0;
++      long totalTermFreq = 0;
++      while (true) {
++        int docID = docsEnum.nextDoc();
++        if (docID == DocsEnum.NO_MORE_DOCS) {
++          break;
++        }
++        docsSeen.set(docID);
++
++        int delta = docID - lastDocID;
++        lastDocID = docID;
+ 
+-          final int delta = doc.docID - lastDocID;
+-          lastDocID = doc.docID;
++        docFreq++;
+ 
+-          // if (DEBUG) System.out.println("  write doc=" + doc.docID + " freq=" + doc.termFreq);
++        if (fieldHasFreqs) {
++          int freq = docsEnum.freq();
++          totalTermFreq += freq;
+ 
+-          if (doc.termFreq == 1) {
+-            buffer.writeVInt((delta<<1)|1);
++          if (freq == 1) {
++            buffer.writeVInt((delta << 1) | 1);
+           } else {
+-            buffer.writeVInt(delta<<1);
+-            buffer.writeVInt(doc.termFreq);
++            buffer.writeVInt(delta << 1);
++            buffer.writeVInt(freq);
+           }
+ 
+-          int lastPos = 0;
+-          int lastOffset = 0;
+-          for(int posIDX=0;posIDX<doc.termFreq;posIDX++) {
+-            final Position pos = pending[pendingIDX++];
+-            assert pos.docID == doc.docID;
+-            final int posDelta = pos.pos - lastPos;
+-            lastPos = pos.pos;
+-            // if (DEBUG) System.out.println("    write pos=" + pos.pos);
+-            final int payloadLength = pos.payload == null ? 0 : pos.payload.length;
+-            if (storePayloads) {
+-              if (payloadLength != lastPayloadLength) {
+-                buffer.writeVInt((posDelta << 1)|1);
+-                buffer.writeVInt(payloadLength);
+-                lastPayloadLength = payloadLength;
++          if (fieldHasPositions) {
++            int lastPos = 0;
++            int lastOffset = 0;
++            for(int posIDX=0;posIDX<freq;posIDX++) {
++              int pos = posEnum.nextPosition();
++              int posDelta = pos - lastPos;
++              lastPos = pos;
++              int payloadLength;
++              BytesRef payload;
++              if (fieldHasPayloads) {
++                payload = posEnum.getPayload();
++                payloadLength = payload == null ? 0 : payload.length;
++                if (payloadLength != lastPayloadLength) {
++                  buffer.writeVInt((posDelta << 1)|1);
++                  buffer.writeVInt(payloadLength);
++                  lastPayloadLength = payloadLength;
++                } else {
++                  buffer.writeVInt(posDelta << 1);
++                }
+               } else {
+-                buffer.writeVInt(posDelta << 1);
++                payloadLength = 0;
++                payload = null;
++                buffer.writeVInt(posDelta);
+               }
+-            } else {
+-              buffer.writeVInt(posDelta);
+-            }
+-            
+-            if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
+-              //System.out.println("write=" + pos.startOffset + "," + pos.endOffset);
+-              int offsetDelta = pos.startOffset - lastOffset;
+-              int offsetLength = pos.endOffset - pos.startOffset;
+-              if (offsetLength != lastOffsetLength) {
+-                buffer.writeVInt(offsetDelta << 1 | 1);
+-                buffer.writeVInt(offsetLength);
+-              } else {
+-                buffer.writeVInt(offsetDelta << 1);
++
++              if (fieldHasOffsets) {
++                int startOffset = posEnum.startOffset();
++                int endOffset = posEnum.endOffset();
++                int offsetDelta = startOffset - lastOffset;
++                int offsetLength = endOffset - startOffset;
++                if (offsetLength != lastOffsetLength) {
++                  buffer.writeVInt(offsetDelta << 1 | 1);
++                  buffer.writeVInt(offsetLength);
++                } else {
++                  buffer.writeVInt(offsetDelta << 1);
++                }
++                lastOffset = startOffset;
++                lastOffsetLength = offsetLength;             
+               }
+-              lastOffset = pos.startOffset;
+-              lastOffsetLength = offsetLength;             
+-            }
+             
+-            if (payloadLength > 0) {
+-              assert storePayloads;
+-              buffer.writeBytes(pos.payload.bytes, 0, pos.payload.length);
++              if (payloadLength > 0) {
++                assert fieldHasPayloads;
++                assert payload != null;
++                buffer.writeBytes(payload.bytes, payload.offset, payload.length);
++              }
+             }
+           }
+-        }
+-      } else if (indexOptions == IndexOptions.DOCS_AND_FREQS) {
+-        int lastDocID = 0;
+-        for(int posIDX=0;posIDX<pendingCount;posIDX++) {
+-          final Position doc = pending[posIDX];
+-          final int delta = doc.docID - lastDocID;
+-          assert doc.termFreq != 0;
+-          if (doc.termFreq == 1) {
+-            buffer.writeVInt((delta<<1)|1);
+-          } else {
+-            buffer.writeVInt(delta<<1);
+-            buffer.writeVInt(doc.termFreq);
+-          }
+-          lastDocID = doc.docID;
+-        }
+-      } else if (indexOptions == IndexOptions.DOCS_ONLY) {
+-        int lastDocID = 0;
+-        for(int posIDX=0;posIDX<pendingCount;posIDX++) {
+-          final Position doc = pending[posIDX];
+-          buffer.writeVInt(doc.docID - lastDocID);
+-          lastDocID = doc.docID;
++        } else {
++          buffer.writeVInt(delta);
+         }
+       }
+-
++      
++      PulsingTermState state = new PulsingTermState();
+       state.bytes = new byte[(int) buffer.getFilePointer()];
++      state.docFreq = docFreq;
++      state.totalTermFreq = fieldHasFreqs ? totalTermFreq : -1;
+       buffer.writeTo(state.bytes, 0);
+       buffer.reset();
++      return state;
++    }
++  }
++
++  // TODO: -- should we NOT reuse across fields?  would
++  // be cleaner
++
++  // Currently, this instance is re-used across fields, so
++  // our parent calls setField whenever the field changes
++  @Override
++  public int setField(FieldInfo fieldInfo) {
++    this.indexOptions = fieldInfo.getIndexOptions();
++    //if (DEBUG) System.out.println("PW field=" + fieldInfo.name + " indexOptions=" + indexOptions);
++    fieldHasPayloads = fieldInfo.hasPayloads();
++    absolute = false;
++    longsSize = wrappedPostingsWriter.setField(fieldInfo);
++    longs = new long[longsSize];
++    fields.add(new FieldMetaData(fieldInfo.number, longsSize));
++
++    fieldHasFreqs = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
++    fieldHasPositions = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
++    fieldHasOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
++
++    if (fieldHasFreqs == false) {
++      enumFlags = 0;
++    } else if (fieldHasPositions == false) {
++      enumFlags = DocsEnum.FLAG_FREQS;
++    } else if (fieldHasOffsets == false) {
++      if (fieldHasPayloads) {
++        enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS;
++      } else {
++        enumFlags = 0;
++      }
++    } else {
++      if (fieldHasPayloads) {
++        enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS | DocsAndPositionsEnum.FLAG_OFFSETS;
++      } else {
++        enumFlags = DocsAndPositionsEnum.FLAG_OFFSETS;
++      }
+     }
+-    pendingCount = 0;
++    return 0;
++    //DEBUG = BlockTreeTermsWriter.DEBUG;
+   }
+ 
+   @Override
+@@ -420,39 +375,4 @@ public final class PulsingPostingsWriter extends PostingsWriterBase {
+       IOUtils.closeWhileHandlingException(out);
+     }
+   }
+-
+-  // Pushes pending positions to the wrapped codec
+-  private void push() throws IOException {
+-    // if (DEBUG) System.out.println("PW now push @ " + pendingCount + " wrapped=" + wrappedPostingsWriter);
+-    assert pendingCount == pending.length;
+-      
+-    wrappedPostingsWriter.startTerm();
+-      
+-    // Flush all buffered docs
+-    if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
+-      Position doc = null;
+-      for(Position pos : pending) {
+-        if (doc == null) {
+-          doc = pos;
+-          // if (DEBUG) System.out.println("PW: wrapped.startDoc docID=" + doc.docID + " tf=" + doc.termFreq);
+-          wrappedPostingsWriter.startDoc(doc.docID, doc.termFreq);
+-        } else if (doc.docID != pos.docID) {
+-          assert pos.docID > doc.docID;
+-          // if (DEBUG) System.out.println("PW: wrapped.finishDoc");
+-          wrappedPostingsWriter.finishDoc();
+-          doc = pos;
+-          // if (DEBUG) System.out.println("PW: wrapped.startDoc docID=" + doc.docID + " tf=" + doc.termFreq);
+-          wrappedPostingsWriter.startDoc(doc.docID, doc.termFreq);
+-        }
+-        // if (DEBUG) System.out.println("PW:   wrapped.addPos pos=" + pos.pos);
+-        wrappedPostingsWriter.addPosition(pos.pos, pos.payload, pos.startOffset, pos.endOffset);
+-      }
+-      //wrappedPostingsWriter.finishDoc();
+-    } else {
+-      for(Position doc : pending) {
+-        wrappedPostingsWriter.startDoc(doc.docID, indexOptions == IndexOptions.DOCS_ONLY ? 0 : doc.termFreq);
+-      }
+-    }
+-    pendingCount = -1;
+-  }
+ }
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/sep/SepPostingsWriter.java b/lucene/codecs/src/java/org/apache/lucene/codecs/sep/SepPostingsWriter.java
+index 3883dc5..7febda8 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/sep/SepPostingsWriter.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/sep/SepPostingsWriter.java
+@@ -21,16 +21,15 @@ import java.io.IOException;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+ import org.apache.lucene.codecs.CodecUtil;
+-import org.apache.lucene.codecs.PostingsWriterBase;
++import org.apache.lucene.codecs.PushPostingsWriterBase;
+ import org.apache.lucene.index.CorruptIndexException;
+ import org.apache.lucene.index.DocsEnum;
+-import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
++import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+-import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ 
+@@ -38,7 +37,7 @@ import org.apache.lucene.util.IOUtils;
+  *  to .pyl, skip data to .skp
+  *
+  * @lucene.experimental */
+-public final class SepPostingsWriter extends PostingsWriterBase {
++public final class SepPostingsWriter extends PushPostingsWriterBase {
+   final static String CODEC = "SepPostingsWriter";
+ 
+   final static String DOC_EXTENSION = "doc";
+@@ -85,11 +84,8 @@ public final class SepPostingsWriter extends PostingsWriterBase {
+ 
+   final int totalNumDocs;
+ 
+-  boolean storePayloads;
+   IndexOptions indexOptions;
+ 
+-  FieldInfo fieldInfo;
+-
+   int lastPayloadLength;
+   int lastPosition;
+   long payloadStart;
+@@ -190,13 +186,12 @@ public final class SepPostingsWriter extends PostingsWriterBase {
+   // our parent calls setField whenever the field changes
+   @Override
+   public int setField(FieldInfo fieldInfo) {
+-    this.fieldInfo = fieldInfo;
++    super.setField(fieldInfo);
+     this.indexOptions = fieldInfo.getIndexOptions();
+     if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
+       throw new UnsupportedOperationException("this codec cannot index offsets");
+     }
+     skipListWriter.setIndexOptions(indexOptions);
+-    storePayloads = indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS && fieldInfo.hasPayloads();
+     lastPayloadFP = 0;
+     lastSkipFP = 0;
+     lastState = setEmptyState();
+@@ -233,7 +228,7 @@ public final class SepPostingsWriter extends PostingsWriterBase {
+       // TODO: -- awkward we have to make these two
+       // separate calls to skipper
+       //System.out.println("    buffer skip lastDocID=" + lastDocID);
+-      skipListWriter.setSkipData(lastDocID, storePayloads, lastPayloadLength);
++      skipListWriter.setSkipData(lastDocID, writePayloads, lastPayloadLength);
+       skipListWriter.bufferSkip(df);
+     }
+ 
+@@ -254,7 +249,7 @@ public final class SepPostingsWriter extends PostingsWriterBase {
+     assert delta >= 0: "position=" + position + " lastPosition=" + lastPosition;            // not quite right (if pos=0 is repeated twice we don't catch it)
+     lastPosition = position;
+ 
+-    if (storePayloads) {
++    if (writePayloads) {
+       final int payloadLength = payload == null ? 0 : payload.length;
+       if (payloadLength != lastPayloadLength) {
+         lastPayloadLength = payloadLength;
+@@ -344,7 +339,7 @@ public final class SepPostingsWriter extends PostingsWriterBase {
+       if (indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
+         lastState.posIndex.copyFrom(state.posIndex, false);
+         lastState.posIndex.write(out, absolute);
+-        if (storePayloads) {
++        if (writePayloads) {
+           if (absolute) {
+             out.writeVLong(state.payloadFP);
+           } else {
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsWriter.java b/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsWriter.java
+index 114f8b1..5529001 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/BlockTreeTermsWriter.java
+@@ -17,6 +17,7 @@ package org.apache.lucene.codecs;
+  * limitations under the License.
+  */
+ 
++import java.io.Closeable;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -24,13 +25,17 @@ import java.util.List;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.FieldInfos;
++import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.fst.Builder;
+@@ -174,7 +179,7 @@ import org.apache.lucene.util.packed.PackedInts;
+  * @lucene.experimental
+  */
+ 
+-public class BlockTreeTermsWriter extends PushFieldsConsumer {
++public class BlockTreeTermsWriter extends FieldsConsumer implements Closeable {
+ 
+   /** Suggested default value for the {@code
+    *  minItemsInBlock} parameter to {@link
+@@ -228,12 +233,12 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+ 
+   private final IndexOutput out;
+   private final IndexOutput indexOut;
++  final int maxDoc;
+   final int minItemsInBlock;
+   final int maxItemsInBlock;
+ 
+   final PostingsWriterBase postingsWriter;
+   final FieldInfos fieldInfos;
+-  FieldInfo currentField;
+ 
+   private static class FieldMetaData {
+     public final FieldInfo fieldInfo;
+@@ -273,7 +278,6 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+                               int maxItemsInBlock)
+     throws IOException
+   {
+-    super(state);
+     if (minItemsInBlock <= 1) {
+       throw new IllegalArgumentException("minItemsInBlock must be >= 2; got " + minItemsInBlock);
+     }
+@@ -287,6 +291,8 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+       throw new IllegalArgumentException("maxItemsInBlock must be at least 2*(minItemsInBlock-1); got maxItemsInBlock=" + maxItemsInBlock + " minItemsInBlock=" + minItemsInBlock);
+     }
+ 
++    maxDoc = state.segmentInfo.getDocCount();
++
+     final String termsFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, TERMS_EXTENSION);
+     out = state.directory.createOutput(termsFileName, state.context);
+     boolean success = false;
+@@ -303,7 +309,6 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+       indexOut = state.directory.createOutput(termsIndexFileName, state.context);
+       writeIndexHeader(indexOut);
+ 
+-      currentField = null;
+       this.postingsWriter = postingsWriter;
+       // segment = state.segmentName;
+ 
+@@ -338,16 +343,46 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+   private void writeIndexTrailer(IndexOutput indexOut, long dirStart) throws IOException {
+     indexOut.writeLong(dirStart);    
+   }
+-  
++
+   @Override
+-  public TermsConsumer addField(FieldInfo field) throws IOException {
+-    //DEBUG = field.name.equals("id");
+-    //if (DEBUG) System.out.println("\nBTTW.addField seg=" + segment + " field=" + field.name);
+-    assert currentField == null || currentField.name.compareTo(field.name) < 0;
+-    currentField = field;
+-    return new TermsWriter(field);
+-  }
++  public void write(Fields fields) throws IOException {
++
++    boolean success = false;
++    try {
++      String lastField = null;
++      for(String field : fields) {
++        assert lastField == null || lastField.compareTo(field) < 0;
++        lastField = field;
++
++        Terms terms = fields.terms(field);
++        if (terms == null) {
++          continue;
++        }
++
++        TermsEnum termsEnum = terms.iterator(null);
+ 
++        TermsWriter termsWriter = new TermsWriter(fieldInfos.fieldInfo(field));
++
++        while (true) {
++          BytesRef term = termsEnum.next();
++          if (term == null) {
++            break;
++          }
++          termsWriter.write(term, termsEnum);
++        }
++
++        termsWriter.finish();
++      }
++      success = true;
++    } finally {
++      if (success) {
++        IOUtils.close(this);
++      } else {
++        IOUtils.closeWhileHandlingException(this);
++      }
++    }
++  }
++  
+   static long encodeOutput(long fp, boolean hasTerms, boolean isFloor) {
+     assert fp < (1L << 62);
+     return (fp << 2) | (hasTerms ? OUTPUT_FLAG_HAS_TERMS : 0) | (isFloor ? OUTPUT_FLAG_IS_FLOOR : 0);
+@@ -488,13 +523,13 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+ 
+   final RAMOutputStream scratchBytes = new RAMOutputStream();
+ 
+-  class TermsWriter extends TermsConsumer {
++  class TermsWriter {
+     private final FieldInfo fieldInfo;
+     private final int longsSize;
+     private long numTerms;
++    final FixedBitSet docsSeen;
+     long sumTotalTermFreq;
+     long sumDocFreq;
+-    int docCount;
+     long indexStartFP;
+ 
+     // Used only to partition terms into the block tree; we
+@@ -1000,6 +1035,7 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+ 
+     TermsWriter(FieldInfo fieldInfo) {
+       this.fieldInfo = fieldInfo;
++      docsSeen = new FixedBitSet(maxDoc);
+ 
+       noOutputs = NoOutputs.getSingleton();
+ 
+@@ -1017,42 +1053,27 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+       this.longsSize = postingsWriter.setField(fieldInfo);
+     }
+     
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) throws IOException {
+-      //if (DEBUG) System.out.println("\nBTTW.startTerm term=" + fieldInfo.name + ":" + toString(text) + " seg=" + segment);
+-      postingsWriter.startTerm();
+-      /*
+-      if (fieldInfo.name.equals("id")) {
+-        postingsWriter.termID = Integer.parseInt(text.utf8ToString());
+-      } else {
+-        postingsWriter.termID = -1;
+-      }
+-      */
+-      return postingsWriter;
+-    }
+-
+     private final IntsRef scratchIntsRef = new IntsRef();
+ 
+-    @Override
+-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
+-
+-      assert stats.docFreq > 0;
+-      //if (DEBUG) System.out.println("BTTW.finishTerm term=" + fieldInfo.name + ":" + toString(text) + " seg=" + segment + " df=" + stats.docFreq);
++    /** Writes one term's worth of postings. */
++    public void write(BytesRef text, TermsEnum termsEnum) throws IOException {
+ 
+-      blockBuilder.add(Util.toIntsRef(text, scratchIntsRef), noOutputs.getNoOutput());
+-      BlockTermState state = postingsWriter.newTermState();
+-      state.docFreq = stats.docFreq;
+-      state.totalTermFreq = stats.totalTermFreq;
+-      postingsWriter.finishTerm(state);
++      BlockTermState state = postingsWriter.writeTerm(text, termsEnum, docsSeen);
++      if (state != null) {
++        assert state.docFreq != 0;
++        assert fieldInfo.getIndexOptions() == IndexOptions.DOCS_ONLY || state.totalTermFreq >= state.docFreq: "postingsWriter=" + postingsWriter;
++        sumDocFreq += state.docFreq;
++        sumTotalTermFreq += state.totalTermFreq;
++        blockBuilder.add(Util.toIntsRef(text, scratchIntsRef), noOutputs.getNoOutput());
+ 
+-      PendingTerm term = new PendingTerm(BytesRef.deepCopyOf(text), state);
+-      pending.add(term);
+-      numTerms++;
++        PendingTerm term = new PendingTerm(BytesRef.deepCopyOf(text), state);
++        pending.add(term);
++        numTerms++;
++      }
+     }
+ 
+     // Finishes all terms in this field
+-    @Override
+-    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
++    public void finish() throws IOException {
+       if (numTerms > 0) {
+         blockBuilder.finish();
+ 
+@@ -1062,10 +1083,6 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+         assert root.prefix.length == 0;
+         assert root.index.getEmptyOutput() != null;
+ 
+-        this.sumTotalTermFreq = sumTotalTermFreq;
+-        this.sumDocFreq = sumDocFreq;
+-        this.docCount = docCount;
+-
+         // Write FST to index
+         indexStartFP = indexOut.getFilePointer();
+         root.index.save(indexOut);
+@@ -1085,12 +1102,12 @@ public class BlockTreeTermsWriter extends PushFieldsConsumer {
+                                      indexStartFP,
+                                      sumTotalTermFreq,
+                                      sumDocFreq,
+-                                     docCount,
++                                     docsSeen.cardinality(),
+                                      longsSize));
+       } else {
+         assert sumTotalTermFreq == 0 || fieldInfo.getIndexOptions() == IndexOptions.DOCS_ONLY && sumTotalTermFreq == -1;
+         assert sumDocFreq == 0;
+-        assert docCount == 0;
++        assert docsSeen.cardinality() == 0;
+       }
+     }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/FieldsConsumer.java b/lucene/core/src/java/org/apache/lucene/codecs/FieldsConsumer.java
+index 80fa473..523e411 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/FieldsConsumer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/FieldsConsumer.java
+@@ -48,16 +48,12 @@ public abstract class FieldsConsumer {
+   /** Write all fields, terms and postings.  This the "pull"
+    *  API, allowing you to iterate more than once over the
+    *  postings, somewhat analogous to using a DOM API to
+-   *  traverse an XML tree.  Alternatively, if you subclass
+-   *  {@link PushFieldsConsumer}, then all postings are
+-   *  pushed in a single pass, somewhat analogous to using a
+-   *  SAX API to traverse an XML tree.
++   *  traverse an XML tree.
+    *
+-   *  <p>This API is has certain restrictions vs {@link
+-   *  PushFieldsConsumer}:
++   *  <p><b>Notes</b>:
+    *
+    *  <ul>
+-   *    <li> You must compute index statistics yourself,
++   *    <li> You must compute index statistics,
+    *         including each Term's docFreq and totalTermFreq,
+    *         as well as the summary sumTotalTermFreq,
+    *         sumTotalDocFreq and docCount.
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/PostingsConsumer.java b/lucene/core/src/java/org/apache/lucene/codecs/PostingsConsumer.java
+deleted file mode 100644
+index 642d107..0000000
+--- a/lucene/core/src/java/org/apache/lucene/codecs/PostingsConsumer.java
++++ /dev/null
+@@ -1,67 +0,0 @@
+-package org.apache.lucene.codecs;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.io.IOException;
+-
+-import org.apache.lucene.util.BytesRef;
+-
+-/**
+- * Abstract API that consumes postings for an individual term.
+- * <p>
+- * The lifecycle is:
+- * <ol>
+- *    <li>PostingsConsumer is returned for each term by
+- *        {@link TermsConsumer#startTerm(BytesRef)}. 
+- *    <li>{@link #startDoc(int, int)} is called for each
+- *        document where the term occurs, specifying id 
+- *        and term frequency for that document.
+- *    <li>If positions are enabled for the field, then
+- *        {@link #addPosition(int, BytesRef, int, int)}
+- *        will be called for each occurrence in the 
+- *        document.
+- *    <li>{@link #finishDoc()} is called when the producer
+- *        is done adding positions to the document.
+- * </ol>
+- * 
+- * @lucene.experimental
+- */
+-public abstract class PostingsConsumer {
+-
+-  /** Sole constructor. (For invocation by subclass 
+-   *  constructors, typically implicit.) */
+-  protected PostingsConsumer() {
+-  }
+-
+-  /** Adds a new doc in this term. 
+-   * <code>freq</code> will be -1 when term frequencies are omitted
+-   * for the field. */
+-  public abstract void startDoc(int docID, int freq) throws IOException;
+-
+-  /** Add a new position & payload, and start/end offset.  A
+-   *  null payload means no payload; a non-null payload with
+-   *  zero length also means no payload.  Caller may reuse
+-   *  the {@link BytesRef} for the payload between calls
+-   *  (method must fully consume the payload). <code>startOffset</code>
+-   *  and <code>endOffset</code> will be -1 when offsets are not indexed. */
+-  public abstract void addPosition(int position, BytesRef payload, int startOffset, int endOffset) throws IOException;
+-
+-  /** Called when we are done adding positions & payloads
+-   *  for each doc. */
+-  public abstract void finishDoc() throws IOException;
+-}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/PostingsWriterBase.java b/lucene/core/src/java/org/apache/lucene/codecs/PostingsWriterBase.java
+index e110710..645ee01 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/PostingsWriterBase.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/PostingsWriterBase.java
+@@ -17,29 +17,29 @@ package org.apache.lucene.codecs;
+  * limitations under the License.
+  */
+ 
+-import java.io.IOException;
+ import java.io.Closeable;
++import java.io.IOException;
+ 
++import org.apache.lucene.index.DocsAndPositionsEnum; // javadocs
++import org.apache.lucene.index.DocsEnum; // javadocs
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+-import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ 
+ /**
+- * Extension of {@link PostingsConsumer} to support pluggable term dictionaries.
+- * <p>
+- * This class contains additional hooks to interact with the provided
+- * term dictionaries such as {@link BlockTreeTermsWriter}. If you want
+- * to re-use an existing implementation and are only interested in
+- * customizing the format of the postings list, extend this class
+- * instead.
++ * Class that plugs into term dictionaries, such as {@link
++ * BlockTreeTermsWriter}, and handles writing postings.
+  * 
+  * @see PostingsReaderBase
+  * @lucene.experimental
+  */
+ // TODO: find a better name; this defines the API that the
+ // terms dict impls use to talk to a postings impl.
+-// TermsDict + PostingsReader/WriterBase == PostingsConsumer/Producer
+-public abstract class PostingsWriterBase extends PostingsConsumer implements Closeable {
++// TermsDict + PostingsReader/WriterBase == FieldsProducer/Consumer
++public abstract class PostingsWriterBase implements Closeable {
+ 
+   /** Sole constructor. (For invocation by subclass 
+    *  constructors, typically implicit.) */
+@@ -51,18 +51,16 @@ public abstract class PostingsWriterBase extends PostingsConsumer implements Clo
+    *  the provided {@code termsOut}. */
+   public abstract void init(IndexOutput termsOut) throws IOException;
+ 
+-  /** Return a newly created empty TermState */
+-  public abstract BlockTermState newTermState() throws IOException;
+-
+-  /** Start a new term.  Note that a matching call to {@link
+-   *  #finishTerm(BlockTermState)} is done, only if the term has at least one
+-   *  document. */
+-  public abstract void startTerm() throws IOException;
+-
+-  /** Finishes the current term.  The provided {@link
+-   *  BlockTermState} contains the term's summary statistics, 
+-   *  and will holds metadata from PBF when returned */
+-  public abstract void finishTerm(BlockTermState state) throws IOException;
++  /** Write all postings for one term; use the provided
++   *  {@link TermsEnum} to pull a {@link DocsEnum} or {@link
++   *  DocsAndPositionsEnum}.  This method should not
++   *  re-position the {@code TermsEnum}!  It is already
++   *  positioned on the term that should be written.  This
++   *  method must set the bit in the provided {@link
++   *  FixedBitSet} for every docID written.  If no docs
++   *  were written, this method should return null, and the
++   *  terms dict will skip the term. */
++  public abstract BlockTermState writeTerm(BytesRef term, TermsEnum termsEnum, FixedBitSet docsSeen) throws IOException;
+ 
+   /**
+    * Encode metadata as long[] and byte[]. {@code absolute} controls whether 
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/PushFieldsConsumer.java b/lucene/core/src/java/org/apache/lucene/codecs/PushFieldsConsumer.java
+deleted file mode 100644
+index 5a10c90..0000000
+--- a/lucene/core/src/java/org/apache/lucene/codecs/PushFieldsConsumer.java
++++ /dev/null
+@@ -1,181 +0,0 @@
+-package org.apache.lucene.codecs;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.io.Closeable;
+-import java.io.IOException;
+-
+-import org.apache.lucene.index.DocsAndPositionsEnum;
+-import org.apache.lucene.index.DocsEnum;
+-import org.apache.lucene.index.FieldInfo.IndexOptions;
+-import org.apache.lucene.index.FieldInfo;
+-import org.apache.lucene.index.Fields;
+-import org.apache.lucene.index.SegmentWriteState;
+-import org.apache.lucene.index.Terms;
+-import org.apache.lucene.index.TermsEnum;
+-import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.FixedBitSet;
+-import org.apache.lucene.util.IOUtils;
+-
+-/** Translates the "pull" API from {@link FieldsConsumer}
+- *  into a "push" API that pushes fields, terms, postings to
+- *  the consumer.
+- *
+- *  <p>
+- *  The lifecycle is:
+- *  <ol>
+- *    <li>PushFieldsConsumer is created by 
+- *        {@link PostingsFormat#fieldsConsumer(SegmentWriteState)}.
+- *    <li>For each field, {@link #addField(FieldInfo)} is called,
+- *        returning a {@link TermsConsumer} for the field.
+- *    <li>After all fields are added, the consumer is {@link #close}d.
+- *  </ol>
+- *
+- * @lucene.experimental
+- */
+-public abstract class PushFieldsConsumer extends FieldsConsumer implements Closeable {
+-
+-  final SegmentWriteState writeState;
+-
+-  /** Sole constructor */
+-  protected PushFieldsConsumer(SegmentWriteState writeState) {
+-    this.writeState = writeState;
+-  }
+-
+-  /** Add a new field */
+-  public abstract TermsConsumer addField(FieldInfo field) throws IOException;
+-
+-  /** Called when we are done adding everything. */
+-  @Override
+-  public abstract void close() throws IOException;
+-
+-  @Override
+-  public final void write(Fields fields) throws IOException {
+-
+-    boolean success = false;
+-    try {
+-      for(String field : fields) { // for all fields
+-        FieldInfo fieldInfo = writeState.fieldInfos.fieldInfo(field);
+-        IndexOptions indexOptions = fieldInfo.getIndexOptions();
+-        TermsConsumer termsConsumer = addField(fieldInfo);
+-
+-        Terms terms = fields.terms(field);
+-        if (terms != null) {
+-
+-          // Holds all docs that have this field:
+-          FixedBitSet visitedDocs = new FixedBitSet(writeState.segmentInfo.getDocCount());
+-
+-          boolean hasFreq = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
+-          boolean hasPositions = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+-          assert hasPositions == terms.hasPositions();
+-          boolean hasOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+-          assert hasOffsets == terms.hasOffsets();
+-          boolean hasPayloads = fieldInfo.hasPayloads();
+-
+-          long sumTotalTermFreq = 0;
+-          long sumDocFreq = 0;
+-
+-          int flags = 0;
+-          if (hasPositions == false) {
+-            if (hasFreq) {
+-              flags = flags | DocsEnum.FLAG_FREQS;
+-            }
+-          } else {
+-            if (hasPayloads) {
+-              flags = flags | DocsAndPositionsEnum.FLAG_PAYLOADS;
+-            }
+-            if (hasOffsets) {
+-              flags = flags | DocsAndPositionsEnum.FLAG_OFFSETS;
+-            }
+-          }
+-
+-          DocsEnum docsEnum = null;
+-          DocsAndPositionsEnum docsAndPositionsEnum = null;
+-          TermsEnum termsEnum = terms.iterator(null);
+-
+-          while (true) { // for all terms in this field
+-            BytesRef term = termsEnum.next();
+-            if (term == null) {
+-              break;
+-            }
+-            if (hasPositions) {
+-              docsAndPositionsEnum = termsEnum.docsAndPositions(null, docsAndPositionsEnum, flags);
+-              docsEnum = docsAndPositionsEnum;
+-            } else {
+-              docsEnum = termsEnum.docs(null, docsEnum, flags);
+-              docsAndPositionsEnum = null;
+-            }
+-            assert docsEnum != null;
+-
+-            PostingsConsumer postingsConsumer = termsConsumer.startTerm(term);
+-
+-            // How many documents have this term:
+-            int docFreq = 0;
+-
+-            // How many times this term occurs:
+-            long totalTermFreq = 0;
+-
+-            while(true) { // for all docs in this field+term
+-              int doc = docsEnum.nextDoc();
+-              if (doc == DocsEnum.NO_MORE_DOCS) {
+-                break;
+-              }
+-              docFreq++;
+-              visitedDocs.set(doc);
+-              if (hasFreq) {
+-                int freq = docsEnum.freq();
+-                postingsConsumer.startDoc(doc, freq);
+-                totalTermFreq += freq;
+-
+-                if (hasPositions) {
+-                  for(int i=0;i<freq;i++) { // for all positions in this field+term + doc
+-                    int pos = docsAndPositionsEnum.nextPosition();
+-                    BytesRef payload = docsAndPositionsEnum.getPayload();
+-                    if (hasOffsets) {
+-                      postingsConsumer.addPosition(pos, payload, docsAndPositionsEnum.startOffset(), docsAndPositionsEnum.endOffset());
+-                    } else {
+-                      postingsConsumer.addPosition(pos, payload, -1, -1);
+-                    }
+-                  }
+-                }
+-              } else {
+-                postingsConsumer.startDoc(doc, -1);
+-              }
+-              postingsConsumer.finishDoc();
+-            }
+-
+-            if (docFreq > 0) {
+-              termsConsumer.finishTerm(term, new TermStats(docFreq, hasFreq ? totalTermFreq : -1));
+-              sumTotalTermFreq += totalTermFreq;
+-              sumDocFreq += docFreq;
+-            }
+-          }
+-
+-          termsConsumer.finish(hasFreq ? sumTotalTermFreq : -1, sumDocFreq, visitedDocs.cardinality());
+-        }
+-      }
+-      success = true;
+-    } finally {
+-      if (success) {
+-        IOUtils.close(this);
+-      } else {
+-        IOUtils.closeWhileHandlingException(this);
+-      }
+-    }
+-  }
+-}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/PushPostingsWriterBase.java b/lucene/core/src/java/org/apache/lucene/codecs/PushPostingsWriterBase.java
+new file mode 100644
+index 0000000..a310cf6
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/PushPostingsWriterBase.java
+@@ -0,0 +1,219 @@
++package org.apache.lucene.codecs;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.index.DocsAndPositionsEnum;
++import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.index.FieldInfo.IndexOptions;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.store.DataOutput;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
++
++/**
++ * Extension of {@link PostingsWriterBase}, adding a push
++ * API for writing each element of the postings.  This API
++ * is somewhat analagous to an XML SAX API, while {@link
++ * PostingsWriterBase} is more like an XML DOM API.
++ * 
++ * @see PostingsReaderBase
++ * @lucene.experimental
++ */
++// TODO: find a better name; this defines the API that the
++// terms dict impls use to talk to a postings impl.
++// TermsDict + PostingsReader/WriterBase == PostingsConsumer/Producer
++public abstract class PushPostingsWriterBase extends PostingsWriterBase {
++
++  // Reused in writeTerm
++  private DocsEnum docsEnum;
++  private DocsAndPositionsEnum posEnum;
++  private int enumFlags;
++
++  /** {@link FieldInfo} of current field being written. */
++  protected FieldInfo fieldInfo;
++
++  /** {@link IndexOptions} of current field being
++      written */
++  protected IndexOptions indexOptions;
++
++  /** True if the current field writes freqs. */
++  protected boolean writeFreqs;
++
++  /** True if the current field writes positions. */
++  protected boolean writePositions;
++
++  /** True if the current field writes payloads. */
++  protected boolean writePayloads;
++
++  /** True if the current field writes offsets. */
++  protected boolean writeOffsets;
++
++  /** Sole constructor. (For invocation by subclass 
++   *  constructors, typically implicit.) */
++  protected PushPostingsWriterBase() {
++  }
++
++  /** Called once after startup, before any terms have been
++   *  added.  Implementations typically write a header to
++   *  the provided {@code termsOut}. */
++  public abstract void init(IndexOutput termsOut) throws IOException;
++
++  /** Return a newly created empty TermState */
++  public abstract BlockTermState newTermState() throws IOException;
++
++  /** Start a new term.  Note that a matching call to {@link
++   *  #finishTerm(BlockTermState)} is done, only if the term has at least one
++   *  document. */
++  public abstract void startTerm() throws IOException;
++
++  /** Finishes the current term.  The provided {@link
++   *  BlockTermState} contains the term's summary statistics, 
++   *  and will holds metadata from PBF when returned */
++  public abstract void finishTerm(BlockTermState state) throws IOException;
++
++  /**
++   * Encode metadata as long[] and byte[]. {@code absolute} controls whether 
++   * current term is delta encoded according to latest term. 
++   * Usually elements in {@code longs} are file pointers, so each one always 
++   * increases when a new term is consumed. {@code out} is used to write generic
++   * bytes, which are not monotonic.
++   *
++   * NOTE: sometimes long[] might contain "don't care" values that are unused, e.g. 
++   * the pointer to postings list may not be defined for some terms but is defined
++   * for others, if it is designed to inline  some postings data in term dictionary.
++   * In this case, the postings writer should always use the last value, so that each
++   * element in metadata long[] remains monotonic.
++   */
++  public abstract void encodeTerm(long[] longs, DataOutput out, FieldInfo fieldInfo, BlockTermState state, boolean absolute) throws IOException;
++
++  /** 
++   * Sets the current field for writing, and returns the
++   * fixed length of long[] metadata (which is fixed per
++   * field), called when the writing switches to another field. */
++  // TODO: better name?
++  public int setField(FieldInfo fieldInfo) {
++    this.fieldInfo = fieldInfo;
++    indexOptions = fieldInfo.getIndexOptions();
++
++    writeFreqs = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
++    writePositions = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
++    writeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;        
++    writePayloads = fieldInfo.hasPayloads();
++
++    if (writeFreqs == false) {
++      enumFlags = 0;
++    } else if (writePositions == false) {
++      enumFlags = DocsEnum.FLAG_FREQS;
++    } else if (writeOffsets == false) {
++      if (writePayloads) {
++        enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS;
++      } else {
++        enumFlags = 0;
++      }
++    } else {
++      if (writePayloads) {
++        enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS | DocsAndPositionsEnum.FLAG_OFFSETS;
++      } else {
++        enumFlags = DocsAndPositionsEnum.FLAG_OFFSETS;
++      }
++    }
++
++    return 0;
++  }
++
++  @Override
++  public final BlockTermState writeTerm(BytesRef term, TermsEnum termsEnum, FixedBitSet docsSeen) throws IOException {
++    startTerm();
++    if (writePositions == false) {
++      docsEnum = termsEnum.docs(null, docsEnum, enumFlags);
++    } else {
++      posEnum = termsEnum.docsAndPositions(null, posEnum, enumFlags);
++      docsEnum = posEnum;
++    }
++    assert docsEnum != null;
++
++    int docFreq = 0;
++    long totalTermFreq = 0;
++    while (true) {
++      int docID = docsEnum.nextDoc();
++      if (docID == DocsEnum.NO_MORE_DOCS) {
++        break;
++      }
++      docFreq++;
++      docsSeen.set(docID);
++      int freq;
++      if (writeFreqs) {
++        freq = docsEnum.freq();
++        totalTermFreq += freq;
++      } else {
++        freq = -1;
++      }
++      startDoc(docID, freq);
++
++      if (writePositions) {
++        for(int i=0;i<freq;i++) {
++          int pos = posEnum.nextPosition();
++          BytesRef payload = writePayloads ? posEnum.getPayload() : null;
++          int startOffset;
++          int endOffset;
++          if (writeOffsets) {
++            startOffset = posEnum.startOffset();
++            endOffset = posEnum.endOffset();
++          } else {
++            startOffset = -1;
++            endOffset = -1;
++          }
++          addPosition(pos, payload, startOffset, endOffset);
++        }
++      }
++
++      finishDoc();
++    }
++
++    if (docFreq == 0) {
++      return null;
++    } else {
++      BlockTermState state = newTermState();
++      state.docFreq = docFreq;
++      state.totalTermFreq = writeFreqs ? totalTermFreq : -1;
++      finishTerm(state);
++      return state;
++    }
++  }
++
++  /** Adds a new doc in this term. 
++   * <code>freq</code> will be -1 when term frequencies are omitted
++   * for the field. */
++  public abstract void startDoc(int docID, int freq) throws IOException;
++
++  /** Add a new position & payload, and start/end offset.  A
++   *  null payload means no payload; a non-null payload with
++   *  zero length also means no payload.  Caller may reuse
++   *  the {@link BytesRef} for the payload between calls
++   *  (method must fully consume the payload). <code>startOffset</code>
++   *  and <code>endOffset</code> will be -1 when offsets are not indexed. */
++  public abstract void addPosition(int position, BytesRef payload, int startOffset, int endOffset) throws IOException;
++
++  /** Called when we are done adding positions & payloads
++   *  for each doc. */
++  public abstract void finishDoc() throws IOException;
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/TermsConsumer.java b/lucene/core/src/java/org/apache/lucene/codecs/TermsConsumer.java
+deleted file mode 100644
+index 84fde04..0000000
+--- a/lucene/core/src/java/org/apache/lucene/codecs/TermsConsumer.java
++++ /dev/null
+@@ -1,67 +0,0 @@
+-package org.apache.lucene.codecs;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.io.IOException;
+-
+-import org.apache.lucene.index.FieldInfo; // javadocs
+-
+-import org.apache.lucene.util.BytesRef;
+-
+-/**
+- * Abstract API that consumes terms for an individual field.
+- * <p>
+- * The lifecycle is:
+- * <ol>
+- *   <li>TermsConsumer is returned for each field 
+- *       by {@link PushFieldsConsumer#addField(FieldInfo)}.
+- *   <li>TermsConsumer returns a {@link PostingsConsumer} for
+- *       each term in {@link #startTerm(BytesRef)}.
+- *   <li>When the producer (e.g. IndexWriter)
+- *       is done adding documents for the term, it calls 
+- *       {@link #finishTerm(BytesRef, TermStats)}, passing in
+- *       the accumulated term statistics.
+- *   <li>Producer calls {@link #finish(long, long, int)} with
+- *       the accumulated collection statistics when it is finished
+- *       adding terms to the field.
+- * </ol>
+- * 
+- * @lucene.experimental
+- */
+-public abstract class TermsConsumer {
+-
+-  /** Sole constructor. (For invocation by subclass 
+-   *  constructors, typically implicit.) */
+-  protected TermsConsumer() {
+-  }
+-
+-  /** Starts a new term in this field; this may be called
+-   *  with no corresponding call to finish if the term had
+-   *  no docs. */
+-  public abstract PostingsConsumer startTerm(BytesRef text) throws IOException;
+-
+-  /** Finishes the current term; numDocs must be > 0.
+-   *  <code>stats.totalTermFreq</code> will be -1 when term 
+-   *  frequencies are omitted for the field. */
+-  public abstract void finishTerm(BytesRef text, TermStats stats) throws IOException;
+-
+-  /** Called when we are done adding terms to this field.
+-   *  <code>sumTotalTermFreq</code> will be -1 when term 
+-   *  frequencies are omitted for the field. */
+-  public abstract void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException;
+-}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsFormat.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsFormat.java
+index 7d342e6..f18ec89 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsFormat.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsFormat.java
+@@ -26,7 +26,7 @@ import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.FieldsProducer;
+ import org.apache.lucene.codecs.PostingsFormat;
+ import org.apache.lucene.codecs.PostingsReaderBase;
+-import org.apache.lucene.codecs.PostingsWriterBase;
++import org.apache.lucene.codecs.PostingsWriterBase; // javadocs
+ import org.apache.lucene.index.DocsEnum; // javadocs
+ import org.apache.lucene.index.FieldInfo.IndexOptions; // javadocs
+ import org.apache.lucene.index.FieldInfos; // javadocs
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene41/Lucene41PostingsWriter.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene41/Lucene41PostingsWriter.java
+index 74bf3e3..208af3c 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene41/Lucene41PostingsWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene41/Lucene41PostingsWriter.java
+@@ -17,31 +17,27 @@ package org.apache.lucene.codecs.lucene41;
+  * limitations under the License.
+  */
+ 
+-import static org.apache.lucene.codecs.lucene41.Lucene41PostingsFormat.BLOCK_SIZE;
+-import static org.apache.lucene.codecs.lucene41.ForUtil.MAX_DATA_SIZE;
+-import static org.apache.lucene.codecs.lucene41.ForUtil.MAX_ENCODED_SIZE;
+-
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+ import org.apache.lucene.codecs.CodecUtil;
+-import org.apache.lucene.codecs.PostingsWriterBase;
++import org.apache.lucene.codecs.PushPostingsWriterBase;
+ import org.apache.lucene.index.CorruptIndexException;
+ import org.apache.lucene.index.FieldInfo;
+-import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.index.TermState;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+-import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.packed.PackedInts;
+ 
++import static org.apache.lucene.codecs.lucene41.ForUtil.MAX_DATA_SIZE;
++import static org.apache.lucene.codecs.lucene41.ForUtil.MAX_ENCODED_SIZE;
++import static org.apache.lucene.codecs.lucene41.Lucene41PostingsFormat.BLOCK_SIZE;
++
+ 
+ /**
+  * Concrete class that writes docId(maybe frq,pos,offset,payloads) list
+@@ -52,7 +48,7 @@ import org.apache.lucene.util.packed.PackedInts;
+  * @see Lucene41SkipWriter for details about skipping setting and postings layout.
+  * @lucene.experimental
+  */
+-public final class Lucene41PostingsWriter extends PostingsWriterBase {
++public final class Lucene41PostingsWriter extends PushPostingsWriterBase {
+ 
+   /** 
+    * Expert: The maximum number of skip levels. Smaller values result in 
+@@ -77,12 +73,6 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+   final static IntBlockTermState emptyState = new IntBlockTermState();
+   IntBlockTermState lastState;
+ 
+-  // How current field indexes postings:
+-  private boolean fieldHasFreqs;
+-  private boolean fieldHasPositions;
+-  private boolean fieldHasOffsets;
+-  private boolean fieldHasPayloads;
+-
+   // Holds starting file pointers for current term:
+   private long docStartFP;
+   private long posStartFP;
+@@ -241,15 +231,11 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+ 
+   @Override
+   public int setField(FieldInfo fieldInfo) {
+-    IndexOptions indexOptions = fieldInfo.getIndexOptions();
+-    fieldHasFreqs = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
+-    fieldHasPositions = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+-    fieldHasOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+-    fieldHasPayloads = fieldInfo.hasPayloads();
+-    skipWriter.setField(fieldHasPositions, fieldHasOffsets, fieldHasPayloads);
++    super.setField(fieldInfo);
++    skipWriter.setField(writePositions, writeOffsets, writePayloads);
+     lastState = emptyState;
+-    if (fieldHasPositions) {
+-      if (fieldHasPayloads || fieldHasOffsets) {
++    if (writePositions) {
++      if (writePayloads || writeOffsets) {
+         return 3;  // doc + pos + pay FP
+       } else {
+         return 2;  // doc + pos FP
+@@ -262,9 +248,9 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+   @Override
+   public void startTerm() {
+     docStartFP = docOut.getFilePointer();
+-    if (fieldHasPositions) {
++    if (writePositions) {
+       posStartFP = posOut.getFilePointer();
+-      if (fieldHasPayloads || fieldHasOffsets) {
++      if (writePayloads || writeOffsets) {
+         payStartFP = payOut.getFilePointer();
+       }
+     }
+@@ -301,7 +287,7 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+     // if (DEBUG) {
+     //   System.out.println("  docDeltaBuffer[" + docBufferUpto + "]=" + docDelta);
+     // }
+-    if (fieldHasFreqs) {
++    if (writeFreqs) {
+       freqBuffer[docBufferUpto] = termDocFreq;
+     }
+     docBufferUpto++;
+@@ -312,7 +298,7 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+       //   System.out.println("  write docDelta block @ fp=" + docOut.getFilePointer());
+       // }
+       forUtil.writeBlock(docDeltaBuffer, encoded, docOut);
+-      if (fieldHasFreqs) {
++      if (writeFreqs) {
+         // if (DEBUG) {
+         //   System.out.println("  write freq block @ fp=" + docOut.getFilePointer());
+         // }
+@@ -329,14 +315,13 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+     lastStartOffset = 0;
+   }
+ 
+-  /** Add a new position & payload */
+   @Override
+   public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) throws IOException {
+     // if (DEBUG) {
+-    //   System.out.println("FPW.addPosition pos=" + position + " posBufferUpto=" + posBufferUpto + (fieldHasPayloads ? " payloadByteUpto=" + payloadByteUpto: ""));
++    //   System.out.println("FPW.addPosition pos=" + position + " posBufferUpto=" + posBufferUpto + (writePayloads ? " payloadByteUpto=" + payloadByteUpto: ""));
+     // }
+     posDeltaBuffer[posBufferUpto] = position - lastPosition;
+-    if (fieldHasPayloads) {
++    if (writePayloads) {
+       if (payload == null || payload.length == 0) {
+         // no payload
+         payloadLengthBuffer[posBufferUpto] = 0;
+@@ -350,7 +335,7 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+       }
+     }
+ 
+-    if (fieldHasOffsets) {
++    if (writeOffsets) {
+       assert startOffset >= lastStartOffset;
+       assert endOffset >= startOffset;
+       offsetStartDeltaBuffer[posBufferUpto] = startOffset - lastStartOffset;
+@@ -366,13 +351,13 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+       // }
+       forUtil.writeBlock(posDeltaBuffer, encoded, posOut);
+ 
+-      if (fieldHasPayloads) {
++      if (writePayloads) {
+         forUtil.writeBlock(payloadLengthBuffer, encoded, payOut);
+         payOut.writeVInt(payloadByteUpto);
+         payOut.writeBytes(payloadBytes, 0, payloadByteUpto);
+         payloadByteUpto = 0;
+       }
+-      if (fieldHasOffsets) {
++      if (writeOffsets) {
+         forUtil.writeBlock(offsetStartDeltaBuffer, encoded, payOut);
+         forUtil.writeBlock(offsetLengthBuffer, encoded, payOut);
+       }
+@@ -433,7 +418,7 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+       for(int i=0;i<docBufferUpto;i++) {
+         final int docDelta = docDeltaBuffer[i];
+         final int freq = freqBuffer[i];
+-        if (!fieldHasFreqs) {
++        if (!writeFreqs) {
+           docOut.writeVInt(docDelta);
+         } else if (freqBuffer[i] == 1) {
+           docOut.writeVInt((docDelta<<1)|1);
+@@ -446,10 +431,10 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+ 
+     final long lastPosBlockOffset;
+ 
+-    if (fieldHasPositions) {
++    if (writePositions) {
+       // if (DEBUG) {
+       //   if (posBufferUpto > 0) {
+-      //     System.out.println("  write pos vInt block (count=" + posBufferUpto + ") at fp=" + posOut.getFilePointer() + " posStartFP=" + posStartFP + " hasPayloads=" + fieldHasPayloads + " hasOffsets=" + fieldHasOffsets);
++      //     System.out.println("  write pos vInt block (count=" + posBufferUpto + ") at fp=" + posOut.getFilePointer() + " posStartFP=" + posStartFP + " hasPayloads=" + writePayloads + " hasOffsets=" + writeOffsets);
+       //   }
+       // }
+ 
+@@ -474,7 +459,7 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+         int payloadBytesReadUpto = 0;
+         for(int i=0;i<posBufferUpto;i++) {
+           final int posDelta = posDeltaBuffer[i];
+-          if (fieldHasPayloads) {
++          if (writePayloads) {
+             final int payloadLength = payloadLengthBuffer[i];
+             if (payloadLength != lastPayloadLength) {
+               lastPayloadLength = payloadLength;
+@@ -499,7 +484,7 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+             posOut.writeVInt(posDelta);
+           }
+ 
+-          if (fieldHasOffsets) {
++          if (writeOffsets) {
+             // if (DEBUG) {
+             //   System.out.println("          write offset @ pos.fp=" + posOut.getFilePointer());
+             // }
+@@ -515,7 +500,7 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+           }
+         }
+ 
+-        if (fieldHasPayloads) {
++        if (writePayloads) {
+           assert payloadBytesReadUpto == payloadByteUpto;
+           payloadByteUpto = 0;
+         }
+@@ -562,16 +547,16 @@ public final class Lucene41PostingsWriter extends PostingsWriterBase {
+       lastState = emptyState;
+     }
+     longs[0] = state.docStartFP - lastState.docStartFP;
+-    if (fieldHasPositions) {
++    if (writePositions) {
+       longs[1] = state.posStartFP - lastState.posStartFP;
+-      if (fieldHasPayloads || fieldHasOffsets) {
++      if (writePayloads || writeOffsets) {
+         longs[2] = state.payStartFP - lastState.payStartFP;
+       }
+     }
+     if (state.singletonDocID != -1) {
+       out.writeVInt(state.singletonDocID);
+     }
+-    if (fieldHasPositions) {
++    if (writePositions) {
+       if (state.lastPosBlockOffset != -1) {
+         out.writeVLong(state.lastPosBlockOffset);
+       }
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/asserting/AssertingPostingsFormat.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/asserting/AssertingPostingsFormat.java
+index af227a9..8681b59 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/asserting/AssertingPostingsFormat.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/asserting/AssertingPostingsFormat.java
+@@ -18,21 +18,15 @@ package org.apache.lucene.codecs.asserting;
+  */
+ 
+ import java.io.IOException;
+-import java.util.Comparator;
+ import java.util.Iterator;
+ 
+ import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.FieldsProducer;
+-import org.apache.lucene.codecs.PostingsConsumer;
+ import org.apache.lucene.codecs.PostingsFormat;
+-import org.apache.lucene.codecs.PushFieldsConsumer;
+-import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.codecs.TermsConsumer;
+ import org.apache.lucene.codecs.lucene41.Lucene41PostingsFormat;
+ import org.apache.lucene.index.AssertingAtomicReader;
+ import org.apache.lucene.index.DocsAndPositionsEnum;
+ import org.apache.lucene.index.DocsEnum;
+-import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.SegmentReadState;
+@@ -40,7 +34,6 @@ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.index.Terms;
+ import org.apache.lucene.index.TermsEnum;
+ import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.OpenBitSet;
+ 
+ /**
+  * Just like {@link Lucene41PostingsFormat} but with additional asserts.
+@@ -54,12 +47,7 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+   
+   @Override
+   public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
+-    FieldsConsumer fieldsConsumer = in.fieldsConsumer(state);
+-    if (fieldsConsumer instanceof PushFieldsConsumer) {
+-      return new AssertingPushFieldsConsumer(state, (PushFieldsConsumer) fieldsConsumer);
+-    } else {
+-      return new AssertingFieldsConsumer(state, fieldsConsumer);
+-    }
++    return new AssertingFieldsConsumer(state, in.fieldsConsumer(state));
+   }
+ 
+   @Override
+@@ -103,27 +91,6 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+     }
+   }
+ 
+-  static class AssertingPushFieldsConsumer extends PushFieldsConsumer {
+-    private final PushFieldsConsumer in;
+-    
+-    AssertingPushFieldsConsumer(SegmentWriteState writeState, PushFieldsConsumer in) {
+-      super(writeState);
+-      this.in = in;
+-    }
+-    
+-    @Override
+-    public TermsConsumer addField(FieldInfo field) throws IOException {
+-      TermsConsumer consumer = in.addField(field);
+-      assert consumer != null;
+-      return new AssertingTermsConsumer(consumer, field);
+-    }
+-
+-    @Override
+-    public void close() throws IOException {
+-      in.close();
+-    }
+-  }
+-
+   static class AssertingFieldsConsumer extends FieldsConsumer {
+     private final FieldsConsumer in;
+     private final SegmentWriteState writeState;
+@@ -153,6 +120,9 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+         lastField = field;
+ 
+         Terms terms = fields.terms(field);
++        if (terms == null) {
++          continue;
++        }
+         assert terms != null;
+ 
+         termsEnum = terms.iterator(termsEnum);
+@@ -163,6 +133,7 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+         boolean hasFreqs = fieldInfo.getIndexOptions().compareTo(FieldInfo.IndexOptions.DOCS_AND_FREQS) >= 0;
+         boolean hasPositions = fieldInfo.getIndexOptions().compareTo(FieldInfo.IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+         boolean hasOffsets = fieldInfo.getIndexOptions().compareTo(FieldInfo.IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
++        boolean hasPayloads = terms.hasPayloads();
+ 
+         assert hasPositions == terms.hasPositions();
+         assert hasOffsets == terms.hasOffsets();
+@@ -179,14 +150,16 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+             lastTerm.copyBytes(term);
+           }
+ 
++          int flags = 0;
+           if (hasPositions == false) {
+-            int flags = 0;
+             if (hasFreqs) {
+               flags = flags | DocsEnum.FLAG_FREQS;
+             }
+             docsEnum = termsEnum.docs(null, docsEnum, flags);
+           } else {
+-            int flags = DocsAndPositionsEnum.FLAG_PAYLOADS;
++            if (hasPayloads) {
++              flags |= DocsAndPositionsEnum.FLAG_PAYLOADS;
++            }
+             if (hasOffsets) {
+               flags = flags | DocsAndPositionsEnum.FLAG_OFFSETS;
+             }
+@@ -194,6 +167,8 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+             docsEnum = posEnum;
+           }
+ 
++          assert docsEnum != null : "termsEnum=" + termsEnum + " hasPositions=" + hasPositions;
++
+           int lastDocID = -1;
+ 
+           while(true) {
+@@ -212,13 +187,13 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+                 int lastStartOffset = -1;
+                 for(int i=0;i<freq;i++) {
+                   int pos = posEnum.nextPosition();
+-                  assert pos > lastPos;
++                  assert pos >= lastPos: "pos=" + pos + " vs lastPos=" + lastPos + " i=" + i + " freq=" + freq;
+                   lastPos = pos;
+ 
+                   if (hasOffsets) {
+                     int startOffset = posEnum.startOffset();
+                     int endOffset = posEnum.endOffset();
+-                    assert endOffset > startOffset;
++                    assert endOffset >= startOffset;
+                     assert startOffset >= lastStartOffset;
+                     lastStartOffset = startOffset;
+                   }
+@@ -230,140 +205,4 @@ public final class AssertingPostingsFormat extends PostingsFormat {
+       }
+     }
+   }
+-  
+-  static enum TermsConsumerState { INITIAL, START, FINISHED };
+-  static class AssertingTermsConsumer extends TermsConsumer {
+-    private final TermsConsumer in;
+-    private final FieldInfo fieldInfo;
+-    private BytesRef lastTerm = null;
+-    private TermsConsumerState state = TermsConsumerState.INITIAL;
+-    private AssertingPostingsConsumer lastPostingsConsumer = null;
+-    private long sumTotalTermFreq = 0;
+-    private long sumDocFreq = 0;
+-    private OpenBitSet visitedDocs = new OpenBitSet();
+-    private static final Comparator<BytesRef> termComp = BytesRef.getUTF8SortedAsUnicodeComparator();
+-    
+-    AssertingTermsConsumer(TermsConsumer in, FieldInfo fieldInfo) {
+-      this.in = in;
+-      this.fieldInfo = fieldInfo;
+-    }
+-    
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) throws IOException {
+-      assert state == TermsConsumerState.INITIAL || state == TermsConsumerState.START && lastPostingsConsumer.docFreq == 0;
+-      state = TermsConsumerState.START;
+-      assert lastTerm == null || termComp.compare(text, lastTerm) > 0;
+-      lastTerm = BytesRef.deepCopyOf(text);
+-      return lastPostingsConsumer = new AssertingPostingsConsumer(in.startTerm(text), fieldInfo, visitedDocs);
+-    }
+-
+-    @Override
+-    public void finishTerm(BytesRef text, TermStats stats) throws IOException {
+-      assert state == TermsConsumerState.START;
+-      state = TermsConsumerState.INITIAL;
+-      assert text.equals(lastTerm);
+-      assert stats.docFreq > 0; // otherwise, this method should not be called.
+-      assert stats.docFreq == lastPostingsConsumer.docFreq;
+-      sumDocFreq += stats.docFreq;
+-      if (fieldInfo.getIndexOptions() == IndexOptions.DOCS_ONLY) {
+-        assert stats.totalTermFreq == -1;
+-      } else {
+-        assert stats.totalTermFreq == lastPostingsConsumer.totalTermFreq;
+-        sumTotalTermFreq += stats.totalTermFreq;
+-      }
+-      in.finishTerm(text, stats);
+-    }
+-
+-    @Override
+-    public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) throws IOException {
+-      assert state == TermsConsumerState.INITIAL || state == TermsConsumerState.START && lastPostingsConsumer.docFreq == 0;
+-      state = TermsConsumerState.FINISHED;
+-      assert docCount >= 0;
+-      assert docCount == visitedDocs.cardinality();
+-      assert sumDocFreq >= docCount;
+-      assert sumDocFreq == this.sumDocFreq;
+-      if (fieldInfo.getIndexOptions() == IndexOptions.DOCS_ONLY) {
+-        assert sumTotalTermFreq == -1;
+-      } else {
+-        assert sumTotalTermFreq >= sumDocFreq;
+-        assert sumTotalTermFreq == this.sumTotalTermFreq;
+-      }
+-      in.finish(sumTotalTermFreq, sumDocFreq, docCount);
+-    }
+-  }
+-  
+-  static enum PostingsConsumerState { INITIAL, START };
+-  static class AssertingPostingsConsumer extends PostingsConsumer {
+-    private final PostingsConsumer in;
+-    private final FieldInfo fieldInfo;
+-    private final OpenBitSet visitedDocs;
+-    private PostingsConsumerState state = PostingsConsumerState.INITIAL;
+-    private int freq;
+-    private int positionCount;
+-    private int lastPosition = 0;
+-    private int lastStartOffset = 0;
+-    int docFreq = 0;
+-    long totalTermFreq = 0;
+-    
+-    AssertingPostingsConsumer(PostingsConsumer in, FieldInfo fieldInfo, OpenBitSet visitedDocs) {
+-      this.in = in;
+-      this.fieldInfo = fieldInfo;
+-      this.visitedDocs = visitedDocs;
+-    }
+-
+-    @Override
+-    public void startDoc(int docID, int freq) throws IOException {
+-      assert state == PostingsConsumerState.INITIAL;
+-      state = PostingsConsumerState.START;
+-      assert docID >= 0;
+-      if (fieldInfo.getIndexOptions() == IndexOptions.DOCS_ONLY) {
+-        assert freq == -1;
+-        this.freq = 0; // we don't expect any positions here
+-      } else {
+-        assert freq > 0;
+-        this.freq = freq;
+-        totalTermFreq += freq;
+-      }
+-      this.positionCount = 0;
+-      this.lastPosition = 0;
+-      this.lastStartOffset = 0;
+-      docFreq++;
+-      visitedDocs.set(docID);
+-      in.startDoc(docID, freq);
+-    }
+-
+-    @Override
+-    public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) throws IOException {
+-      assert state == PostingsConsumerState.START;
+-      assert positionCount < freq;
+-      positionCount++;
+-      assert position >= lastPosition || position == -1; /* we still allow -1 from old 3.x indexes */
+-      lastPosition = position;
+-      if (fieldInfo.getIndexOptions() == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) {
+-        assert startOffset >= 0;
+-        assert startOffset >= lastStartOffset;
+-        lastStartOffset = startOffset;
+-        assert endOffset >= startOffset;
+-      } else {
+-        assert startOffset == -1;
+-        assert endOffset == -1;
+-      }
+-      if (payload != null) {
+-        assert fieldInfo.hasPayloads();
+-      }
+-      in.addPosition(position, payload, startOffset, endOffset);
+-    }
+-
+-    @Override
+-    public void finishDoc() throws IOException {
+-      assert state == PostingsConsumerState.START;
+-      state = PostingsConsumerState.INITIAL;
+-      if (fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) < 0) {
+-        assert positionCount == 0; // we should not have fed any positions!
+-      } else {
+-        assert positionCount == freq;
+-      }
+-      in.finishDoc();
+-    }
+-  }
+ }
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsWriter.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsWriter.java
+index e3e5cba..2c489a4 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsWriter.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40PostingsWriter.java
+@@ -21,22 +21,18 @@ package org.apache.lucene.codecs.lucene40;
+  *  index file format */
+ 
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
+ 
+ import org.apache.lucene.codecs.BlockTermState;
+ import org.apache.lucene.codecs.CodecUtil;
+-import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.codecs.TermStats;
++import org.apache.lucene.codecs.PushPostingsWriterBase;
+ import org.apache.lucene.index.CorruptIndexException;
+-import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.index.DocsEnum;  // javadocs
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.store.DataOutput;
+ import org.apache.lucene.store.IndexOutput;
+-import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ 
+@@ -46,7 +42,7 @@ import org.apache.lucene.util.IOUtils;
+  * @see Lucene40PostingsFormat
+  * @lucene.experimental 
+  */
+-public final class Lucene40PostingsWriter extends PostingsWriterBase {
++public final class Lucene40PostingsWriter extends PushPostingsWriterBase {
+ 
+   final IndexOutput freqOut;
+   final IndexOutput proxOut;
+@@ -70,13 +66,9 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+   final int maxSkipLevels = 10;
+   final int totalNumDocs;
+ 
+-  IndexOptions indexOptions;
+-  boolean storePayloads;
+-  boolean storeOffsets;
+   // Starts a new term
+   long freqStart;
+   long proxStart;
+-  FieldInfo fieldInfo;
+   int lastPayloadLength;
+   int lastOffsetLength;
+   int lastPosition;
+@@ -150,7 +142,6 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+     return new StandardTermState();
+   }
+ 
+-
+   @Override
+   public void startTerm() {
+     freqStart = freqOut.getFilePointer();
+@@ -169,6 +160,7 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+   // our parent calls setField whenever the field changes
+   @Override
+   public int setField(FieldInfo fieldInfo) {
++    super.setField(fieldInfo);
+     //System.out.println("SPW: setField");
+     /*
+     if (BlockTreeTermsWriter.DEBUG && fieldInfo.name.equals("id")) {
+@@ -177,11 +169,7 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+       DEBUG = false;
+     }
+     */
+-    this.fieldInfo = fieldInfo;
+-    indexOptions = fieldInfo.getIndexOptions();
+-    
+-    storeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;        
+-    storePayloads = fieldInfo.hasPayloads();
++
+     lastState = emptyState;
+     //System.out.println("  set init blockFreqStart=" + freqStart);
+     //System.out.println("  set init blockProxStart=" + proxStart);
+@@ -190,7 +178,7 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+ 
+   int lastDocID;
+   int df;
+-  
++
+   @Override
+   public void startDoc(int docID, int termDocFreq) throws IOException {
+     // if (DEBUG) System.out.println("SPW:   startDoc seg=" + segment + " docID=" + docID + " tf=" + termDocFreq + " freqOut.fp=" + freqOut.getFilePointer());
+@@ -202,7 +190,7 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+     }
+ 
+     if ((++df % skipInterval) == 0) {
+-      skipListWriter.setSkipData(lastDocID, storePayloads, lastPayloadLength, storeOffsets, lastOffsetLength);
++      skipListWriter.setSkipData(lastDocID, writePayloads, lastPayloadLength, writeOffsets, lastOffsetLength);
+       skipListWriter.bufferSkip(df);
+     }
+ 
+@@ -237,7 +225,7 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+ 
+     int payloadLength = 0;
+ 
+-    if (storePayloads) {
++    if (writePayloads) {
+       payloadLength = payload == null ? 0 : payload.length;
+ 
+       if (payloadLength != lastPayloadLength) {
+@@ -251,7 +239,7 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+       proxOut.writeVInt(delta);
+     }
+     
+-    if (storeOffsets) {
++    if (writeOffsets) {
+       // don't use startOffset - lastEndOffset, because this creates lots of negative vints for synonyms,
+       // and the numbers aren't that much smaller anyways.
+       int offsetDelta = startOffset - lastOffset;
+@@ -285,7 +273,7 @@ public final class Lucene40PostingsWriter extends PostingsWriterBase {
+   /** Called when we are done adding docs to this term */
+   @Override
+   public void finishTerm(BlockTermState _state) throws IOException {
+-    StandardTermState state = (StandardTermState)_state;
++    StandardTermState state = (StandardTermState) _state;
+     // if (DEBUG) System.out.println("SPW: finishTerm seg=" + segment + " freqStart=" + freqStart);
+     assert state.docFreq > 0;
+ 
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40RWPostingsFormat.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40RWPostingsFormat.java
+index 90b3f0c..01dea23 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40RWPostingsFormat.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/lucene40/Lucene40RWPostingsFormat.java
+@@ -1,13 +1,5 @@
+ package org.apache.lucene.codecs.lucene40;
+ 
+-import java.io.IOException;
+-
+-import org.apache.lucene.codecs.BlockTreeTermsWriter;
+-import org.apache.lucene.codecs.FieldsConsumer;
+-import org.apache.lucene.codecs.PostingsWriterBase;
+-import org.apache.lucene.index.SegmentWriteState;
+-import org.apache.lucene.util.LuceneTestCase;
+-
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -25,6 +17,14 @@ import org.apache.lucene.util.LuceneTestCase;
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
++
++import org.apache.lucene.codecs.BlockTreeTermsWriter;
++import org.apache.lucene.codecs.FieldsConsumer;
++import org.apache.lucene.codecs.PostingsWriterBase;
++import org.apache.lucene.index.SegmentWriteState;
++import org.apache.lucene.util.LuceneTestCase;
++
+ /**
+  * Read-write version of {@link Lucene40PostingsFormat} for testing.
+  */
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockFixedIntBlockPostingsFormat.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockFixedIntBlockPostingsFormat.java
+index fff571c..b714489 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockFixedIntBlockPostingsFormat.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockFixedIntBlockPostingsFormat.java
+@@ -37,8 +37,8 @@ import org.apache.lucene.codecs.sep.IntIndexOutput;
+ import org.apache.lucene.codecs.sep.IntStreamFactory;
+ import org.apache.lucene.codecs.sep.SepPostingsReader;
+ import org.apache.lucene.codecs.sep.SepPostingsWriter;
+-import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.index.SegmentReadState;
++import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.store.*;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockVariableIntBlockPostingsFormat.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockVariableIntBlockPostingsFormat.java
+index 48face9..3a62105 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockVariableIntBlockPostingsFormat.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/mockintblock/MockVariableIntBlockPostingsFormat.java
+@@ -37,8 +37,8 @@ import org.apache.lucene.codecs.sep.IntIndexOutput;
+ import org.apache.lucene.codecs.sep.IntStreamFactory;
+ import org.apache.lucene.codecs.sep.SepPostingsReader;
+ import org.apache.lucene.codecs.sep.SepPostingsWriter;
+-import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.index.SegmentReadState;
++import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.IndexInput;
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/mockrandom/MockRandomPostingsFormat.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/mockrandom/MockRandomPostingsFormat.java
+index b52989e..254cc96 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/mockrandom/MockRandomPostingsFormat.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/mockrandom/MockRandomPostingsFormat.java
+@@ -40,6 +40,10 @@ import org.apache.lucene.codecs.blockterms.VariableGapTermsIndexReader;
+ import org.apache.lucene.codecs.blockterms.VariableGapTermsIndexWriter;
+ import org.apache.lucene.codecs.lucene41.Lucene41PostingsReader;
+ import org.apache.lucene.codecs.lucene41.Lucene41PostingsWriter;
++import org.apache.lucene.codecs.memory.FSTOrdTermsReader;
++import org.apache.lucene.codecs.memory.FSTOrdTermsWriter;
++import org.apache.lucene.codecs.memory.FSTTermsReader;
++import org.apache.lucene.codecs.memory.FSTTermsWriter;
+ import org.apache.lucene.codecs.mockintblock.MockFixedIntBlockPostingsFormat;
+ import org.apache.lucene.codecs.mockintblock.MockVariableIntBlockPostingsFormat;
+ import org.apache.lucene.codecs.mocksep.MockSingleIntFactory;
+@@ -50,10 +54,6 @@ import org.apache.lucene.codecs.sep.IntIndexOutput;
+ import org.apache.lucene.codecs.sep.IntStreamFactory;
+ import org.apache.lucene.codecs.sep.SepPostingsReader;
+ import org.apache.lucene.codecs.sep.SepPostingsWriter;
+-import org.apache.lucene.codecs.memory.FSTTermsWriter;
+-import org.apache.lucene.codecs.memory.FSTTermsReader;
+-import org.apache.lucene.codecs.memory.FSTOrdTermsWriter;
+-import org.apache.lucene.codecs.memory.FSTOrdTermsReader;
+ import org.apache.lucene.index.FieldInfo;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentReadState;
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/mocksep/MockSepPostingsFormat.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/mocksep/MockSepPostingsFormat.java
+index f317004..9fc3cd8 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/mocksep/MockSepPostingsFormat.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/mocksep/MockSepPostingsFormat.java
+@@ -32,8 +32,8 @@ import org.apache.lucene.codecs.blockterms.TermsIndexReaderBase;
+ import org.apache.lucene.codecs.blockterms.TermsIndexWriterBase;
+ import org.apache.lucene.codecs.sep.SepPostingsReader;
+ import org.apache.lucene.codecs.sep.SepPostingsWriter;
+-import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.index.SegmentReadState;
++import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.util.BytesRef;
+ 
+ /**
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/ramonly/RAMOnlyPostingsFormat.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/ramonly/RAMOnlyPostingsFormat.java
+index 1473a45..9fcaab7 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/ramonly/RAMOnlyPostingsFormat.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/ramonly/RAMOnlyPostingsFormat.java
+@@ -31,15 +31,13 @@ import java.util.concurrent.atomic.AtomicInteger;
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.FieldsConsumer;
+ import org.apache.lucene.codecs.FieldsProducer;
+-import org.apache.lucene.codecs.PostingsConsumer;
+ import org.apache.lucene.codecs.PostingsFormat;
+-import org.apache.lucene.codecs.PushFieldsConsumer;
+ import org.apache.lucene.codecs.TermStats;
+-import org.apache.lucene.codecs.TermsConsumer;
+ import org.apache.lucene.index.DocsAndPositionsEnum;
+ import org.apache.lucene.index.DocsEnum;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.Fields;
+ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentReadState;
+ import org.apache.lucene.index.SegmentWriteState;
+@@ -49,6 +47,7 @@ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.RamUsageEstimator;
+ 
+@@ -208,34 +207,132 @@ public final class RAMOnlyPostingsFormat extends PostingsFormat {
+   }
+ 
+   // Classes for writing to the postings state
+-  private static class RAMFieldsConsumer extends PushFieldsConsumer {
++  private static class RAMFieldsConsumer extends FieldsConsumer {
+ 
+     private final RAMPostings postings;
+     private final RAMTermsConsumer termsConsumer = new RAMTermsConsumer();
++    private final SegmentWriteState state;
+ 
+     public RAMFieldsConsumer(SegmentWriteState writeState, RAMPostings postings) {
+-      super(writeState);
+       this.postings = postings;
++      this.state = writeState;
+     }
+ 
+     @Override
+-    public TermsConsumer addField(FieldInfo field) {
+-      if (field.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
+-        throw new UnsupportedOperationException("this codec cannot index offsets");
+-      }
+-      RAMField ramField = new RAMField(field.name, field);
+-      postings.fieldToTerms.put(field.name, ramField);
+-      termsConsumer.reset(ramField);
+-      return termsConsumer;
+-    }
++    public void write(Fields fields) throws IOException {
++      for(String field : fields) {
+ 
+-    @Override
+-    public void close() {
+-      // TODO: finalize stuff
++        Terms terms = fields.terms(field);
++        if (terms == null) {
++          continue;
++        }
++
++        TermsEnum termsEnum = terms.iterator(null);
++
++        FieldInfo fieldInfo = state.fieldInfos.fieldInfo(field);
++        if (fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0) {
++          throw new UnsupportedOperationException("this codec cannot index offsets");
++        }
++
++        RAMField ramField = new RAMField(field, fieldInfo);
++        postings.fieldToTerms.put(field, ramField);
++        termsConsumer.reset(ramField);
++
++        FixedBitSet docsSeen = new FixedBitSet(state.segmentInfo.getDocCount());
++        long sumTotalTermFreq = 0;
++        long sumDocFreq = 0;
++        DocsEnum docsEnum = null;
++        DocsAndPositionsEnum posEnum = null;
++        int enumFlags;
++
++        IndexOptions indexOptions = fieldInfo.getIndexOptions();
++        boolean writeFreqs = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
++        boolean writePositions = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
++        boolean writeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;        
++        boolean writePayloads = fieldInfo.hasPayloads();
++
++        if (writeFreqs == false) {
++          enumFlags = 0;
++        } else if (writePositions == false) {
++          enumFlags = DocsEnum.FLAG_FREQS;
++        } else if (writeOffsets == false) {
++          if (writePayloads) {
++            enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS;
++          } else {
++            enumFlags = 0;
++          }
++        } else {
++          if (writePayloads) {
++            enumFlags = DocsAndPositionsEnum.FLAG_PAYLOADS | DocsAndPositionsEnum.FLAG_OFFSETS;
++          } else {
++            enumFlags = DocsAndPositionsEnum.FLAG_OFFSETS;
++          }
++        }
++
++        while (true) {
++          BytesRef term = termsEnum.next();
++          if (term == null) {
++            break;
++          }
++          RAMPostingsWriterImpl postingsWriter = termsConsumer.startTerm(term);
++
++          if (writePositions) {
++            posEnum = termsEnum.docsAndPositions(null, posEnum, enumFlags);
++            docsEnum = posEnum;
++          } else {
++            docsEnum = termsEnum.docs(null, docsEnum, enumFlags);
++            posEnum = null;
++          }
++
++          int docFreq = 0;
++          long totalTermFreq = 0;
++          while (true) {
++            int docID = docsEnum.nextDoc();
++            if (docID == DocsEnum.NO_MORE_DOCS) {
++              break;
++            }
++            docsSeen.set(docID);
++            docFreq++;
++
++            int freq;
++            if (writeFreqs) {
++              freq = docsEnum.freq();
++              totalTermFreq += freq;
++            } else {
++              freq = -1;
++            }
++
++            postingsWriter.startDoc(docID, freq);
++            if (writePositions) {
++              for (int i=0;i<freq;i++) {
++                int pos = posEnum.nextPosition();
++                BytesRef payload = writePayloads ? posEnum.getPayload() : null;
++                int startOffset;
++                int endOffset;
++                if (writeOffsets) {
++                  startOffset = posEnum.startOffset();
++                  endOffset = posEnum.endOffset();
++                } else {
++                  startOffset = -1;
++                  endOffset = -1;
++                }
++                postingsWriter.addPosition(pos, payload, startOffset, endOffset);
++              }
++            }
++
++            postingsWriter.finishDoc();
++          }
++          termsConsumer.finishTerm(term, new TermStats(docFreq, totalTermFreq));
++          sumDocFreq += docFreq;
++          sumTotalTermFreq += totalTermFreq;
++        }
++
++        termsConsumer.finish(sumTotalTermFreq, sumDocFreq, docsSeen.cardinality());
++      }
+     }
+   }
+ 
+-  private static class RAMTermsConsumer extends TermsConsumer {
++  private static class RAMTermsConsumer {
+     private RAMField field;
+     private final RAMPostingsWriterImpl postingsWriter = new RAMPostingsWriterImpl();
+     RAMTerm current;
+@@ -244,15 +341,13 @@ public final class RAMOnlyPostingsFormat extends PostingsFormat {
+       this.field = field;
+     }
+       
+-    @Override
+-    public PostingsConsumer startTerm(BytesRef text) {
++    public RAMPostingsWriterImpl startTerm(BytesRef text) {
+       final String term = text.utf8ToString();
+       current = new RAMTerm(term);
+       postingsWriter.reset(current);
+       return postingsWriter;
+     }
+ 
+-    @Override
+     public void finishTerm(BytesRef text, TermStats stats) {
+       assert stats.docFreq > 0;
+       assert stats.docFreq == current.docs.size();
+@@ -260,7 +355,6 @@ public final class RAMOnlyPostingsFormat extends PostingsFormat {
+       field.termToDocs.put(current.term, current);
+     }
+ 
+-    @Override
+     public void finish(long sumTotalTermFreq, long sumDocFreq, int docCount) {
+       field.sumTotalTermFreq = sumTotalTermFreq;
+       field.sumDocFreq = sumDocFreq;
+@@ -268,7 +362,7 @@ public final class RAMOnlyPostingsFormat extends PostingsFormat {
+     }
+   }
+ 
+-  static class RAMPostingsWriterImpl extends PostingsConsumer {
++  static class RAMPostingsWriterImpl {
+     private RAMTerm term;
+     private RAMDoc current;
+     private int posUpto = 0;
+@@ -277,14 +371,12 @@ public final class RAMOnlyPostingsFormat extends PostingsFormat {
+       this.term = term;
+     }
+ 
+-    @Override
+     public void startDoc(int docID, int freq) {
+       current = new RAMDoc(docID, freq);
+       term.docs.add(current);
+       posUpto = 0;
+     }
+ 
+-    @Override
+     public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) {
+       assert startOffset == -1;
+       assert endOffset == -1;
+@@ -299,7 +391,6 @@ public final class RAMOnlyPostingsFormat extends PostingsFormat {
+       posUpto++;
+     }
+ 
+-    @Override
+     public void finishDoc() {
+       assert posUpto == current.positions.length;
+     }
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/index/BasePostingsFormatTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/index/BasePostingsFormatTestCase.java
+index ea4af50..88c668f 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/index/BasePostingsFormatTestCase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/index/BasePostingsFormatTestCase.java
+@@ -543,7 +543,7 @@ public abstract class BasePostingsFormatTestCase extends LuceneTestCase {
+   
+     @Override
+     public boolean hasPayloads() {
+-      return fieldInfo.hasPayloads();
++      return allowPayloads && fieldInfo.hasPayloads();
+     }
+   }
+ 
+@@ -633,15 +633,12 @@ public abstract class BasePostingsFormatTestCase extends LuceneTestCase {
+         throw new IllegalArgumentException("liveDocs must be null");
+       }
+       if (maxAllowed.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) < 0) {
+-        System.out.println("no: max");
+         return null;
+       }
+       if ((flags & DocsAndPositionsEnum.FLAG_OFFSETS) != 0 && maxAllowed.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) < 0) {
+-        System.out.println("no: offsets");
+         return null;
+       }
+       if ((flags & DocsAndPositionsEnum.FLAG_PAYLOADS) != 0 && allowPayloads == false) {
+-        System.out.println("no: payloads");
+         return null;
+       }
+       return getSeedPostings(current.getKey().utf8ToString(), current.getValue(), false, maxAllowed, allowPayloads);
+

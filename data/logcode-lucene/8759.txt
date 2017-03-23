@@ -1,0 +1,811 @@
+GitDiffStart: efeaac746ae10c63d71051ce2d8575cf85bb6616 | Fri May 3 11:13:19 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index c92f6d1..0084855 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -102,6 +102,10 @@ Optimizations
+ * LUCENE-4951: DrillSideways uses the new Scorer.cost() method to make
+   better decisions about which scorer to use internally.  (Mike McCandless)
+   
++* LUCENE-4976: PersistentSnapshotDeletionPolicy writes its state to a
++  single snapshots_N file, and no longer requires closing (Mike
++  McCandless, Shai Erera)
++
+ New Features
+ 
+ * LUCENE-4766: Added a PatternCaptureGroupTokenFilter that uses Java regexes to 
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java b/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java
+index 5c13a7e..9e8dc76 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java
+@@ -250,9 +250,7 @@ final class IndexFileDeleter implements Closeable {
+ 
+     // Finally, give policy a chance to remove things on
+     // startup:
+-    if (currentSegmentsFile != null) {
+-      policy.onInit(commits);
+-    }
++    policy.onInit(commits);
+ 
+     // Always protect the incoming segmentInfos since
+     // sometime it may not be the most recent commit
+diff --git a/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java b/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java
+index cbf3c7f..c9f31aa 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java
++++ b/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java
+@@ -17,15 +17,20 @@ package org.apache.lucene.index;
+  * the License.
+  */
+ 
+-import java.io.Closeable;
+ import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
+ import java.util.Map.Entry;
++import java.util.Map;
+ 
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.StoredField;
++import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.store.Directory;
+-import org.apache.lucene.util.Version;
++import org.apache.lucene.store.IOContext;
++import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.util.IOUtils;
+ 
+ /**
+  * A {@link SnapshotDeletionPolicy} which adds a persistence layer so that
+@@ -33,65 +38,50 @@ import org.apache.lucene.util.Version;
+  * are persisted in a {@link Directory} and are committed as soon as
+  * {@link #snapshot()} or {@link #release(IndexCommit)} is called.
+  * <p>
+- * <b>NOTE:</b> this class receives a {@link Directory} to persist the data into
+- * a Lucene index. It is highly recommended to use a dedicated directory (and on
+- * stable storage as well) for persisting the snapshots' information, and not
+- * reuse the content index directory, or otherwise conflicts and index
+- * corruption will occur.
+- * <p>
+- * <b>NOTE:</b> you should call {@link #close()} when you're done using this
+- * class for safety (it will close the {@link IndexWriter} instance used).
+- * <p>
+  * <b>NOTE:</b> Sharing {@link PersistentSnapshotDeletionPolicy}s that write to
+  * the same directory across {@link IndexWriter}s will corrupt snapshots. You
+  * should make sure every {@link IndexWriter} has its own
+  * {@link PersistentSnapshotDeletionPolicy} and that they all write to a
+- * different {@link Directory}.
++ * different {@link Directory}.  It is OK to use the same
++ * Directory that holds the index.
+  *
+  * <p> This class adds a {@link #release(long)} method to
+  * release commits from a previous snapshot's {@link IndexCommit#getGeneration}.
+  *
+  * @lucene.experimental
+  */
+-public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy implements Closeable {
++public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy {
+ 
+-  // Used to validate that the given directory includes just one document w/ the
+-  // given gen field. Otherwise, it's not a valid Directory for snapshotting.
+-  private static final String SNAPSHOTS_GENS = "$SNAPSHOTS_DOC$";
++  /** Prefix used for the save file. */
++  public static final String SNAPSHOTS_PREFIX = "snapshots_";
++  private static final int VERSION_START = 0;
++  private static final int VERSION_CURRENT = VERSION_START;
++  private static final String CODEC_NAME = "snapshots";
+ 
+   // The index writer which maintains the snapshots metadata
+-  private final IndexWriter writer;
++  private long nextWriteGen;
++
++  private final Directory dir;
+ 
+   /**
+-   * Reads the snapshots information from the given {@link Directory}. This
+-   * method can be used if the snapshots information is needed, however you
+-   * cannot instantiate the deletion policy (because e.g., some other process
+-   * keeps a lock on the snapshots directory).
++   * {@link PersistentSnapshotDeletionPolicy} wraps another
++   * {@link IndexDeletionPolicy} to enable flexible
++   * snapshotting, passing {@link OpenMode#CREATE_OR_APPEND}
++   * by default.
++   * 
++   * @param primary
++   *          the {@link IndexDeletionPolicy} that is used on non-snapshotted
++   *          commits. Snapshotted commits, by definition, are not deleted until
++   *          explicitly released via {@link #release}.
++   * @param dir
++   *          the {@link Directory} which will be used to persist the snapshots
++   *          information.
+    */
+-  private void loadPriorSnapshots(Directory dir) throws IOException {
+-    IndexReader r = DirectoryReader.open(dir);
+-    try {
+-      int numDocs = r.numDocs();
+-      // index is allowed to have exactly one document or 0.
+-      if (numDocs == 1) {
+-        StoredDocument doc = r.document(r.maxDoc() - 1);
+-        if (doc.getField(SNAPSHOTS_GENS) == null) {
+-          throw new IllegalStateException("directory is not a valid snapshots store!");
+-        }
+-        for (StorableField f : doc) {
+-          if (!f.name().equals(SNAPSHOTS_GENS)) {
+-            refCounts.put(Long.parseLong(f.name()), Integer.parseInt(f.stringValue()));
+-          }
+-        }
+-      } else if (numDocs != 0) {
+-        throw new IllegalStateException(
+-            "should be at most 1 document in the snapshots directory: " + numDocs);
+-      }
+-    } finally {
+-      r.close();
+-    }
++  public PersistentSnapshotDeletionPolicy(IndexDeletionPolicy primary,
++      Directory dir) throws IOException {
++    this(primary, dir, OpenMode.CREATE_OR_APPEND);
+   }
+-  
++
+   /**
+    * {@link PersistentSnapshotDeletionPolicy} wraps another
+    * {@link IndexDeletionPolicy} to enable flexible snapshotting.
+@@ -107,34 +97,21 @@ public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy imp
+    *          specifies whether a new index should be created, deleting all
+    *          existing snapshots information (immediately), or open an existing
+    *          index, initializing the class with the snapshots information.
+-   * @param matchVersion
+-   *          specifies the {@link Version} that should be used when opening the
+-   *          IndexWriter.
+    */
+   public PersistentSnapshotDeletionPolicy(IndexDeletionPolicy primary,
+-      Directory dir, OpenMode mode, Version matchVersion) throws IOException {
++      Directory dir, OpenMode mode) throws IOException {
+     super(primary);
+ 
+-    // Initialize the index writer over the snapshot directory.
+-    writer = new IndexWriter(dir, new IndexWriterConfig(matchVersion, null).setOpenMode(mode));
+-    if (mode != OpenMode.APPEND) {
+-      // IndexWriter no longer creates a first commit on an empty Directory. So
+-      // if we were asked to CREATE*, call commit() just to be sure. If the
+-      // index contains information and mode is CREATE_OR_APPEND, it's a no-op.
+-      writer.commit();
++    this.dir = dir;
++
++    if (mode == OpenMode.CREATE) {
++      clearPriorSnapshots();
+     }
+ 
+-    try {
+-      // Initializes the snapshots information. This code should basically run
+-      // only if mode != CREATE, but if it is, it's no harm as we only open the
+-      // reader once and immediately close it.
+-      loadPriorSnapshots(dir);
+-    } catch (RuntimeException e) {
+-      writer.close(); // don't leave any open file handles
+-      throw e;
+-    } catch (IOException e) {
+-      writer.close(); // don't leave any open file handles
+-      throw e;
++    loadPriorSnapshots();
++
++    if (mode == OpenMode.APPEND && nextWriteGen == 0) {
++      throw new IllegalStateException("no snapshots stored in this directory");
+     }
+   }
+ 
+@@ -147,7 +124,19 @@ public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy imp
+   @Override
+   public synchronized IndexCommit snapshot() throws IOException {
+     IndexCommit ic = super.snapshot();
+-    persist();
++    boolean success = false;
++    try {
++      persist();
++      success = true;
++    } finally {
++      if (!success) {
++        try {
++          super.release(ic);
++        } catch (Exception e) {
++          // Suppress so we keep throwing original exception
++        }
++      }
++    }
+     return ic;
+   }
+ 
+@@ -160,7 +149,19 @@ public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy imp
+   @Override
+   public synchronized void release(IndexCommit commit) throws IOException {
+     super.release(commit);
+-    persist();
++    boolean success = false;
++    try {
++      persist();
++      success = true;
++    } finally {
++      if (!success) {
++        try {
++          incRef(commit);
++        } catch (Exception e) {
++          // Suppress so we keep throwing original exception
++        }
++      }
++    }
+   }
+ 
+   /**
+@@ -175,23 +176,110 @@ public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy imp
+     persist();
+   }
+ 
+-  /** Closes the index which writes the snapshots to the directory. */
+-  public void close() throws IOException {
+-    writer.close();
++  synchronized private void persist() throws IOException {
++    String fileName = SNAPSHOTS_PREFIX + nextWriteGen;
++    IndexOutput out = dir.createOutput(fileName, IOContext.DEFAULT);
++    boolean success = false;
++    try {
++      CodecUtil.writeHeader(out, CODEC_NAME, VERSION_CURRENT);   
++      out.writeVInt(refCounts.size());
++      for(Entry<Long,Integer> ent : refCounts.entrySet()) {
++        out.writeVLong(ent.getKey());
++        out.writeVInt(ent.getValue());
++      }
++      success = true;
++    } finally {
++      if (!success) {
++        IOUtils.closeWhileHandlingException(out);
++        try {
++          dir.deleteFile(fileName);
++        } catch (Exception e) {
++          // Suppress so we keep throwing original exception
++        }
++      } else {
++        IOUtils.close(out);
++      }
++    }
++
++    nextWriteGen++;
++  }
++
++  private synchronized void clearPriorSnapshots() throws IOException {
++    for(String file : dir.listAll()) {
++      if (file.startsWith(SNAPSHOTS_PREFIX)) {
++        dir.deleteFile(file);
++      }
++    }
++  }
++
++  /** Returns the file name the snapshots are currently
++   *  saved to, or null if no snapshots have been saved. */
++  public String getLastSaveFile() {
++    if (nextWriteGen == 0) {
++      return null;
++    } else {
++      return SNAPSHOTS_PREFIX + (nextWriteGen-1);
++    }
+   }
+ 
+   /**
+-   * Persists all snapshots information.
++   * Reads the snapshots information from the given {@link Directory}. This
++   * method can be used if the snapshots information is needed, however you
++   * cannot instantiate the deletion policy (because e.g., some other process
++   * keeps a lock on the snapshots directory).
+    */
+-  private void persist() throws IOException {
+-    writer.deleteAll();
+-    Document d = new Document();
+-    d.add(new StoredField(SNAPSHOTS_GENS, ""));
+-    for (Entry<Long,Integer> e : refCounts.entrySet()) {
+-      d.add(new StoredField(e.getKey().toString(), e.getValue().toString()));
++  private synchronized void loadPriorSnapshots() throws IOException {
++    long genLoaded = -1;
++    IOException ioe = null;
++    List<String> snapshotFiles = new ArrayList<String>();
++    for(String file : dir.listAll()) {
++      if (file.startsWith(SNAPSHOTS_PREFIX)) {
++        long gen = Long.parseLong(file.substring(SNAPSHOTS_PREFIX.length()));
++        if (genLoaded == -1 || gen > genLoaded) {
++          snapshotFiles.add(file);
++          Map<Long,Integer> m = new HashMap<Long,Integer>();    
++          IndexInput in = dir.openInput(file, IOContext.DEFAULT);
++          try {
++            CodecUtil.checkHeader(in, CODEC_NAME, VERSION_START, VERSION_START);
++            int count = in.readVInt();
++            for(int i=0;i<count;i++) {
++              long commitGen = in.readVLong();
++              int refCount = in.readVInt();
++              m.put(commitGen, refCount);
++            }
++          } catch (IOException ioe2) {
++            // Save first exception & throw in the end
++            if (ioe == null) {
++              ioe = ioe2;
++            }
++          } finally {
++            in.close();
++          }
++
++          genLoaded = gen;
++          refCounts.clear();
++          refCounts.putAll(m);
++        }
++      }
+     }
+-    writer.addDocument(d);
+-    writer.commit();
+-  }
+ 
++    if (genLoaded == -1) {
++      // Nothing was loaded...
++      if (ioe != null) {
++        // ... not for lack of trying:
++        throw ioe;
++      }
++    } else { 
++      if (snapshotFiles.size() > 1) {
++        // Remove any broken / old snapshot files:
++        String curFileName = SNAPSHOTS_PREFIX + genLoaded;
++        for(String file : snapshotFiles) {
++          if (!curFileName.equals(file)) {
++            dir.deleteFile(file);
++          }
++        }
++      }
++      nextWriteGen = 1+genLoaded;
++    }
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SnapshotDeletionPolicy.java b/lucene/core/src/java/org/apache/lucene/index/SnapshotDeletionPolicy.java
+index 7eeac10..6cc7b8c 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SnapshotDeletionPolicy.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SnapshotDeletionPolicy.java
+@@ -58,6 +58,9 @@ public class SnapshotDeletionPolicy extends IndexDeletionPolicy {
+   /** Most recently committed {@link IndexCommit}. */
+   protected IndexCommit lastCommit;
+ 
++  /** Used to detect misuse */
++  private boolean initCalled;
++
+   /** Sole constructor, taking the incoming {@link
+    *  IndexDeletionPolicy} to wrap. */
+   public SnapshotDeletionPolicy(IndexDeletionPolicy primary) {
+@@ -74,13 +77,16 @@ public class SnapshotDeletionPolicy extends IndexDeletionPolicy {
+   @Override
+   public synchronized void onInit(List<? extends IndexCommit> commits)
+       throws IOException {
++    initCalled = true;
+     primary.onInit(wrapCommits(commits));
+     for(IndexCommit commit : commits) {
+       if (refCounts.containsKey(commit.getGeneration())) {
+         indexCommits.put(commit.getGeneration(), commit);
+       }
+     }
+-    lastCommit = commits.get(commits.size() - 1);
++    if (!commits.isEmpty()) {
++      lastCommit = commits.get(commits.size() - 1);
++    }
+   }
+ 
+   /**
+@@ -96,6 +102,9 @@ public class SnapshotDeletionPolicy extends IndexDeletionPolicy {
+ 
+   /** Release a snapshot by generation. */
+   protected void releaseGen(long gen) throws IOException {
++    if (!initCalled) {
++      throw new IllegalStateException("this instance is not being used by IndexWriter; be sure to use the instance returned from writer.getConfig().getIndexDeletionPolicy()");
++    }
+     Integer refCount = refCounts.get(gen);
+     if (refCount == null) {
+       throw new IllegalArgumentException("commit gen=" + gen + " is not currently snapshotted");
+@@ -111,6 +120,20 @@ public class SnapshotDeletionPolicy extends IndexDeletionPolicy {
+     }
+   }
+ 
++  /** Increments the refCount for this {@link IndexCommit}. */
++  protected synchronized void incRef(IndexCommit ic) {
++    long gen = ic.getGeneration();
++    Integer refCount = refCounts.get(gen);
++    int refCountInt;
++    if (refCount == null) {
++      indexCommits.put(gen, lastCommit);
++      refCountInt = 0;
++    } else {
++      refCountInt = refCount.intValue();
++    }
++    refCounts.put(gen, refCountInt+1);
++  }
++
+   /**
+    * Snapshots the last commit and returns it. Once a commit is 'snapshotted,' it is protected
+    * from deletion (as long as this {@link IndexDeletionPolicy} is used). The
+@@ -129,27 +152,24 @@ public class SnapshotDeletionPolicy extends IndexDeletionPolicy {
+    * @return the {@link IndexCommit} that was snapshotted.
+    */
+   public synchronized IndexCommit snapshot() throws IOException {
++    if (!initCalled) {
++      throw new IllegalStateException("this instance is not being used by IndexWriter; be sure to use the instance returned from writer.getConfig().getIndexDeletionPolicy()");
++    }
+     if (lastCommit == null) {
+       // No commit yet, eg this is a new IndexWriter:
+       throw new IllegalStateException("No index commit to snapshot");
+     }
+ 
+-    long gen = lastCommit.getGeneration();
+-
+-    Integer refCount = refCounts.get(gen);
+-    int refCountInt;
+-    if (refCount == null) {
+-      indexCommits.put(gen, lastCommit);
+-      refCountInt = 0;
+-    } else {
+-      refCountInt = refCount.intValue();
+-    }
+-
+-    refCounts.put(gen, refCountInt+1);
++    incRef(lastCommit);
+ 
+     return lastCommit;
+   }
+ 
++  /** Returns all IndexCommits held by at least one snapshot. */
++  public synchronized List<IndexCommit> getSnapshots() {
++    return new ArrayList<IndexCommit>(indexCommits.values());
++  }
++
+   /** Returns the total number of snapshots currently held. */
+   public synchronized int getSnapshotCount() {
+     int total = 0;
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java b/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java
+index 89c2c2d..7644583 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java
+@@ -45,7 +45,10 @@ import org.apache.lucene.util._TestUtil;
+ public class TestDeletionPolicy extends LuceneTestCase {
+   
+   private void verifyCommitOrder(List<? extends IndexCommit> commits) {
+-    final IndexCommit firstCommit =  commits.get(0);
++    if (commits.isEmpty()) {
++      return;
++    }
++    final IndexCommit firstCommit = commits.get(0);
+     long last = SegmentInfos.generationFromSegmentsFileName(firstCommit.getSegmentsFileName());
+     assertEquals(last, firstCommit.getGeneration());
+     for(int i=1;i<commits.size();i++) {
+@@ -184,6 +187,9 @@ public class TestDeletionPolicy extends LuceneTestCase {
+ 
+     @Override
+     public void onInit(List<? extends IndexCommit> commits) throws IOException {
++      if (commits.isEmpty()) {
++        return;
++      }
+       verifyCommitOrder(commits);
+       onCommit(commits);
+     }
+@@ -353,7 +359,7 @@ public class TestDeletionPolicy extends LuceneTestCase {
+         writer.close();
+       }
+ 
+-      assertEquals(needsMerging ? 1:0, policy.numOnInit);
++      assertEquals(needsMerging ? 2:1, policy.numOnInit);
+ 
+       // If we are not auto committing then there should
+       // be exactly 2 commits (one per close above):
+@@ -541,7 +547,7 @@ public class TestDeletionPolicy extends LuceneTestCase {
+       writer.forceMerge(1);
+       writer.close();
+ 
+-      assertEquals(1, policy.numOnInit);
++      assertEquals(2, policy.numOnInit);
+       // If we are not auto committing then there should
+       // be exactly 2 commits (one per close above):
+       assertEquals(2, policy.numOnCommit);
+@@ -588,7 +594,7 @@ public class TestDeletionPolicy extends LuceneTestCase {
+       }
+ 
+       assertTrue(policy.numDelete > 0);
+-      assertEquals(N, policy.numOnInit);
++      assertEquals(N+1, policy.numOnInit);
+       assertEquals(N+1, policy.numOnCommit);
+ 
+       // Simplistic check: just verify only the past N segments_N's still
+@@ -685,7 +691,7 @@ public class TestDeletionPolicy extends LuceneTestCase {
+         writer.close();
+       }
+ 
+-      assertEquals(3*(N+1), policy.numOnInit);
++      assertEquals(3*(N+1)+1, policy.numOnInit);
+       assertEquals(3*(N+1)+1, policy.numOnCommit);
+ 
+       IndexReader rwReader = DirectoryReader.open(dir);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java b/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java
+index 3cdac3c..52441f7 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java
+@@ -22,168 +22,147 @@ import java.io.IOException;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.store.Directory;
+-import org.apache.lucene.store.LockObtainFailedException;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+ public class TestPersistentSnapshotDeletionPolicy extends TestSnapshotDeletionPolicy {
+ 
+-  // Keep it a class member so that getDeletionPolicy can use it
+-  private Directory snapshotDir;
+-  
+-  // so we can close it if called by SDP tests
+-  private PersistentSnapshotDeletionPolicy psdp;
+-  
+   @Before
+   @Override
+   public void setUp() throws Exception {
+     super.setUp();
+-    snapshotDir = newDirectory();
+   }
+   
+   @After
+   @Override
+   public void tearDown() throws Exception {
+-    if (psdp != null) psdp.close();
+-    snapshotDir.close();
+     super.tearDown();
+   }
+   
+-  @Override
+-  protected SnapshotDeletionPolicy getDeletionPolicy() throws IOException {
+-    if (psdp != null) psdp.close();
+-    snapshotDir.close();
+-    snapshotDir = newDirectory();
+-    return psdp = new PersistentSnapshotDeletionPolicy(
+-        new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.CREATE,
+-        TEST_VERSION_CURRENT);
++  private SnapshotDeletionPolicy getDeletionPolicy(Directory dir) throws IOException {
++    return new PersistentSnapshotDeletionPolicy(
++        new KeepOnlyLastCommitDeletionPolicy(), dir, OpenMode.CREATE);
+   }
+ 
+   @Test
+   public void testExistingSnapshots() throws Exception {
+     int numSnapshots = 3;
+     Directory dir = newDirectory();
+-    IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
++    IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy(dir)));
+     PersistentSnapshotDeletionPolicy psdp = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
++    assertNull(psdp.getLastSaveFile());
+     prepareIndexAndSnapshots(psdp, writer, numSnapshots);
++    assertNotNull(psdp.getLastSaveFile());
+     writer.close();
+-    psdp.close();
+ 
+     // Re-initialize and verify snapshots were persisted
+     psdp = new PersistentSnapshotDeletionPolicy(
+-        new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.APPEND,
+-        TEST_VERSION_CURRENT);
++        new KeepOnlyLastCommitDeletionPolicy(), dir, OpenMode.APPEND);
+ 
+-    IndexWriter iw = new IndexWriter(dir, getConfig(random(), psdp));
+-    psdp = (PersistentSnapshotDeletionPolicy) iw.getConfig().getIndexDeletionPolicy();
+-    iw.close();
++    writer = new IndexWriter(dir, getConfig(random(), psdp));
++    psdp = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+ 
++    assertEquals(numSnapshots, psdp.getSnapshots().size());
++    assertEquals(numSnapshots, psdp.getSnapshotCount());
+     assertSnapshotExists(dir, psdp, numSnapshots, false);
+-    psdp.close();
+-    dir.close();
+-  }
+ 
+-  @Test
+-  public void testInvalidSnapshotInfos() throws Exception {
+-    // Add the correct number of documents (1), but without snapshot information
+-    IndexWriter writer = new IndexWriter(snapshotDir, getConfig(random(), null));
+     writer.addDocument(new Document());
++    writer.commit();
++    snapshots.add(psdp.snapshot());
++    assertEquals(numSnapshots+1, psdp.getSnapshots().size());
++    assertEquals(numSnapshots+1, psdp.getSnapshotCount());
++    assertSnapshotExists(dir, psdp, numSnapshots+1, false);
++
+     writer.close();
+-    try {
+-      new PersistentSnapshotDeletionPolicy(
+-          new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.APPEND,
+-          TEST_VERSION_CURRENT);
+-      fail("should not have succeeded to read from an invalid Directory");
+-    } catch (IllegalStateException e) {
+-      // expected
+-    }
++    dir.close();
+   }
+ 
+   @Test
+   public void testNoSnapshotInfos() throws Exception {
+-    // Initialize an empty index in snapshotDir - PSDP should initialize successfully.
+-    new IndexWriter(snapshotDir, getConfig(random(), null)).close();
++    Directory dir = newDirectory();
+     new PersistentSnapshotDeletionPolicy(
+-        new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.APPEND,
+-        TEST_VERSION_CURRENT).close();
++        new KeepOnlyLastCommitDeletionPolicy(), dir, OpenMode.CREATE);
++    dir.close();
+   }
+ 
+-  @Test(expected=IllegalStateException.class)
+-  public void testTooManySnapshotInfos() throws Exception {
+-    // Write two documents to the snapshots directory - illegal.
+-    IndexWriter writer = new IndexWriter(snapshotDir, getConfig(random(), null));
+-    writer.addDocument(new Document());
++  @Test
++  public void testMissingSnapshots() throws Exception {
++    Directory dir = newDirectory();
++    try {
++      new PersistentSnapshotDeletionPolicy(
++                                           new KeepOnlyLastCommitDeletionPolicy(), dir, OpenMode.APPEND);
++      fail("did not hit expected exception");
++    } catch (IllegalStateException ise) {
++      // expected
++    }
++    dir.close();
++  }
++
++  public void testExceptionDuringSave() throws Exception {
++    MockDirectoryWrapper dir = newMockDirectory();
++    dir.failOn(new MockDirectoryWrapper.Failure() {
++      @Override
++      public void eval(MockDirectoryWrapper dir) throws IOException {
++        StackTraceElement[] trace = Thread.currentThread().getStackTrace();
++        for (int i = 0; i < trace.length; i++) {
++          if (PersistentSnapshotDeletionPolicy.class.getName().equals(trace[i].getClassName()) && "persist".equals(trace[i].getMethodName())) {
++            throw new IOException("now fail on purpose");
++          }
++        }
++      }
++      });
++    IndexWriter writer = new IndexWriter(dir, getConfig(random(), new PersistentSnapshotDeletionPolicy(
++                                         new KeepOnlyLastCommitDeletionPolicy(), dir, OpenMode.CREATE_OR_APPEND)));
+     writer.addDocument(new Document());
++    writer.commit();
++
++    PersistentSnapshotDeletionPolicy psdp = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
++    try {
++      psdp.snapshot();
++    } catch (IOException ioe) {
++      if (ioe.getMessage().equals("now fail on purpose")) {
++        // ok
++      } else {
++        throw ioe;
++      }
++    }
++    assertEquals(0, psdp.getSnapshotCount());
+     writer.close();
+-    
+-    new PersistentSnapshotDeletionPolicy(
+-        new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.APPEND,
+-        TEST_VERSION_CURRENT).close();
+-    fail("should not have succeeded to open an invalid directory");
++    assertEquals(1, DirectoryReader.listCommits(dir).size());
++    dir.close();
+   }
+ 
+   @Test
+   public void testSnapshotRelease() throws Exception {
+     Directory dir = newDirectory();
+-    IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
++    IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy(dir)));
+     PersistentSnapshotDeletionPolicy psdp = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     prepareIndexAndSnapshots(psdp, writer, 1);
+     writer.close();
+ 
+     psdp.release(snapshots.get(0));
+-    psdp.close();
+ 
+     psdp = new PersistentSnapshotDeletionPolicy(
+-        new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.APPEND,
+-        TEST_VERSION_CURRENT);
++        new KeepOnlyLastCommitDeletionPolicy(), dir, OpenMode.APPEND);
+     assertEquals("Should have no snapshots !", 0, psdp.getSnapshotCount());
+-    psdp.close();
+     dir.close();
+   }
+ 
+   @Test
+   public void testSnapshotReleaseByGeneration() throws Exception {
+     Directory dir = newDirectory();
+-    IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
++    IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy(dir)));
+     PersistentSnapshotDeletionPolicy psdp = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     prepareIndexAndSnapshots(psdp, writer, 1);
+     writer.close();
+ 
+     psdp.release(snapshots.get(0).getGeneration());
+-    psdp.close();
+ 
+     psdp = new PersistentSnapshotDeletionPolicy(
+-        new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.APPEND,
+-        TEST_VERSION_CURRENT);
++        new KeepOnlyLastCommitDeletionPolicy(), dir, OpenMode.APPEND);
+     assertEquals("Should have no snapshots !", 0, psdp.getSnapshotCount());
+-    psdp.close();
+     dir.close();
+   }
+-
+-  @Test
+-  public void testStaticRead() throws Exception {
+-    // While PSDP is open, it keeps a lock on the snapshots directory and thus
+-    // prevents reading the snapshots information. This test checks that the 
+-    // static read method works.
+-    int numSnapshots = 1;
+-    Directory dir = newDirectory();
+-    IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
+-    PersistentSnapshotDeletionPolicy psdp = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+-    prepareIndexAndSnapshots(psdp, writer, numSnapshots);
+-    writer.close();
+-    dir.close();
+-    
+-    try {
+-      // This should fail, since the snapshots directory is locked - we didn't close it !
+-      new PersistentSnapshotDeletionPolicy(
+-          new KeepOnlyLastCommitDeletionPolicy(), snapshotDir, OpenMode.APPEND,
+-          TEST_VERSION_CURRENT);
+-      fail("should not have reached here - the snapshots directory should be locked!");
+-    } catch (LockObtainFailedException e) {
+-      // expected
+-    } finally {
+-      psdp.close();
+-    }
+-  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java b/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java
+index 5792cd9..2d8ae61 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java
+@@ -104,10 +104,19 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+     // Run for ~1 seconds
+     final long stopTime = System.currentTimeMillis() + 1000;
+ 
++    SnapshotDeletionPolicy dp = getDeletionPolicy();
+     final IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+-        TEST_VERSION_CURRENT, new MockAnalyzer(random)).setIndexDeletionPolicy(getDeletionPolicy())
++        TEST_VERSION_CURRENT, new MockAnalyzer(random)).setIndexDeletionPolicy(dp)
+         .setMaxBufferedDocs(2));
+-    SnapshotDeletionPolicy dp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
++
++    // Verify we catch misuse:
++    try {
++      dp.snapshot();
++      fail("did not hit exception");
++    } catch(IllegalStateException ise) {
++      // expected
++    }
++    dp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     writer.commit();
+     
+     final Thread t = new Thread() {
+@@ -247,6 +256,8 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+     prepareIndexAndSnapshots(sdp, writer, numSnapshots);
+     writer.close();
+     
++    assertEquals(numSnapshots, sdp.getSnapshots().size());
++    assertEquals(numSnapshots, sdp.getSnapshotCount());
+     assertSnapshotExists(dir, sdp, numSnapshots, true);
+ 
+     // open a reader on a snapshot - should succeed.
+@@ -322,6 +333,7 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+     // this does the actual rollback
+     writer.commit();
+     writer.deleteUnusedFiles();
++    //sdp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     assertSnapshotExists(dir, sdp, numSnapshots - 1, true);
+     writer.close();
+ 
+

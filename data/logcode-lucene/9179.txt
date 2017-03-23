@@ -1,0 +1,1187 @@
+GitDiffStart: 8f2294f644e73a80c835fa8f6c955af9500efd2b | Fri Mar 15 20:12:19 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 6bce46e..8fbb26b 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -79,6 +79,14 @@ New Features
+ * LUCENE-4607: Add DocIDSetIterator.cost() and Spans.cost() for optimizing
+   scoring.  (Simon Willnauer, Robert Muir)
+ 
++* LUCENE-4795: Add SortedSetDocValuesFacetField and
++  SortedSetDocValuesAccumulator, to compute topK facet counts from a
++  field's SortedSetDocValues.  This method only supports flat
++  (dim/label) facets, is a bit (~25%) slower, has added cost
++  per-IndexReader-open to compute its ordinal map, but it requires no
++  taxonomy index and it tie-breaks facet labels in an understandable
++  (by Unicode sort order) way.  (Robert Muir, Mike McCandless)
++
+ Optimizations
+ 
+ * LUCENE-4819: Added Sorted[Set]DocValues.termsEnum(), and optimized the
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/search/DrillSideways.java b/lucene/facet/src/java/org/apache/lucene/facet/search/DrillSideways.java
+index f028ecd..a66d812 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/search/DrillSideways.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/search/DrillSideways.java
+@@ -204,7 +204,7 @@ public class DrillSideways {
+                                                                       doDocScores,
+                                                                       doMaxScore,
+                                                                       true);
+-      DrillSidewaysResult r = new DrillSideways(searcher, taxoReader).search(query, hitCollector, fsp);
++      DrillSidewaysResult r = search(query, hitCollector, fsp);
+       r.hits = hitCollector.topDocs();
+       return r;
+     } else {
+@@ -219,20 +219,20 @@ public class DrillSideways {
+   public DrillSidewaysResult search(ScoreDoc after,
+                                     DrillDownQuery query, int topN, FacetSearchParams fsp) throws IOException {
+     TopScoreDocCollector hitCollector = TopScoreDocCollector.create(Math.min(topN, searcher.getIndexReader().maxDoc()), after, true);
+-    DrillSidewaysResult r = new DrillSideways(searcher, taxoReader).search(query, hitCollector, fsp);
++    DrillSidewaysResult r = search(query, hitCollector, fsp);
+     r.hits = hitCollector.topDocs();
+     return r;
+   }
+ 
+   /** Override this to use a custom drill-down {@link
+    *  FacetsAccumulator}. */
+-  protected FacetsAccumulator getDrillDownAccumulator(FacetSearchParams fsp) {
++  protected FacetsAccumulator getDrillDownAccumulator(FacetSearchParams fsp) throws IOException {
+     return FacetsAccumulator.create(fsp, searcher.getIndexReader(), taxoReader);
+   }
+ 
+   /** Override this to use a custom drill-sideways {@link
+    *  FacetsAccumulator}. */
+-  protected FacetsAccumulator getDrillSidewaysAccumulator(String dim, FacetSearchParams fsp) {
++  protected FacetsAccumulator getDrillSidewaysAccumulator(String dim, FacetSearchParams fsp) throws IOException {
+     return FacetsAccumulator.create(fsp, searcher.getIndexReader(), taxoReader);
+   }
+ 
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesAccumulator.java b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesAccumulator.java
+new file mode 100644
+index 0000000..b82de69
+--- /dev/null
++++ b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesAccumulator.java
+@@ -0,0 +1,303 @@
++package org.apache.lucene.facet.sortedset;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.List;
++
++import org.apache.lucene.facet.params.CategoryListParams;
++import org.apache.lucene.facet.params.FacetSearchParams;
++import org.apache.lucene.facet.search.CountFacetRequest;
++import org.apache.lucene.facet.search.FacetArrays;
++import org.apache.lucene.facet.search.FacetRequest;
++import org.apache.lucene.facet.search.FacetResult;
++import org.apache.lucene.facet.search.FacetResultNode;
++import org.apache.lucene.facet.search.FacetsAccumulator;
++import org.apache.lucene.facet.search.FacetsAggregator;
++import org.apache.lucene.facet.search.FacetsCollector.MatchingDocs;
++import org.apache.lucene.facet.taxonomy.CategoryPath;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.MultiDocValues.MultiSortedSetDocValues;
++import org.apache.lucene.index.MultiDocValues;
++import org.apache.lucene.index.SortedSetDocValues;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.PriorityQueue;
++
++/** A {@link FacetsAccumulator} that uses previously
++ *  indexed {@link SortedSetDocValuesFacetField} to perform faceting,
++ *  without require a separate taxonomy index.  Faceting is
++ *  a bit slower (~25%), and there is added cost on every
++ *  {@link IndexReader} open to create a new {@link
++ *  SortedSetDocValuesReaderState}.  Furthermore, this does
++ *  not support hierarchical facets; only flat (dimension +
++ *  label) facets, but it uses quite a bit less RAM to do so. */
++public class SortedSetDocValuesAccumulator extends FacetsAccumulator {
++
++  final SortedSetDocValuesReaderState state;
++  final SortedSetDocValues dv;
++  final String field;
++
++  public SortedSetDocValuesAccumulator(FacetSearchParams fsp, SortedSetDocValuesReaderState state) throws IOException {
++    super(fsp, null, null, new FacetArrays((int) state.getDocValues().getValueCount()));
++    this.state = state;
++    this.field = state.getField();
++    dv = state.getDocValues();
++
++    // Check params:
++    for(FacetRequest request : fsp.facetRequests) {
++      if (!(request instanceof CountFacetRequest)) {
++        throw new IllegalArgumentException("this collector only supports CountFacetRequest; got " + request);
++      }
++      if (request.categoryPath.length != 1) {
++        throw new IllegalArgumentException("this collector only supports depth 1 CategoryPath; got " + request.categoryPath);
++      }
++      if (request.getDepth() != 1) {
++        throw new IllegalArgumentException("this collector only supports depth=1; got " + request.getDepth());
++      }
++      String dim = request.categoryPath.components[0];
++
++      SortedSetDocValuesReaderState.OrdRange ordRange = state.getOrdRange(dim);
++      if (ordRange == null) {
++        throw new IllegalArgumentException("dim \"" + dim + "\" does not exist");
++      }
++    }
++  }
++
++  @Override
++  public FacetsAggregator getAggregator() {
++
++    return new FacetsAggregator() {
++
++      @Override
++      public void aggregate(MatchingDocs matchingDocs, CategoryListParams clp, FacetArrays facetArrays) throws IOException {
++
++        SortedSetDocValues segValues = matchingDocs.context.reader().getSortedSetDocValues(field);
++        if (segValues == null) {
++          return;
++        }
++
++        final int[] counts = facetArrays.getIntArray();
++        final int maxDoc = matchingDocs.context.reader().maxDoc();
++        assert maxDoc == matchingDocs.bits.length();
++
++        if (dv instanceof MultiSortedSetDocValues) {
++          MultiDocValues.OrdinalMap ordinalMap = ((MultiSortedSetDocValues) dv).mapping;
++          int segOrd = matchingDocs.context.ord;
++
++          int numSegOrds = (int) segValues.getValueCount();
++
++          if (matchingDocs.totalHits < numSegOrds/10) {
++            // Remap every ord to global ord as we iterate:
++            final int[] segCounts = new int[numSegOrds];
++            int doc = 0;
++            while (doc < maxDoc && (doc = matchingDocs.bits.nextSetBit(doc)) != -1) {
++              segValues.setDocument(doc);
++              int term = (int) segValues.nextOrd();
++              while (term != SortedSetDocValues.NO_MORE_ORDS) {
++                counts[(int) ordinalMap.getGlobalOrd(segOrd, term)]++;
++                term = (int) segValues.nextOrd();
++              }
++              ++doc;
++            }
++          } else {
++
++            // First count in seg-ord space:
++            final int[] segCounts = new int[numSegOrds];
++            int doc = 0;
++            while (doc < maxDoc && (doc = matchingDocs.bits.nextSetBit(doc)) != -1) {
++              segValues.setDocument(doc);
++              int term = (int) segValues.nextOrd();
++              while (term != SortedSetDocValues.NO_MORE_ORDS) {
++                segCounts[term]++;
++                term = (int) segValues.nextOrd();
++              }
++              ++doc;
++            }
++
++            // Then, migrate to global ords:
++            for(int ord=0;ord<numSegOrds;ord++) {
++              int count = segCounts[ord];
++              if (count != 0) {
++                counts[(int) ordinalMap.getGlobalOrd(segOrd, ord)] += count;
++              }
++            }
++          }
++        } else {
++          // No ord mapping (e.g., single segment index):
++          // just aggregate directly into counts:
++
++          int doc = 0;
++          while (doc < maxDoc && (doc = matchingDocs.bits.nextSetBit(doc)) != -1) {
++            segValues.setDocument(doc);
++            int term = (int) segValues.nextOrd();
++            while (term != SortedSetDocValues.NO_MORE_ORDS) {
++              counts[term]++;
++              term = (int) segValues.nextOrd();
++            }
++            ++doc;
++          }
++        }
++      }
++
++      @Override
++      public void rollupValues(FacetRequest fr, int ordinal, int[] children, int[] siblings, FacetArrays facetArrays) {
++        // Nothing to do here: we only support flat (dim +
++        // label) facets, and in accumulate we sum up the
++        // count for the dimension.
++      }
++
++      @Override
++      public boolean requiresDocScores() {
++        return false;
++      }
++    };
++  }
++
++  /** Keeps highest count results. */
++  static class TopCountPQ extends PriorityQueue<FacetResultNode> {
++    public TopCountPQ(int topN) {
++      super(topN, false);
++    }
++
++    @Override
++    protected boolean lessThan(FacetResultNode a, FacetResultNode b) {
++      if (a.value < b.value) {
++        return true;
++      } else if (a.value > b.value) {
++        return false;
++      } else {
++        return a.ordinal > b.ordinal;
++      }
++    }
++  }
++
++  @Override
++  public List<FacetResult> accumulate(List<MatchingDocs> matchingDocs) throws IOException {
++
++    FacetsAggregator aggregator = getAggregator();
++    for (CategoryListParams clp : getCategoryLists()) {
++      for (MatchingDocs md : matchingDocs) {
++        aggregator.aggregate(md, clp, facetArrays);
++      }
++    }
++
++    // compute top-K
++    List<FacetResult> results = new ArrayList<FacetResult>();
++
++    int[] counts = facetArrays.getIntArray();
++
++    BytesRef scratch = new BytesRef();
++
++    for(FacetRequest request : searchParams.facetRequests) {
++      String dim = request.categoryPath.components[0];
++      SortedSetDocValuesReaderState.OrdRange ordRange = state.getOrdRange(dim);
++      // checked in ctor:
++      assert ordRange != null;
++
++      if (request.numResults >= ordRange.end - ordRange.start + 1) {
++        // specialize this case, user is interested in all available results
++        ArrayList<FacetResultNode> nodes = new ArrayList<FacetResultNode>();
++        int dimCount = 0;
++        for(int ord=ordRange.start; ord<=ordRange.end; ord++) {
++          //System.out.println("  ord=" + ord + " count= "+ counts[ord] + " bottomCount=" + bottomCount);
++          if (counts[ord] != 0) {
++            dimCount += counts[ord];
++            FacetResultNode node = new FacetResultNode(ord, counts[ord]);
++            dv.lookupOrd(ord, scratch);
++            node.label = new CategoryPath(scratch.utf8ToString().split(state.separatorRegex, 2));
++            nodes.add(node);
++          }
++        }
++
++        Collections.sort(nodes, new Comparator<FacetResultNode>() {
++            @Override
++            public int compare(FacetResultNode o1, FacetResultNode o2) {
++              // First by highest count
++              int value = (int) (o2.value - o1.value);
++              if (value == 0) {
++                // ... then by lowest ord:
++                value = o1.ordinal - o2.ordinal;
++              }
++              return value;
++            }
++          });
++      
++        CategoryListParams.OrdinalPolicy op = searchParams.indexingParams.getCategoryListParams(request.categoryPath).getOrdinalPolicy(dim);
++        if (op == CategoryListParams.OrdinalPolicy.ALL_BUT_DIMENSION) {
++          dimCount = 0;
++        }
++
++        FacetResultNode rootNode = new FacetResultNode(-1, dimCount);
++        rootNode.label = new CategoryPath(new String[] {dim});
++        rootNode.subResults = nodes;
++        results.add(new FacetResult(request, rootNode, nodes.size()));
++        continue;
++      }
++
++      TopCountPQ q = new TopCountPQ(request.numResults);
++
++      int bottomCount = 0;
++
++      //System.out.println("collect");
++      int dimCount = 0;
++      FacetResultNode reuse = null;
++      for(int ord=ordRange.start; ord<=ordRange.end; ord++) {
++        //System.out.println("  ord=" + ord + " count= "+ counts[ord] + " bottomCount=" + bottomCount);
++        if (counts[ord] > bottomCount) {
++          dimCount += counts[ord];
++          //System.out.println("    keep");
++          if (reuse == null) {
++            reuse = new FacetResultNode(ord, counts[ord]);
++          } else {
++            reuse.ordinal = ord;
++            reuse.value = counts[ord];
++          }
++          reuse = q.insertWithOverflow(reuse);
++          if (q.size() == request.numResults) {
++            bottomCount = (int) q.top().value;
++            //System.out.println("    new bottom=" + bottomCount);
++          }
++        }
++      }
++
++      CategoryListParams.OrdinalPolicy op = searchParams.indexingParams.getCategoryListParams(request.categoryPath).getOrdinalPolicy(dim);
++      if (op == CategoryListParams.OrdinalPolicy.ALL_BUT_DIMENSION) {
++        dimCount = 0;
++      }
++
++      FacetResultNode rootNode = new FacetResultNode(-1, dimCount);
++      rootNode.label = new CategoryPath(new String[] {dim});
++
++      FacetResultNode[] childNodes = new FacetResultNode[q.size()];
++      for(int i=childNodes.length-1;i>=0;i--) {
++        childNodes[i] = q.pop();
++        dv.lookupOrd(childNodes[i].ordinal, scratch);
++        childNodes[i].label = new CategoryPath(scratch.utf8ToString().split(state.separatorRegex, 2));
++      }
++      rootNode.subResults = Arrays.asList(childNodes);
++      
++      results.add(new FacetResult(request, rootNode, childNodes.length));
++    }
++
++    return results;
++  }
++}
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesFacetField.java b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesFacetField.java
+new file mode 100644
+index 0000000..30bfa6b
+--- /dev/null
++++ b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesFacetField.java
+@@ -0,0 +1,67 @@
++package org.apache.lucene.facet.sortedset;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.document.SortedSetDocValuesField;
++import org.apache.lucene.facet.params.FacetIndexingParams;
++import org.apache.lucene.facet.taxonomy.CategoryPath;
++import org.apache.lucene.util.BytesRef;
++
++/** Add instances of this to your Document if you intend to
++ *  use {@link SortedSetDocValuesAccumulator} to count facets
++ *  at search time.  Note that this only supports flat
++ *  facets (dimension + label).  Add multiple instances of
++ *  this to your document, one per dimension + label, and
++ *  it's fine if a given dimension is multi-valued. */
++
++public class SortedSetDocValuesFacetField extends SortedSetDocValuesField {
++
++  /** Create a {@code SortedSetDocValuesFacetField} with the
++   *  provided {@link CategoryPath}. */
++  public SortedSetDocValuesFacetField(CategoryPath cp)  {
++    this(FacetIndexingParams.DEFAULT, cp);
++  }
++
++  /** Create a {@code SortedSetDocValuesFacetField} with the
++   *  provided {@link CategoryPath}, and custom {@link
++   *  FacetIndexingParams}. */
++  public SortedSetDocValuesFacetField(FacetIndexingParams fip, CategoryPath cp)  {
++    super(fip.getCategoryListParams(cp).field + SortedSetDocValuesReaderState.FACET_FIELD_EXTENSION, toBytesRef(fip, cp));
++  }
++
++  private static BytesRef toBytesRef(FacetIndexingParams fip, CategoryPath cp) {
++    if (fip.getPartitionSize() != Integer.MAX_VALUE) {
++      throw new IllegalArgumentException("partitions are not supported");
++    }
++    if (cp.length != 2) {
++      throw new IllegalArgumentException("only flat facets (dimension + label) are currently supported");
++    }
++    String dimension = cp.components[0];
++    char delim = fip.getFacetDelimChar();
++    if (dimension.indexOf(delim) != -1) {
++      throw new IllegalArgumentException("facet dimension cannot contain FacetIndexingParams.getFacetDelimChar()=" + delim + " (U+" + Integer.toHexString(delim) + "); got dimension=\"" + dimension + "\"");
++    }
++
++    // We can't use cp.toString(delim) because that fails if
++    // cp.components[1] has the delim char, when in fact
++    // that is allowed here (but not when using taxonomy
++    // index):
++    return new BytesRef(dimension + delim + cp.components[1]);
++  }
++}
++
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesReaderState.java b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesReaderState.java
+new file mode 100644
+index 0000000..819c384
+--- /dev/null
++++ b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/SortedSetDocValuesReaderState.java
+@@ -0,0 +1,157 @@
++package org.apache.lucene.facet.sortedset;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.regex.Pattern;
++
++import org.apache.lucene.facet.params.CategoryListParams;
++import org.apache.lucene.facet.params.FacetIndexingParams;
++import org.apache.lucene.index.AtomicReader;
++import org.apache.lucene.index.CompositeReader;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.SlowCompositeReaderWrapper;
++import org.apache.lucene.index.SortedSetDocValues;
++import org.apache.lucene.util.BytesRef;
++
++/** Wraps a {@link IndexReader} and resolves ords
++ *  using existing {@link SortedSetDocValues} APIs without a
++ *  separate taxonomy index.  This only supports flat facets
++ *  (dimension + label), and it makes faceting a bit
++ *  slower, adds some cost at reopen time, but avoids
++ *  managing the separate taxonomy index.  It also requires
++ *  less RAM than the taxonomy index, as it manages the flat
++ *  (2-level) hierarchy more efficiently.  In addition, the
++ *  tie-break during faceting is now meaningful (in label
++ *  sorted order).
++ *
++ *  <p><b>NOTE</b>: creating an instance of this class is
++ *  somewhat costly, as it computes per-segment ordinal maps,
++ *  so you should create it once and re-use that one instance
++ *  for a given {@link IndexReader}. */
++
++public final class SortedSetDocValuesReaderState {
++
++  private final String field;
++  private final AtomicReader topReader;
++  private final int valueCount;
++  final char separator;
++  final String separatorRegex;
++
++  /** Extension added to {@link CategoryListParams#field}
++   *  to determin which field to read/write facet ordinals from/to. */
++  public static final String FACET_FIELD_EXTENSION = "_sorted_doc_values";
++
++  /** Holds start/end range of ords, which maps to one
++   *  dimension (someday we may generalize it to map to
++   *  hierarchies within one dimension). */
++  static final class OrdRange {
++    /** Start of range, inclusive: */
++    public final int start;
++    /** End of range, inclusive: */
++    public final int end;
++
++    /** Start and end are inclusive. */
++    public OrdRange(int start, int end) {
++      this.start = start;
++      this.end = end;
++    }
++  }
++
++  private final Map<String,OrdRange> prefixToOrdRange = new HashMap<String,OrdRange>();
++
++  /** Create an instance, scanning the {@link
++   *  SortedSetDocValues} from the provided reader, with
++   *  default {@link FacetIndexingParams}. */
++  public SortedSetDocValuesReaderState(IndexReader reader) throws IOException {
++    this(FacetIndexingParams.DEFAULT, reader);
++  }
++
++  /** Create an instance, scanning the {@link
++   *  SortedSetDocValues} from the provided reader and
++   *  {@link FacetIndexingParams}. */
++  public SortedSetDocValuesReaderState(FacetIndexingParams fip, IndexReader reader) throws IOException {
++
++    this.field = fip.getCategoryListParams(null).field + FACET_FIELD_EXTENSION;
++    this.separator = fip.getFacetDelimChar();
++    this.separatorRegex = Pattern.quote(Character.toString(separator));
++
++    // We need this to create thread-safe MultiSortedSetDV
++    // per collector:
++    if (reader instanceof AtomicReader) {
++      topReader = (AtomicReader) reader;
++    } else {
++      topReader = new SlowCompositeReaderWrapper((CompositeReader) reader);
++    }
++    SortedSetDocValues dv = topReader.getSortedSetDocValues(field);
++    if (dv == null) {
++      throw new IllegalArgumentException("field \"" + field + "\" was not indexed with SortedSetDocValues");
++    }
++    if (dv.getValueCount() > Integer.MAX_VALUE) {
++      throw new IllegalArgumentException("can only handle valueCount < Integer.MAX_VALUE; got " + dv.getValueCount());
++    }
++    valueCount = (int) dv.getValueCount();
++
++    // TODO: we can make this more efficient if eg we can be
++    // "involved" when OrdinalMap is being created?  Ie see
++    // each term/ord it's assigning as it goes...
++    String lastDim = null;
++    int startOrd = -1;
++    BytesRef spare = new BytesRef();
++
++    // TODO: this approach can work for full hierarchy?;
++    // TaxoReader can't do this since ords are not in
++    // "sorted order" ... but we should generalize this to
++    // support arbitrary hierarchy:
++    for(int ord=0;ord<valueCount;ord++) {
++      dv.lookupOrd(ord, spare);
++      String[] components = spare.utf8ToString().split(separatorRegex, 2);
++      if (components.length != 2) {
++        throw new IllegalArgumentException("this class can only handle 2 level hierarchy (dim/value); got: " + spare.utf8ToString());
++      }
++      if (!components[0].equals(lastDim)) {
++        if (lastDim != null) {
++          prefixToOrdRange.put(lastDim, new OrdRange(startOrd, ord-1));
++        }
++        startOrd = ord;
++        lastDim = components[0];
++      }
++    }
++
++    if (lastDim != null) {
++      prefixToOrdRange.put(lastDim, new OrdRange(startOrd, valueCount-1));
++    }
++  }
++
++  SortedSetDocValues getDocValues() throws IOException {
++    return topReader.getSortedSetDocValues(field);
++  }
++
++  OrdRange getOrdRange(String dim) {
++    return prefixToOrdRange.get(dim);
++  }
++
++  String getField() {
++    return field;
++  }
++
++  int getSize() {
++    return valueCount;
++  }
++}
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/sortedset/package.html b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/package.html
+new file mode 100644
+index 0000000..1967a67
+--- /dev/null
++++ b/lucene/facet/src/java/org/apache/lucene/facet/sortedset/package.html
+@@ -0,0 +1,24 @@
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++<html>
++<head>
++<title>Classes to perform faceting without a separate taxonomy index, using on SortedSetDocValuesField</title>
++</head>
++<body>
++Classes to perform faceting without a separate taxonomy index, using on SortedSetDocValuesField.
++</body>
++</html>
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/CategoryPath.java b/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/CategoryPath.java
+index 5635397..d31556e 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/CategoryPath.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/taxonomy/CategoryPath.java
+@@ -1,7 +1,5 @@
+ package org.apache.lucene.facet.taxonomy;
+ 
+-import java.util.Arrays;
+-
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -19,6 +17,9 @@ import java.util.Arrays;
+  * limitations under the License.
+  */
+ 
++import java.util.Arrays;
++import java.util.regex.Pattern;
++
+ /**
+  * Holds a sequence of string components, specifying the hierarchical name of a
+  * category.
+@@ -73,7 +74,7 @@ public class CategoryPath implements Comparable<CategoryPath> {
+ 
+   /** Construct from a given path, separating path components with {@code delimiter}. */
+   public CategoryPath(final String pathString, final char delimiter) {
+-    String[] comps = pathString.split(Character.toString(delimiter));
++    String[] comps = pathString.split(Pattern.quote(Character.toString(delimiter)));
+     if (comps.length == 1 && comps[0].isEmpty()) {
+       components = null;
+       length = 0;
+diff --git a/lucene/facet/src/test/org/apache/lucene/facet/search/TestDrillSideways.java b/lucene/facet/src/test/org/apache/lucene/facet/search/TestDrillSideways.java
+index 055a641..5b9ebe7 100644
+--- a/lucene/facet/src/test/org/apache/lucene/facet/search/TestDrillSideways.java
++++ b/lucene/facet/src/test/org/apache/lucene/facet/search/TestDrillSideways.java
+@@ -37,6 +37,9 @@ import org.apache.lucene.facet.index.FacetFields;
+ import org.apache.lucene.facet.params.FacetIndexingParams;
+ import org.apache.lucene.facet.params.FacetSearchParams;
+ import org.apache.lucene.facet.search.DrillSideways.DrillSidewaysResult;
++import org.apache.lucene.facet.sortedset.SortedSetDocValuesAccumulator;
++import org.apache.lucene.facet.sortedset.SortedSetDocValuesFacetField;
++import org.apache.lucene.facet.sortedset.SortedSetDocValuesReaderState;
+ import org.apache.lucene.facet.taxonomy.CategoryPath;
+ import org.apache.lucene.facet.taxonomy.TaxonomyReader;
+ import org.apache.lucene.facet.taxonomy.directory.DirectoryTaxonomyReader;
+@@ -63,6 +66,7 @@ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.InfoStream;
++import org.apache.lucene.util.SorterTemplate;
+ import org.apache.lucene.util._TestUtil;
+ 
+ public class TestDrillSideways extends FacetTestCase {
+@@ -401,6 +405,8 @@ public class TestDrillSideways extends FacetTestCase {
+ 
+   public void testRandom() throws Exception {
+ 
++    boolean canUseDV = defaultCodecSupportsSortedSet();
++
+     while (aChance == 0.0) {
+       aChance = random().nextDouble();
+     }
+@@ -435,13 +441,14 @@ public class TestDrillSideways extends FacetTestCase {
+         String s;
+         while (true) {
+           s = _TestUtil.randomRealisticUnicodeString(random());
+-          // We cannot include this character else the label
+-          // is silently truncated:
+-          if (s.indexOf(FacetIndexingParams.DEFAULT_FACET_DELIM_CHAR) == -1) {
++          //s = _TestUtil.randomSimpleString(random());
++          // We cannot include this character else we hit
++          // IllegalArgExc: 
++          if (s.indexOf(FacetIndexingParams.DEFAULT_FACET_DELIM_CHAR) == -1 &&
++              (!canUseDV || s.indexOf('/') == -1)) {
+             break;
+           }
+         }
+-        //String s = _TestUtil.randomSimpleString(random());
+         if (s.length() > 0) {
+           values.add(s);
+         }
+@@ -506,24 +513,33 @@ public class TestDrillSideways extends FacetTestCase {
+       for(int dim=0;dim<numDims;dim++) {
+         int dimValue = rawDoc.dims[dim];
+         if (dimValue != -1) {
+-          paths.add(new CategoryPath("dim" + dim, dimValues[dim][dimValue]));
++          CategoryPath cp = new CategoryPath("dim" + dim, dimValues[dim][dimValue]);
++          paths.add(cp);
+           doc.add(new StringField("dim" + dim, dimValues[dim][dimValue], Field.Store.YES));
+           if (VERBOSE) {
+             System.out.println("    dim" + dim + "=" + new BytesRef(dimValues[dim][dimValue]));
+           }
++          if (canUseDV) {
++            doc.add(new SortedSetDocValuesFacetField(cp));
++          }
+         }
+         int dimValue2 = rawDoc.dims2[dim];
+         if (dimValue2 != -1) {
+-          paths.add(new CategoryPath("dim" + dim, dimValues[dim][dimValue2]));
++          CategoryPath cp = new CategoryPath("dim" + dim, dimValues[dim][dimValue2]);
++          paths.add(cp);
+           doc.add(new StringField("dim" + dim, dimValues[dim][dimValue2], Field.Store.YES));
+           if (VERBOSE) {
+             System.out.println("      dim" + dim + "=" + new BytesRef(dimValues[dim][dimValue2]));
+           }
++          if (canUseDV) {
++            doc.add(new SortedSetDocValuesFacetField(cp));
++          }
+         }
+       }
+       if (!paths.isEmpty()) {
+         facetFields.addFields(doc, paths);
+       }
++
+       w.addDocument(doc);
+     }
+ 
+@@ -555,6 +571,14 @@ public class TestDrillSideways extends FacetTestCase {
+     }
+     IndexReader r = w.getReader();
+     w.close();
++
++    final SortedSetDocValuesReaderState sortedSetDVState;
++    if (canUseDV) {
++      sortedSetDVState = new SortedSetDocValuesReaderState(r);
++    } else {
++      sortedSetDVState = null;
++    }
++
+     if (VERBOSE) {
+       System.out.println("r.numDocs() = " + r.numDocs());
+     }
+@@ -563,23 +587,25 @@ public class TestDrillSideways extends FacetTestCase {
+     TaxonomyReader tr = new DirectoryTaxonomyReader(tw);
+     tw.close();
+ 
+-    List<FacetRequest> requests = new ArrayList<FacetRequest>();
+-    for(int i=0;i<numDims;i++) {
+-      requests.add(new CountFacetRequest(new CategoryPath("dim" + i), dimValues[numDims-1].length));
+-    }
+-
+-    FacetSearchParams fsp = new FacetSearchParams(requests);
+     IndexSearcher s = new IndexSearcher(r);
+ 
+     int numIters = atLeast(10);
+ 
+     for(int iter=0;iter<numIters;iter++) {
++      List<FacetRequest> requests = new ArrayList<FacetRequest>();
++      for(int i=0;i<numDims;i++) {
++        requests.add(new CountFacetRequest(new CategoryPath("dim" + i), dimValues[numDims-1].length));
++      }
++
++      FacetSearchParams fsp = new FacetSearchParams(requests);
+       String contentToken = random().nextInt(30) == 17 ? null : randomContentToken(true);
+       int numDrillDown = _TestUtil.nextInt(random(), 1, Math.min(4, numDims));
+       String[][] drillDowns = new String[numDims][];
++      boolean useSortedSetDV = canUseDV && random().nextBoolean();
+       if (VERBOSE) {
+-        System.out.println("\nTEST: iter=" + iter + " baseQuery=" + contentToken + " numDrillDown=" + numDrillDown);
++        System.out.println("\nTEST: iter=" + iter + " baseQuery=" + contentToken + " numDrillDown=" + numDrillDown + " useSortedSetDV=" + useSortedSetDV);
+       }
++
+       int count = 0;
+       while (count < numDrillDown) {
+         int dim = random().nextInt(numDims);
+@@ -660,7 +686,9 @@ public class TestDrillSideways extends FacetTestCase {
+         filter = null;
+       }
+ 
+-      // Verify docs are always collected in order:
++      // Verify docs are always collected in order.  If we
++      // had an AssertingScorer it could catch it when
++      // Weight.scoresDocsOutOfOrder lies!:
+       new DrillSideways(s, tr).search(ddq,
+                            new Collector() {
+                              int lastDocID;
+@@ -689,15 +717,42 @@ public class TestDrillSideways extends FacetTestCase {
+       SimpleFacetResult expected = slowDrillSidewaysSearch(s, docs, contentToken, drillDowns, dimValues, filter);
+ 
+       Sort sort = new Sort(new SortField("id", SortField.Type.STRING));
+-      DrillSidewaysResult actual = new DrillSideways(s, tr).search(ddq, filter, null, numDocs, sort, true, true, fsp);
++      DrillSideways ds;
++      if (useSortedSetDV) {
++        ds = new DrillSideways(s, null) {
++            @Override
++            protected FacetsAccumulator getDrillDownAccumulator(FacetSearchParams fsp) throws IOException {
++              return new SortedSetDocValuesAccumulator(fsp, sortedSetDVState);
++            }
++
++            @Override
++            protected FacetsAccumulator getDrillSidewaysAccumulator(String dim, FacetSearchParams fsp) throws IOException {
++              return new SortedSetDocValuesAccumulator(fsp, sortedSetDVState);
++            }
++          };
++      } else {
++        ds = new DrillSideways(s, tr);
++      }
++
++      DrillSidewaysResult actual = ds.search(ddq, filter, null, numDocs, sort, true, true, fsp);
+ 
+       TopDocs hits = s.search(baseQuery, numDocs);
+       Map<String,Float> scores = new HashMap<String,Float>();
+       for(ScoreDoc sd : hits.scoreDocs) {
+         scores.put(s.doc(sd.doc).get("id"), sd.score);
+       }
+-      
+-      verifyEquals(dimValues, s, expected, actual, scores);
++      verifyEquals(dimValues, s, expected, actual, scores, -1, useSortedSetDV);
++
++      // Make sure topN works:
++      int topN = _TestUtil.nextInt(random(), 1, 20);
++
++      requests = new ArrayList<FacetRequest>();
++      for(int i=0;i<numDims;i++) {
++        requests.add(new CountFacetRequest(new CategoryPath("dim" + i), topN));
++      }
++      fsp = new FacetSearchParams(requests);
++      actual = ds.search(ddq, filter, null, numDocs, sort, true, true, fsp);
++      verifyEquals(dimValues, s, expected, actual, scores, topN, useSortedSetDV);
+ 
+       // Make sure drill down doesn't change score:
+       TopDocs ddqHits = s.search(ddq, filter, numDocs);
+@@ -748,6 +803,78 @@ public class TestDrillSideways extends FacetTestCase {
+     List<Doc> hits;
+     int[][] counts;
+   }
++  
++  private int[] getTopNOrds(final int[] counts, final String[] values, int topN) {
++    final int[] ids = new int[counts.length];
++    for(int i=0;i<ids.length;i++) {
++      ids[i] = i;
++    }
++
++    // Naive (on purpose, to reduce bug in tester/gold):
++    // sort all ids, then return top N slice:
++    new SorterTemplate() {
++
++      private int pivot;
++
++      @Override
++      protected void swap(int i, int j) {
++        int id = ids[i];
++        ids[i] = ids[j];
++        ids[j] = id;
++      }
++
++      @Override
++      protected int compare(int i, int j) {
++        int counti = counts[ids[i]];
++        int countj = counts[ids[j]];
++        // Sort by count descending...
++        if (counti > countj) {
++          return -1;
++        } else if (counti < countj) {
++          return 1;
++        } else {
++          // ... then by label ascending:
++          return new BytesRef(values[ids[i]]).compareTo(new BytesRef(values[ids[j]]));
++        }
++      }
++
++      @Override
++      protected void setPivot(int i) {
++        pivot = ids[i];
++      }
++
++      @Override
++      protected int comparePivot(int j) {
++        int counti = counts[pivot];
++        int countj = counts[ids[j]];
++        // Sort by count descending...
++        if (counti > countj) {
++          return -1;
++        } else if (counti < countj) {
++          return 1;
++        } else {
++          // ... then by ord ascending:
++          return new BytesRef(values[pivot]).compareTo(new BytesRef(values[ids[j]]));
++        }
++      }
++    }.mergeSort(0, ids.length-1);
++
++    if (topN > ids.length) {
++      topN = ids.length;
++    }
++
++    int numSet = topN;
++    for(int i=0;i<topN;i++) {
++      if (counts[ids[i]] == 0) {
++        numSet = i;
++        break;
++      }
++    }
++
++    int[] topNIDs = new int[numSet];
++    System.arraycopy(ids, 0, topNIDs, 0, topNIDs.length);
++    return topNIDs;
++  }
+ 
+   private SimpleFacetResult slowDrillSidewaysSearch(IndexSearcher s, List<Doc> docs, String contentToken, String[][] drillDowns,
+                                                     String[][] dimValues, Filter onlyEven) throws Exception {
+@@ -836,7 +963,8 @@ public class TestDrillSideways extends FacetTestCase {
+     return res;
+   }
+ 
+-  void verifyEquals(String[][] dimValues, IndexSearcher s, SimpleFacetResult expected, DrillSidewaysResult actual, Map<String,Float> scores) throws Exception {
++  void verifyEquals(String[][] dimValues, IndexSearcher s, SimpleFacetResult expected,
++                    DrillSidewaysResult actual, Map<String,Float> scores, int topN, boolean isSortedSetDV) throws Exception {
+     if (VERBOSE) {
+       System.out.println("  verify totHits=" + expected.hits.size());
+     }
+@@ -851,41 +979,81 @@ public class TestDrillSideways extends FacetTestCase {
+       // Score should be IDENTICAL:
+       assertEquals(scores.get(expected.hits.get(i).id), actual.hits.scoreDocs[i].score, 0.0f);
+     }
++
+     assertEquals(expected.counts.length, actual.facetResults.size());
+     for(int dim=0;dim<expected.counts.length;dim++) {
++      FacetResult fr = actual.facetResults.get(dim);
++      List<FacetResultNode> subResults = fr.getFacetResultNode().subResults;
+       if (VERBOSE) {
+         System.out.println("    dim" + dim);
+         System.out.println("      actual");
+       }
+-      FacetResult fr = actual.facetResults.get(dim);
++
+       Map<String,Integer> actualValues = new HashMap<String,Integer>();
+-      for(FacetResultNode childNode : fr.getFacetResultNode().subResults) {
++      int idx = 0;
++      for(FacetResultNode childNode : subResults) {
+         actualValues.put(childNode.label.components[1], (int) childNode.value);
+         if (VERBOSE) {
+-          System.out.println("        " + new BytesRef(childNode.label.components[1]) + ": " + (int) childNode.value);
++          System.out.println("        " + idx + ": " + new BytesRef(childNode.label.components[1]) + ": " + (int) childNode.value);
++          idx++;
+         }
+       }
+ 
+-      if (VERBOSE) {
+-        System.out.println("      expected");
+-      }
++      if (topN != -1) {
++        int[] topNIDs = getTopNOrds(expected.counts[dim], dimValues[dim], topN);
++        if (VERBOSE) {
++          idx = 0;
++          System.out.println("      expected (sorted)");
++          for(int i=0;i<topNIDs.length;i++) {
++            int expectedOrd = topNIDs[i];
++            String value = dimValues[dim][expectedOrd];
++            System.out.println("        " + idx + ": " + new BytesRef(value) + ": " + expected.counts[dim][expectedOrd]);
++            idx++;
++          }
++        }
++        if (VERBOSE) {
++          System.out.println("      topN=" + topN + " expectedTopN=" + topNIDs.length);
++        }
+ 
+-      int setCount = 0;
+-      for(int i=0;i<dimValues[dim].length;i++) {
+-        String value = dimValues[dim][i];
+-        if (expected.counts[dim][i] != 0) {
+-          if (VERBOSE) {
+-            System.out.println("        " + new BytesRef(value) + ": " + expected.counts[dim][i]);
+-          } 
+-          assertTrue(actualValues.containsKey(value));
+-          assertEquals(expected.counts[dim][i], actualValues.get(value).intValue());
+-          setCount++;
+-        } else {
+-          assertFalse(actualValues.containsKey(value));
++        assertEquals(topNIDs.length, subResults.size());
++        for(int i=0;i<topNIDs.length;i++) {
++          FacetResultNode node = subResults.get(i);
++          int expectedOrd = topNIDs[i];
++          assertEquals(expected.counts[dim][expectedOrd], (int) node.value);
++          assertEquals(2, node.label.length);
++          if (isSortedSetDV) {
++            // Tie-break facet labels are only in unicode
++            // order with SortedSetDVFacets:
++            assertEquals("value @ idx=" + i, dimValues[dim][expectedOrd], node.label.components[1]);
++          }
+         }
+-      }
++      } else {
+ 
+-      assertEquals(setCount, actualValues.size());
++        if (VERBOSE) {
++          idx = 0;
++          System.out.println("      expected (unsorted)");
++          for(int i=0;i<dimValues[dim].length;i++) {
++            String value = dimValues[dim][i];
++            if (expected.counts[dim][i] != 0) {
++              System.out.println("        " + idx + ": " + new BytesRef(value) + ": " + expected.counts[dim][i]);
++              idx++;
++            } 
++          }
++        }
++
++        int setCount = 0;
++        for(int i=0;i<dimValues[dim].length;i++) {
++          String value = dimValues[dim][i];
++          if (expected.counts[dim][i] != 0) {
++            assertTrue(actualValues.containsKey(value));
++            assertEquals(expected.counts[dim][i], actualValues.get(value).intValue());
++            setCount++;
++          } else {
++            assertFalse(actualValues.containsKey(value));
++          }
++        }
++        assertEquals(setCount, actualValues.size());
++      }
+     }
+   }
+ 
+diff --git a/lucene/facet/src/test/org/apache/lucene/facet/sortedset/TestSortedSetDocValuesFacets.java b/lucene/facet/src/test/org/apache/lucene/facet/sortedset/TestSortedSetDocValuesFacets.java
+new file mode 100644
+index 0000000..d9f646e
+--- /dev/null
++++ b/lucene/facet/src/test/org/apache/lucene/facet/sortedset/TestSortedSetDocValuesFacets.java
+@@ -0,0 +1,135 @@
++package org.apache.lucene.facet.sortedset;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.facet.FacetTestCase;
++import org.apache.lucene.facet.FacetTestUtils;
++import org.apache.lucene.facet.params.CategoryListParams;
++import org.apache.lucene.facet.params.FacetIndexingParams;
++import org.apache.lucene.facet.params.FacetSearchParams;
++import org.apache.lucene.facet.search.CountFacetRequest;
++import org.apache.lucene.facet.search.FacetRequest;
++import org.apache.lucene.facet.search.FacetResult;
++import org.apache.lucene.facet.search.FacetsCollector;
++import org.apache.lucene.facet.taxonomy.CategoryPath;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.MatchAllDocsQuery;
++import org.apache.lucene.store.Directory;
++
++public class TestSortedSetDocValuesFacets extends FacetTestCase {
++
++  // NOTE: TestDrillSideways.testRandom also sometimes
++  // randomly uses SortedSetDV
++
++  public void testSortedSetDocValuesAccumulator() throws Exception {
++    assumeTrue("Test requires SortedSetDV support", defaultCodecSupportsSortedSet());
++    Directory dir = newDirectory();
++    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
++
++    // Use a custom delim char to make sure the impls
++    // respect it:
++    final char delim = ':';
++    FacetIndexingParams fip = new FacetIndexingParams() {
++        @Override
++        public char getFacetDelimChar() {
++          return delim;
++        }
++      };
++
++    Document doc = new Document();
++    // Mixup order we add these paths, to verify tie-break
++    // order is by label (unicode sort) and has nothing to
++    // do w/ order we added them:
++    List<CategoryPath> paths = new ArrayList<CategoryPath>();
++    paths.add(new CategoryPath("a", "foo"));
++    paths.add(new CategoryPath("a", "bar"));
++    paths.add(new CategoryPath("a", "zoo"));
++    Collections.shuffle(paths, random());
++
++    for(CategoryPath cp : paths) {
++      doc.add(new SortedSetDocValuesFacetField(fip, cp));
++    }
++
++    doc.add(new SortedSetDocValuesFacetField(fip, new CategoryPath("b", "baz")));
++    // Make sure it's fine to use delim in the label (it's
++    // just not allowed in the dim):
++    doc.add(new SortedSetDocValuesFacetField(fip, new CategoryPath("b", "baz" + delim + "foo")));
++    doc.add(new SortedSetDocValuesFacetField(fip, new CategoryPath("b" + FacetIndexingParams.DEFAULT_FACET_DELIM_CHAR, "bazfoo")));
++    writer.addDocument(doc);
++    if (random().nextBoolean()) {
++      writer.commit();
++    }
++
++    doc = new Document();
++    doc.add(new SortedSetDocValuesFacetField(fip, new CategoryPath("a", "foo")));
++    writer.addDocument(doc);
++
++    // NRT open
++    IndexSearcher searcher = newSearcher(writer.getReader());
++    writer.close();
++
++    List<FacetRequest> requests = new ArrayList<FacetRequest>();
++    requests.add(new CountFacetRequest(new CategoryPath("a"), 10));
++    requests.add(new CountFacetRequest(new CategoryPath("b"), 10));
++    requests.add(new CountFacetRequest(new CategoryPath("b" + FacetIndexingParams.DEFAULT_FACET_DELIM_CHAR), 10));
++
++    final boolean doDimCount = random().nextBoolean();
++
++    CategoryListParams clp = new CategoryListParams() {
++        @Override
++        public OrdinalPolicy getOrdinalPolicy(String dimension) {
++          return doDimCount ? OrdinalPolicy.NO_PARENTS : OrdinalPolicy.ALL_BUT_DIMENSION;
++        }
++      };
++
++    FacetSearchParams fsp = new FacetSearchParams(new FacetIndexingParams(clp), requests);
++
++    // Per-top-reader state:
++    SortedSetDocValuesReaderState state = new SortedSetDocValuesReaderState(fip, searcher.getIndexReader());
++    
++    //SortedSetDocValuesCollector c = new SortedSetDocValuesCollector(state);
++    //SortedSetDocValuesCollectorMergeBySeg c = new SortedSetDocValuesCollectorMergeBySeg(state);
++
++    FacetsCollector c = FacetsCollector.create(new SortedSetDocValuesAccumulator(fsp, state));
++
++    searcher.search(new MatchAllDocsQuery(), c);
++
++    //List<FacetResult> results = c.getFacetResults(requests);
++    List<FacetResult> results = c.getFacetResults();
++
++    assertEquals(3, results.size());
++
++    int dimCount = doDimCount ? 4 : 0;
++    assertEquals("a (" + dimCount + ")\n  foo (2)\n  bar (1)\n  zoo (1)\n", FacetTestUtils.toSimpleString(results.get(0)));
++
++    dimCount = doDimCount ? 2 : 0;
++    assertEquals("b (" + dimCount + ")\n  baz (1)\n  baz" + delim + "foo (1)\n", FacetTestUtils.toSimpleString(results.get(1)));
++
++    dimCount = doDimCount ? 1 : 0;
++    assertEquals("b" + FacetIndexingParams.DEFAULT_FACET_DELIM_CHAR + " (" + dimCount + ")\n  bazfoo (1)\n", FacetTestUtils.toSimpleString(results.get(2)));
++
++    searcher.getIndexReader().close();
++    dir.close();
++  }
++}
+

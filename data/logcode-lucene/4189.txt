@@ -1,0 +1,1848 @@
+GitDiffStart: bed131f1808d40a4f7f79303f73e1c93aa750895 | Sat Feb 21 16:49:55 2015 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 7bd0cb5..2a83a3f 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -127,6 +127,9 @@ API Changes
+ * LUCENE-6269: Removed BooleanFilter, use a QueryWrapperFilter(BooleanQuery)
+   instead. (Adrien Grand)
+ 
++* LUCENE-6270: Replaced TermsFilter with TermsQuery, use a
++  QueryWrapperFilter(TermsQuery) instead. (Adrien Grand)
++
+ * LUCENE-6223: Move BooleanQuery.BooleanWeight to BooleanWeight.
+   (Robert Muir)
+ 
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/TermsFilter.java b/lucene/queries/src/java/org/apache/lucene/queries/TermsFilter.java
+deleted file mode 100644
+index d11c1b4..0000000
+--- a/lucene/queries/src/java/org/apache/lucene/queries/TermsFilter.java
++++ /dev/null
+@@ -1,345 +0,0 @@
+-package org.apache.lucene.queries;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.Iterator;
+-import java.util.List;
+-
+-import org.apache.lucene.index.PostingsEnum;
+-import org.apache.lucene.index.Fields;
+-import org.apache.lucene.index.LeafReader;
+-import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.index.Terms;
+-import org.apache.lucene.index.TermsEnum;
+-import org.apache.lucene.search.DocIdSet;
+-import org.apache.lucene.search.Filter;
+-import org.apache.lucene.util.Accountable;
+-import org.apache.lucene.util.ArrayUtil;
+-import org.apache.lucene.util.BitDocIdSet;
+-import org.apache.lucene.util.Bits;
+-import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.RamUsageEstimator;
+-
+-/**
+- * Constructs a filter for docs matching any of the terms added to this class.
+- * Unlike a RangeFilter this can be used for filtering on multiple terms that are not necessarily in
+- * a sequence. An example might be a collection of primary keys from a database query result or perhaps
+- * a choice of "category" labels picked by the end user. As a filter, this is much faster than the
+- * equivalent query (a BooleanQuery with many "should" TermQueries)
+- */
+-public final class TermsFilter extends Filter implements Accountable {
+-
+-  private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(TermsFilter.class);
+-
+-  /*
+-   * this class is often used for large number of terms in a single field.
+-   * to optimize for this case and to be filter-cache friendly we 
+-   * serialize all terms into a single byte array and store offsets
+-   * in a parallel array to keep the # of object constant and speed up
+-   * equals / hashcode.
+-   * 
+-   * This adds quite a bit of complexity but allows large term filters to
+-   * be efficient for GC and cache-lookups
+-   */
+-  private final int[] offsets;
+-  private final byte[] termsBytes;
+-  private final TermsAndField[] termsAndFields;
+-  private final int hashCode; // cached hashcode for fast cache lookups
+-  private static final int PRIME = 31;
+-  
+-  /**
+-   * Creates a new {@link TermsFilter} from the given list. The list
+-   * can contain duplicate terms and multiple fields.
+-   */
+-  public TermsFilter(final List<Term> terms) {
+-    this(new FieldAndTermEnum() {
+-      // we need to sort for deduplication and to have a common cache key
+-      final Iterator<Term> iter = sort(terms).iterator();
+-      @Override
+-      public BytesRef next() {
+-        if (iter.hasNext()) {
+-          Term next = iter.next();
+-          field = next.field();
+-          return next.bytes();
+-        }
+-        return null;
+-      }}, terms.size());
+-  }
+-  
+-  /**
+-   * Creates a new {@link TermsFilter} from the given {@link BytesRef} list for
+-   * a single field.
+-   */
+-  public TermsFilter(final String field, final List<BytesRef> terms) {
+-    this(new FieldAndTermEnum(field) {
+-      // we need to sort for deduplication and to have a common cache key
+-      final Iterator<BytesRef> iter = sort(terms).iterator();
+-      @Override
+-      public BytesRef next() {
+-        if (iter.hasNext()) {
+-          return iter.next();
+-        }
+-        return null;
+-      }
+-    }, terms.size());
+-  }
+-  
+-  /**
+-   * Creates a new {@link TermsFilter} from the given {@link BytesRef} array for
+-   * a single field.
+-   */
+-  public TermsFilter(final String field, final BytesRef...terms) {
+-    // this ctor prevents unnecessary Term creations
+-   this(field, Arrays.asList(terms));
+-  }
+-  
+-  /**
+-   * Creates a new {@link TermsFilter} from the given array. The array can
+-   * contain duplicate terms and multiple fields.
+-   */
+-  public TermsFilter(final Term... terms) {
+-    this(Arrays.asList(terms));
+-  }
+-  
+-  
+-  private TermsFilter(FieldAndTermEnum iter, int length) {
+-    // TODO: maybe use oal.index.PrefixCodedTerms instead?
+-    // If number of terms is more than a few hundred it
+-    // should be a win
+-
+-    // TODO: we also pack terms in FieldCache/DocValues
+-    // ... maybe we can refactor to share that code
+-
+-    // TODO: yet another option is to build the union of the terms in
+-    // an automaton an call intersect on the termsenum if the density is high
+-
+-    int hash = 9;
+-    byte[] serializedTerms = new byte[0];
+-    this.offsets = new int[length+1];
+-    int lastEndOffset = 0;
+-    int index = 0;
+-    ArrayList<TermsAndField> termsAndFields = new ArrayList<>();
+-    TermsAndField lastTermsAndField = null;
+-    BytesRef previousTerm = null;
+-    String previousField = null;
+-    BytesRef currentTerm;
+-    String currentField;
+-    while((currentTerm = iter.next()) != null) {
+-      currentField = iter.field();
+-      if (currentField == null) {
+-        throw new IllegalArgumentException("Field must not be null");
+-      }
+-      if (previousField != null) {
+-        // deduplicate
+-        if (previousField.equals(currentField)) {
+-          if (previousTerm.bytesEquals(currentTerm)){
+-            continue;            
+-          }
+-        } else {
+-          final int start = lastTermsAndField == null ? 0 : lastTermsAndField.end;
+-          lastTermsAndField = new TermsAndField(start, index, previousField);
+-          termsAndFields.add(lastTermsAndField);
+-        }
+-      }
+-      hash = PRIME *  hash + currentField.hashCode();
+-      hash = PRIME *  hash + currentTerm.hashCode();
+-      if (serializedTerms.length < lastEndOffset+currentTerm.length) {
+-        serializedTerms = ArrayUtil.grow(serializedTerms, lastEndOffset+currentTerm.length);
+-      }
+-      System.arraycopy(currentTerm.bytes, currentTerm.offset, serializedTerms, lastEndOffset, currentTerm.length);
+-      offsets[index] = lastEndOffset; 
+-      lastEndOffset += currentTerm.length;
+-      index++;
+-      previousTerm = currentTerm;
+-      previousField = currentField;
+-    }
+-    offsets[index] = lastEndOffset;
+-    final int start = lastTermsAndField == null ? 0 : lastTermsAndField.end;
+-    lastTermsAndField = new TermsAndField(start, index, previousField);
+-    termsAndFields.add(lastTermsAndField);
+-    this.termsBytes = ArrayUtil.shrink(serializedTerms, lastEndOffset);
+-    this.termsAndFields = termsAndFields.toArray(new TermsAndField[termsAndFields.size()]);
+-    this.hashCode = hash;
+-    
+-  }
+-
+-  @Override
+-  public long ramBytesUsed() {
+-    return BASE_RAM_BYTES_USED
+-        + RamUsageEstimator.sizeOf(termsAndFields)
+-        + RamUsageEstimator.sizeOf(termsBytes)
+-        + RamUsageEstimator.sizeOf(offsets);
+-  }
+-  
+-  @Override
+-  public DocIdSet getDocIdSet(LeafReaderContext context, Bits acceptDocs) throws IOException {
+-    final LeafReader reader = context.reader();
+-    BitDocIdSet.Builder builder = new BitDocIdSet.Builder(reader.maxDoc());
+-    final Fields fields = reader.fields();
+-    final BytesRef spare = new BytesRef(this.termsBytes);
+-    Terms terms = null;
+-    TermsEnum termsEnum = null;
+-    PostingsEnum docs = null;
+-    for (TermsAndField termsAndField : this.termsAndFields) {
+-      if ((terms = fields.terms(termsAndField.field)) != null) {
+-        termsEnum = terms.iterator(termsEnum); // this won't return null
+-        for (int i = termsAndField.start; i < termsAndField.end; i++) {
+-          spare.offset = offsets[i];
+-          spare.length = offsets[i+1] - offsets[i];
+-          if (termsEnum.seekExact(spare)) {
+-            docs = termsEnum.postings(acceptDocs, docs, PostingsEnum.NONE); // no freq since we don't need them
+-            builder.or(docs);
+-          }
+-        }
+-      }
+-    }
+-    return builder.build();
+-  }
+-
+-  @Override
+-  public boolean equals(Object obj) {
+-    if (this == obj) {
+-      return true;
+-    }
+-    if ((obj == null) || (obj.getClass() != this.getClass())) {
+-      return false;
+-    }
+-    
+-    TermsFilter test = (TermsFilter) obj;
+-    // first check the fields before even comparing the bytes
+-    if (test.hashCode == hashCode && Arrays.equals(termsAndFields, test.termsAndFields)) {
+-      int lastOffset = termsAndFields[termsAndFields.length - 1].end;
+-      // compare offsets since we sort they must be identical
+-      if (ArrayUtil.equals(offsets, 0, test.offsets, 0, lastOffset + 1)) {
+-        // straight byte comparison since we sort they must be identical
+-        return  ArrayUtil.equals(termsBytes, 0, test.termsBytes, 0, offsets[lastOffset]);
+-      }
+-    }
+-    return false;
+-  }
+-
+-  @Override
+-  public int hashCode() {
+-    return hashCode;
+-  }
+-  
+-  @Override
+-  public String toString(String defaultField) {
+-    StringBuilder builder = new StringBuilder();
+-    BytesRef spare = new BytesRef(termsBytes);
+-    boolean first = true;
+-    for (int i = 0; i < termsAndFields.length; i++) {
+-      TermsAndField current = termsAndFields[i];
+-      for (int j = current.start; j < current.end; j++) {
+-        spare.offset = offsets[j];
+-        spare.length = offsets[j+1] - offsets[j];
+-        if (!first) {
+-          builder.append(' ');
+-        }
+-        first = false;
+-        builder.append(current.field).append(':');
+-        builder.append(spare.utf8ToString());
+-      }
+-    }
+-
+-    return builder.toString();
+-  }
+-  
+-  private static final class TermsAndField implements Accountable {
+-
+-    private static final long BASE_RAM_BYTES_USED =
+-        RamUsageEstimator.shallowSizeOfInstance(TermsAndField.class)
+-        + RamUsageEstimator.shallowSizeOfInstance(String.class)
+-        + RamUsageEstimator.NUM_BYTES_ARRAY_HEADER; // header of the array held by the String
+-
+-    final int start;
+-    final int end;
+-    final String field;
+-    
+-    
+-    TermsAndField(int start, int end, String field) {
+-      super();
+-      this.start = start;
+-      this.end = end;
+-      this.field = field;
+-    }
+-
+-    @Override
+-    public long ramBytesUsed() {
+-      // this is an approximation since we don't actually know how strings store
+-      // their data, which can be JVM-dependent
+-      return BASE_RAM_BYTES_USED + field.length() * RamUsageEstimator.NUM_BYTES_CHAR;
+-    }
+-
+-    @Override
+-    public int hashCode() {
+-      final int prime = 31;
+-      int result = 1;
+-      result = prime * result + ((field == null) ? 0 : field.hashCode());
+-      result = prime * result + end;
+-      result = prime * result + start;
+-      return result;
+-    }
+-    
+-    @Override
+-    public boolean equals(Object obj) {
+-      if (this == obj) return true;
+-      if (obj == null) return false;
+-      if (getClass() != obj.getClass()) return false;
+-      TermsAndField other = (TermsAndField) obj;
+-      if (field == null) {
+-        if (other.field != null) return false;
+-      } else if (!field.equals(other.field)) return false;
+-      if (end != other.end) return false;
+-      if (start != other.start) return false;
+-      return true;
+-    }
+-    
+-  }
+-  
+-  private static abstract class FieldAndTermEnum {
+-    protected String field;
+-    
+-    public abstract BytesRef next();
+-    
+-    public FieldAndTermEnum() {}
+-    
+-    public FieldAndTermEnum(String field) { this.field = field; }
+-    
+-    public String field() {
+-      return field;
+-    }
+-  }
+-  
+-  /*
+-   * simple utility that returns the in-place sorted list
+-   */
+-  private static <T extends Comparable<? super T>> List<T> sort(List<T> toSort) {
+-    if (toSort.isEmpty()) {
+-      throw new IllegalArgumentException("no terms provided");
+-    }
+-    Collections.sort(toSort);
+-    return toSort;
+-  }
+-
+-}
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/TermsQuery.java b/lucene/queries/src/java/org/apache/lucene/queries/TermsQuery.java
+new file mode 100644
+index 0000000..20a12f4
+--- /dev/null
++++ b/lucene/queries/src/java/org/apache/lucene/queries/TermsQuery.java
+@@ -0,0 +1,462 @@
++package org.apache.lucene.queries;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.List;
++
++import org.apache.lucene.index.Fields;
++import org.apache.lucene.index.LeafReader;
++import org.apache.lucene.index.LeafReaderContext;
++import org.apache.lucene.index.PostingsEnum;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.ComplexExplanation;
++import org.apache.lucene.search.ConstantScoreQuery;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.Explanation;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.Weight;
++import org.apache.lucene.util.Accountable;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.BitDocIdSet;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.RamUsageEstimator;
++import org.apache.lucene.util.ToStringUtils;
++
++/**
++ * Specialization for a disjunction over many terms that behaves like a
++ * {@link ConstantScoreQuery} over a {@link BooleanQuery} containing only
++ * {@link org.apache.lucene.search.BooleanClause.Occur#SHOULD} clauses.
++ * This query creates a bit set and sets bits that matches any of the wrapped
++ * terms. While this might help performance when there are many terms, it would
++ * be slower than a {@link BooleanQuery} when there are few terms to match.
++ */
++public class TermsQuery extends Query implements Accountable {
++
++  private static final long BASE_RAM_BYTES_USED = RamUsageEstimator.shallowSizeOfInstance(TermsQuery.class);
++
++  /*
++   * this class is often used for large number of terms in a single field.
++   * to optimize for this case and to be filter-cache friendly we
++   * serialize all terms into a single byte array and store offsets
++   * in a parallel array to keep the # of object constant and speed up
++   * equals / hashcode.
++   *
++   * This adds quite a bit of complexity but allows large term queries to
++   * be efficient for GC and cache-lookups
++   */
++  private final int[] offsets;
++  private final byte[] termsBytes;
++  private final TermsAndField[] termsAndFields;
++  private final int hashCode; // cached hashcode for fast cache lookups, not including the boost
++
++  /**
++   * Creates a new {@link TermsQuery} from the given list. The list
++   * can contain duplicate terms and multiple fields.
++   */
++  public TermsQuery(final List<Term> terms) {
++    this(new FieldAndTermEnum() {
++      // we need to sort for deduplication and to have a common cache key
++      final Iterator<Term> iter = sort(terms).iterator();
++      @Override
++      public BytesRef next() {
++        if (iter.hasNext()) {
++          Term next = iter.next();
++          field = next.field();
++          return next.bytes();
++        }
++        return null;
++      }}, terms.size());
++  }
++
++  /**
++   * Creates a new {@link TermsQuery} from the given {@link BytesRef} list for
++   * a single field.
++   */
++  public TermsQuery(final String field, final List<BytesRef> terms) {
++    this(new FieldAndTermEnum(field) {
++      // we need to sort for deduplication and to have a common cache key
++      final Iterator<BytesRef> iter = sort(terms).iterator();
++      @Override
++      public BytesRef next() {
++        if (iter.hasNext()) {
++          return iter.next();
++        }
++        return null;
++      }
++    }, terms.size());
++  }
++
++  /**
++   * Creates a new {@link TermsQuery} from the given {@link BytesRef} array for
++   * a single field.
++   */
++  public TermsQuery(final String field, final BytesRef...terms) {
++    // this ctor prevents unnecessary Term creations
++   this(field, Arrays.asList(terms));
++  }
++
++  /**
++   * Creates a new {@link TermsQuery} from the given array. The array can
++   * contain duplicate terms and multiple fields.
++   */
++  public TermsQuery(final Term... terms) {
++    this(Arrays.asList(terms));
++  }
++
++  private TermsQuery(FieldAndTermEnum iter, int length) {
++    // TODO: maybe use oal.index.PrefixCodedTerms instead?
++    // If number of terms is more than a few hundred it
++    // should be a win
++
++    // TODO: we also pack terms in FieldCache/DocValues
++    // ... maybe we can refactor to share that code
++
++    // TODO: yet another option is to build the union of the terms in
++    // an automaton an call intersect on the termsenum if the density is high
++
++    int hash = 9;
++    byte[] serializedTerms = new byte[0];
++    this.offsets = new int[length+1];
++    int lastEndOffset = 0;
++    int index = 0;
++    ArrayList<TermsAndField> termsAndFields = new ArrayList<>();
++    TermsAndField lastTermsAndField = null;
++    BytesRef previousTerm = null;
++    String previousField = null;
++    BytesRef currentTerm;
++    String currentField;
++    while((currentTerm = iter.next()) != null) {
++      currentField = iter.field();
++      if (currentField == null) {
++        throw new IllegalArgumentException("Field must not be null");
++      }
++      if (previousField != null) {
++        // deduplicate
++        if (previousField.equals(currentField)) {
++          if (previousTerm.bytesEquals(currentTerm)){
++            continue;
++          }
++        } else {
++          final int start = lastTermsAndField == null ? 0 : lastTermsAndField.end;
++          lastTermsAndField = new TermsAndField(start, index, previousField);
++          termsAndFields.add(lastTermsAndField);
++        }
++      }
++      hash = 31 *  hash + currentField.hashCode();
++      hash = 31 *  hash + currentTerm.hashCode();
++      if (serializedTerms.length < lastEndOffset+currentTerm.length) {
++        serializedTerms = ArrayUtil.grow(serializedTerms, lastEndOffset+currentTerm.length);
++      }
++      System.arraycopy(currentTerm.bytes, currentTerm.offset, serializedTerms, lastEndOffset, currentTerm.length);
++      offsets[index] = lastEndOffset;
++      lastEndOffset += currentTerm.length;
++      index++;
++      previousTerm = currentTerm;
++      previousField = currentField;
++    }
++    offsets[index] = lastEndOffset;
++    final int start = lastTermsAndField == null ? 0 : lastTermsAndField.end;
++    lastTermsAndField = new TermsAndField(start, index, previousField);
++    termsAndFields.add(lastTermsAndField);
++    this.termsBytes = ArrayUtil.shrink(serializedTerms, lastEndOffset);
++    this.termsAndFields = termsAndFields.toArray(new TermsAndField[termsAndFields.size()]);
++    this.hashCode = hash;
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    if (this == obj) {
++      return true;
++    }
++    if ((obj == null) || (obj.getClass() != this.getClass())) {
++      return false;
++    }
++
++    TermsQuery that = (TermsQuery) obj;
++    // first check the fields before even comparing the bytes
++    if (that.hashCode == hashCode && getBoost() == that.getBoost() && Arrays.equals(termsAndFields, that.termsAndFields)) {
++      int lastOffset = termsAndFields[termsAndFields.length - 1].end;
++      // compare offsets since we sort they must be identical
++      if (ArrayUtil.equals(offsets, 0, that.offsets, 0, lastOffset + 1)) {
++        // straight byte comparison since we sort they must be identical
++        return  ArrayUtil.equals(termsBytes, 0, that.termsBytes, 0, offsets[lastOffset]);
++      }
++    }
++    return false;
++  }
++
++  @Override
++  public int hashCode() {
++    return hashCode ^ Float.floatToIntBits(getBoost());
++  }
++
++  @Override
++  public String toString(String defaultField) {
++    StringBuilder builder = new StringBuilder();
++    BytesRef spare = new BytesRef(termsBytes);
++    boolean first = true;
++    for (int i = 0; i < termsAndFields.length; i++) {
++      TermsAndField current = termsAndFields[i];
++      for (int j = current.start; j < current.end; j++) {
++        spare.offset = offsets[j];
++        spare.length = offsets[j+1] - offsets[j];
++        if (!first) {
++          builder.append(' ');
++        }
++        first = false;
++        builder.append(current.field).append(':');
++        builder.append(spare.utf8ToString());
++      }
++    }
++    builder.append(ToStringUtils.boost(getBoost()));
++
++    return builder.toString();
++  }
++
++  @Override
++  public long ramBytesUsed() {
++    return BASE_RAM_BYTES_USED
++        + RamUsageEstimator.sizeOf(termsAndFields)
++        + RamUsageEstimator.sizeOf(termsBytes)
++        + RamUsageEstimator.sizeOf(offsets);
++  }
++
++  @Override
++  public Collection<Accountable> getChildResources() {
++    return Collections.emptyList();
++  }
++
++  private static final class TermsAndField implements Accountable {
++
++    private static final long BASE_RAM_BYTES_USED =
++        RamUsageEstimator.shallowSizeOfInstance(TermsAndField.class)
++        + RamUsageEstimator.shallowSizeOfInstance(String.class)
++        + RamUsageEstimator.NUM_BYTES_ARRAY_HEADER; // header of the array held by the String
++
++    final int start;
++    final int end;
++    final String field;
++
++
++    TermsAndField(int start, int end, String field) {
++      super();
++      this.start = start;
++      this.end = end;
++      this.field = field;
++    }
++
++    @Override
++    public long ramBytesUsed() {
++      // this is an approximation since we don't actually know how strings store
++      // their data, which can be JVM-dependent
++      return BASE_RAM_BYTES_USED + field.length() * RamUsageEstimator.NUM_BYTES_CHAR;
++    }
++
++    @Override
++    public Collection<Accountable> getChildResources() {
++      return Collections.emptyList();
++    }
++
++    @Override
++    public int hashCode() {
++      final int prime = 31;
++      int result = 1;
++      result = prime * result + ((field == null) ? 0 : field.hashCode());
++      result = prime * result + end;
++      result = prime * result + start;
++      return result;
++    }
++
++    @Override
++    public boolean equals(Object obj) {
++      if (this == obj) return true;
++      if (obj == null) return false;
++      if (getClass() != obj.getClass()) return false;
++      TermsAndField other = (TermsAndField) obj;
++      if (field == null) {
++        if (other.field != null) return false;
++      } else if (!field.equals(other.field)) return false;
++      if (end != other.end) return false;
++      if (start != other.start) return false;
++      return true;
++    }
++
++  }
++
++  private static abstract class FieldAndTermEnum {
++    protected String field;
++
++    public abstract BytesRef next();
++
++    public FieldAndTermEnum() {}
++
++    public FieldAndTermEnum(String field) { this.field = field; }
++
++    public String field() {
++      return field;
++    }
++  }
++
++  /*
++   * simple utility that returns the in-place sorted list
++   */
++  private static <T extends Comparable<? super T>> List<T> sort(List<T> toSort) {
++    if (toSort.isEmpty()) {
++      throw new IllegalArgumentException("no terms provided");
++    }
++    Collections.sort(toSort);
++    return toSort;
++  }
++
++  @Override
++  public Weight createWeight(IndexSearcher searcher, boolean needsScores)
++      throws IOException {
++    return new Weight(this) {
++
++      private float queryNorm;
++      private float queryWeight;
++
++      @Override
++      public float getValueForNormalization() throws IOException {
++        queryWeight = getBoost();
++        return queryWeight * queryWeight;
++      }
++
++      @Override
++      public void normalize(float norm, float topLevelBoost) {
++        queryNorm = norm * topLevelBoost;
++        queryWeight *= queryNorm;
++      }
++
++      @Override
++      public Explanation explain(LeafReaderContext context, int doc) throws IOException {
++        final Scorer s = scorer(context, context.reader().getLiveDocs());
++        final boolean exists = (s != null && s.advance(doc) == doc);
++
++        final ComplexExplanation result = new ComplexExplanation();
++        if (exists) {
++          result.setDescription(TermsQuery.this.toString() + ", product of:");
++          result.setValue(queryWeight);
++          result.setMatch(Boolean.TRUE);
++          result.addDetail(new Explanation(getBoost(), "boost"));
++          result.addDetail(new Explanation(queryNorm, "queryNorm"));
++        } else {
++          result.setDescription(TermsQuery.this.toString() + " doesn't match id " + doc);
++          result.setValue(0);
++          result.setMatch(Boolean.FALSE);
++        }
++        return result;
++      }
++
++      @Override
++      public Scorer scorer(LeafReaderContext context, Bits acceptDocs) throws IOException {
++        final LeafReader reader = context.reader();
++        BitDocIdSet.Builder builder = new BitDocIdSet.Builder(reader.maxDoc());
++        final Fields fields = reader.fields();
++        final BytesRef spare = new BytesRef(termsBytes);
++        Terms terms = null;
++        TermsEnum termsEnum = null;
++        PostingsEnum docs = null;
++        for (TermsAndField termsAndField : termsAndFields) {
++          if ((terms = fields.terms(termsAndField.field)) != null) {
++            termsEnum = terms.iterator(termsEnum); // this won't return null
++            for (int i = termsAndField.start; i < termsAndField.end; i++) {
++              spare.offset = offsets[i];
++              spare.length = offsets[i+1] - offsets[i];
++              if (termsEnum.seekExact(spare)) {
++                docs = termsEnum.postings(acceptDocs, docs, PostingsEnum.NONE); // no freq since we don't need them
++                builder.or(docs);
++              }
++            }
++          }
++        }
++        BitDocIdSet result = builder.build();
++        if (result == null) {
++          return null;
++        }
++
++        final DocIdSetIterator disi = result.iterator();
++        return new Scorer(this) {
++
++          @Override
++          public float score() throws IOException {
++            return queryWeight;
++          }
++
++          @Override
++          public int freq() throws IOException {
++            return 1;
++          }
++
++          @Override
++          public int nextPosition() throws IOException {
++            return -1;
++          }
++
++          @Override
++          public int startOffset() throws IOException {
++            return -1;
++          }
++
++          @Override
++          public int endOffset() throws IOException {
++            return -1;
++          }
++
++          @Override
++          public BytesRef getPayload() throws IOException {
++            return null;
++          }
++
++          @Override
++          public int docID() {
++            return disi.docID();
++          }
++
++          @Override
++          public int nextDoc() throws IOException {
++            return disi.nextDoc();
++          }
++
++          @Override
++          public int advance(int target) throws IOException {
++            return disi.advance(target);
++          }
++
++          @Override
++          public long cost() {
++            return disi.cost();
++          }
++
++        };
++      }
++    };
++  }
++}
+diff --git a/lucene/queries/src/test/org/apache/lucene/queries/TermsFilterTest.java b/lucene/queries/src/test/org/apache/lucene/queries/TermsFilterTest.java
+deleted file mode 100644
+index c275233..0000000
+--- a/lucene/queries/src/test/org/apache/lucene/queries/TermsFilterTest.java
++++ /dev/null
+@@ -1,355 +0,0 @@
+-package org.apache.lucene.queries;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collection;
+-import java.util.Collections;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Set;
+-
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.Field;
+-import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.LeafReaderContext;
+-import org.apache.lucene.index.MultiReader;
+-import org.apache.lucene.index.RandomIndexWriter;
+-import org.apache.lucene.index.SlowCompositeReaderWrapper;
+-import org.apache.lucene.index.Term;
+-import org.apache.lucene.search.BooleanClause;
+-import org.apache.lucene.search.BooleanClause.Occur;
+-import org.apache.lucene.search.BooleanQuery;
+-import org.apache.lucene.search.ConstantScoreQuery;
+-import org.apache.lucene.search.DocIdSet;
+-import org.apache.lucene.search.Filter;
+-import org.apache.lucene.search.IndexSearcher;
+-import org.apache.lucene.search.MatchAllDocsQuery;
+-import org.apache.lucene.search.ScoreDoc;
+-import org.apache.lucene.search.TermQuery;
+-import org.apache.lucene.search.TopDocs;
+-import org.apache.lucene.store.Directory;
+-import org.apache.lucene.util.BitDocIdSet;
+-import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.util.LuceneTestCase;
+-import org.apache.lucene.util.RamUsageTester;
+-import org.apache.lucene.util.TestUtil;
+-
+-import com.carrotsearch.randomizedtesting.generators.RandomStrings;
+-
+-public class TermsFilterTest extends LuceneTestCase {
+-
+-  public void testCachability() throws Exception {
+-    TermsFilter a = termsFilter(random().nextBoolean(), new Term("field1", "a"), new Term("field1", "b"));
+-    HashSet<Filter> cachedFilters = new HashSet<>();
+-    cachedFilters.add(a);
+-    TermsFilter b = termsFilter(random().nextBoolean(), new Term("field1", "b"), new Term("field1", "a"));
+-    assertTrue("Must be cached", cachedFilters.contains(b));
+-    //duplicate term
+-    assertTrue("Must be cached", cachedFilters.contains(termsFilter(true, new Term("field1", "a"), new Term("field1", "a"), new Term("field1", "b"))));
+-    assertFalse("Must not be cached", cachedFilters.contains(termsFilter(random().nextBoolean(), new Term("field1", "a"), new Term("field1", "a"), new Term("field1", "b"),  new Term("field1", "v"))));
+-  }
+-
+-  public void testMissingTerms() throws Exception {
+-    String fieldName = "field1";
+-    Directory rd = newDirectory();
+-    RandomIndexWriter w = new RandomIndexWriter(random(), rd);
+-    for (int i = 0; i < 100; i++) {
+-      Document doc = new Document();
+-      int term = i * 10; //terms are units of 10;
+-      doc.add(newStringField(fieldName, "" + term, Field.Store.YES));
+-      w.addDocument(doc);
+-    }
+-    IndexReader reader = SlowCompositeReaderWrapper.wrap(w.getReader());
+-    assertTrue(reader.getContext() instanceof LeafReaderContext);
+-    LeafReaderContext context = (LeafReaderContext) reader.getContext();
+-    w.close();
+-
+-    List<Term> terms = new ArrayList<>();
+-    terms.add(new Term(fieldName, "19"));
+-    BitDocIdSet bits = (BitDocIdSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
+-    assertNull("Must match nothing", bits);
+-
+-    terms.add(new Term(fieldName, "20"));
+-    bits = (BitDocIdSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
+-    assertEquals("Must match 1", 1, bits.bits().cardinality());
+-
+-    terms.add(new Term(fieldName, "10"));
+-    bits = (BitDocIdSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
+-    assertEquals("Must match 2", 2, bits.bits().cardinality());
+-
+-    terms.add(new Term(fieldName, "00"));
+-    bits = (BitDocIdSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
+-    assertEquals("Must match 2", 2, bits.bits().cardinality());
+-
+-    reader.close();
+-    rd.close();
+-  }
+-  
+-  public void testMissingField() throws Exception {
+-    String fieldName = "field1";
+-    Directory rd1 = newDirectory();
+-    RandomIndexWriter w1 = new RandomIndexWriter(random(), rd1);
+-    Document doc = new Document();
+-    doc.add(newStringField(fieldName, "content1", Field.Store.YES));
+-    w1.addDocument(doc);
+-    IndexReader reader1 = w1.getReader();
+-    w1.close();
+-    
+-    fieldName = "field2";
+-    Directory rd2 = newDirectory();
+-    RandomIndexWriter w2 = new RandomIndexWriter(random(), rd2);
+-    doc = new Document();
+-    doc.add(newStringField(fieldName, "content2", Field.Store.YES));
+-    w2.addDocument(doc);
+-    IndexReader reader2 = w2.getReader();
+-    w2.close();
+-    
+-    TermsFilter tf = new TermsFilter(new Term(fieldName, "content1"));
+-    MultiReader multi = new MultiReader(reader1, reader2);
+-    for (LeafReaderContext context : multi.leaves()) {
+-      DocIdSet docIdSet = tf.getDocIdSet(context, context.reader().getLiveDocs());
+-      if (context.reader().docFreq(new Term(fieldName, "content1")) == 0) {
+-        assertNull(docIdSet);
+-      } else {
+-        BitDocIdSet bits = (BitDocIdSet) docIdSet;
+-        assertTrue("Must be >= 0", bits.bits().cardinality() >= 0);      
+-      }
+-    }
+-    multi.close();
+-    reader1.close();
+-    reader2.close();
+-    rd1.close();
+-    rd2.close();
+-  }
+-  
+-  public void testFieldNotPresent() throws IOException {
+-    Directory dir = newDirectory();
+-    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
+-    int num = atLeast(3);
+-    int skip = random().nextInt(num);
+-    List<Term> terms = new ArrayList<>();
+-    for (int i = 0; i < num; i++) {
+-      terms.add(new Term("field" + i, "content1"));
+-      Document doc = new Document();
+-      if (skip == i) {
+-        continue;
+-      }
+-      doc.add(newStringField("field" + i, "content1", Field.Store.YES));
+-      w.addDocument(doc);  
+-    }
+-    
+-    w.forceMerge(1);
+-    IndexReader reader = w.getReader();
+-    w.close();
+-    assertEquals(1, reader.leaves().size());
+-    
+-    
+-    
+-    LeafReaderContext context = reader.leaves().get(0);
+-    TermsFilter tf = new TermsFilter(terms);
+-
+-    BitDocIdSet bits = (BitDocIdSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
+-    assertEquals("Must be num fields - 1 since we skip only one field", num-1, bits.bits().cardinality());  
+-    reader.close();
+-    dir.close();
+-  }
+-  
+-  public void testSkipField() throws IOException {
+-    Directory dir = newDirectory();
+-    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
+-    int num = atLeast(10);
+-    Set<Term> terms = new HashSet<>();
+-    for (int i = 0; i < num; i++) {
+-      String field = "field" + random().nextInt(100);
+-      terms.add(new Term(field, "content1"));
+-      Document doc = new Document();
+-      doc.add(newStringField(field, "content1", Field.Store.YES));
+-      w.addDocument(doc);
+-    }
+-    int randomFields = random().nextInt(10);
+-    for (int i = 0; i < randomFields; i++) {
+-      while (true) {
+-        String field = "field" + random().nextInt(100);
+-        Term t = new Term(field, "content1");
+-        if (!terms.contains(t)) {
+-          terms.add(t);
+-          break;
+-        }
+-      }
+-    }
+-    w.forceMerge(1);
+-    IndexReader reader = w.getReader();
+-    w.close();
+-    assertEquals(1, reader.leaves().size());
+-    LeafReaderContext context = reader.leaves().get(0);
+-    TermsFilter tf = new TermsFilter(new ArrayList<>(terms));
+-
+-    BitDocIdSet bits = (BitDocIdSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
+-    assertEquals(context.reader().numDocs(), bits.bits().cardinality());  
+-    reader.close();
+-    dir.close();
+-  }
+-  
+-  public void testRandom() throws IOException {
+-    Directory dir = newDirectory();
+-    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
+-    int num = atLeast(100);
+-    final boolean singleField = random().nextBoolean();
+-    List<Term> terms = new ArrayList<>();
+-    for (int i = 0; i < num; i++) {
+-      String field = "field" + (singleField ? "1" : random().nextInt(100));
+-      String string = TestUtil.randomRealisticUnicodeString(random());
+-      terms.add(new Term(field, string));
+-      Document doc = new Document();
+-      doc.add(newStringField(field, string, Field.Store.YES));
+-      w.addDocument(doc);
+-    }
+-    IndexReader reader = w.getReader();
+-    w.close();
+-    
+-    IndexSearcher searcher = newSearcher(reader);
+-    
+-    int numQueries = atLeast(10);
+-    for (int i = 0; i < numQueries; i++) {
+-      Collections.shuffle(terms, random());
+-      int numTerms = 1 + random().nextInt(
+-          Math.min(BooleanQuery.getMaxClauseCount(), terms.size()));
+-      BooleanQuery bq = new BooleanQuery();
+-      for (int j = 0; j < numTerms; j++) {
+-        bq.add(new BooleanClause(new TermQuery(terms.get(j)), Occur.SHOULD));
+-      }
+-      TopDocs queryResult = searcher.search(new ConstantScoreQuery(bq), reader.maxDoc());
+-      
+-      MatchAllDocsQuery matchAll = new MatchAllDocsQuery();
+-      final TermsFilter filter = termsFilter(singleField, terms.subList(0, numTerms));;
+-      TopDocs filterResult = searcher.search(matchAll, filter, reader.maxDoc());
+-      assertEquals(filterResult.totalHits, queryResult.totalHits);
+-      ScoreDoc[] scoreDocs = filterResult.scoreDocs;
+-      for (int j = 0; j < scoreDocs.length; j++) {
+-        assertEquals(scoreDocs[j].doc, queryResult.scoreDocs[j].doc);
+-      }
+-    }
+-    
+-    reader.close();
+-    dir.close();
+-  }
+-  
+-  private TermsFilter termsFilter(boolean singleField, Term...terms) {
+-    return termsFilter(singleField, Arrays.asList(terms));
+-  }
+-
+-  private TermsFilter termsFilter(boolean singleField, Collection<Term> termList) {
+-    if (!singleField) {
+-      return new TermsFilter(new ArrayList<>(termList));
+-    }
+-    final TermsFilter filter;
+-    List<BytesRef> bytes = new ArrayList<>();
+-    String field = null;
+-    for (Term term : termList) {
+-        bytes.add(term.bytes());
+-        if (field != null) {
+-          assertEquals(term.field(), field);
+-        }
+-        field = term.field();
+-    }
+-    assertNotNull(field);
+-    filter = new TermsFilter(field, bytes);
+-    return filter;
+-  }
+-  
+-  public void testHashCodeAndEquals() {
+-    int num = atLeast(100);
+-    final boolean singleField = random().nextBoolean();
+-    List<Term> terms = new ArrayList<>();
+-    Set<Term> uniqueTerms = new HashSet<>();
+-    for (int i = 0; i < num; i++) {
+-      String field = "field" + (singleField ? "1" : random().nextInt(100));
+-      String string = TestUtil.randomRealisticUnicodeString(random());
+-      terms.add(new Term(field, string));
+-      uniqueTerms.add(new Term(field, string));
+-      TermsFilter left = termsFilter(singleField ? random().nextBoolean() : false, uniqueTerms);
+-      Collections.shuffle(terms, random());
+-      TermsFilter right = termsFilter(singleField ? random().nextBoolean() : false, terms);
+-      assertEquals(right, left);
+-      assertEquals(right.hashCode(), left.hashCode());
+-      if (uniqueTerms.size() > 1) {
+-        List<Term> asList = new ArrayList<>(uniqueTerms);
+-        asList.remove(0);
+-        TermsFilter notEqual = termsFilter(singleField ? random().nextBoolean() : false, asList);
+-        assertFalse(left.equals(notEqual));
+-        assertFalse(right.equals(notEqual));
+-      }
+-    }
+-  }
+-
+-  public void testSingleFieldEquals() {
+-    // Two terms with the same hash code
+-    assertEquals("AaAaBB".hashCode(), "BBBBBB".hashCode());
+-    TermsFilter left = termsFilter(true, new Term("id", "AaAaAa"), new Term("id", "AaAaBB"));
+-    TermsFilter right = termsFilter(true, new Term("id", "AaAaAa"), new Term("id", "BBBBBB"));
+-    assertFalse(left.equals(right));
+-  }
+-
+-  public void testNoTerms() {
+-    List<Term> emptyTerms = Collections.emptyList();
+-    List<BytesRef> emptyBytesRef = Collections.emptyList();
+-    try {
+-      new TermsFilter(emptyTerms);
+-      fail("must fail - no terms!");
+-    } catch (IllegalArgumentException e) {}
+-    
+-    try {
+-      new TermsFilter(emptyTerms.toArray(new Term[0]));
+-      fail("must fail - no terms!");
+-    } catch (IllegalArgumentException e) {}
+-    
+-    try {
+-      new TermsFilter(null, emptyBytesRef.toArray(new BytesRef[0]));
+-      fail("must fail - no terms!");
+-    } catch (IllegalArgumentException e) {}
+-    
+-    try {
+-      new TermsFilter(null, emptyBytesRef);
+-      fail("must fail - no terms!");
+-    } catch (IllegalArgumentException e) {}
+-  }
+-
+-  public void testToString() {
+-    TermsFilter termsFilter = new TermsFilter(new Term("field1", "a"),
+-                                              new Term("field1", "b"),
+-                                              new Term("field1", "c"));
+-    assertEquals("field1:a field1:b field1:c", termsFilter.toString());
+-  }
+-
+-  public void testRamBytesUsed() {
+-    List<Term> terms = new ArrayList<>();
+-    final int numTerms = 1000 + random().nextInt(1000);
+-    for (int i = 0; i < numTerms; ++i) {
+-      terms.add(new Term("f", RandomStrings.randomUnicodeOfLength(random(), 10)));
+-    }
+-    TermsFilter filter = new TermsFilter(terms);
+-    final long actualRamBytesUsed = RamUsageTester.sizeOf(filter);
+-    final long expectedRamBytesUsed = filter.ramBytesUsed();
+-    // error margin within 1%
+-    assertEquals(actualRamBytesUsed, expectedRamBytesUsed, actualRamBytesUsed / 100);
+-  }
+-
+-}
+diff --git a/lucene/queries/src/test/org/apache/lucene/queries/TermsQueryTest.java b/lucene/queries/src/test/org/apache/lucene/queries/TermsQueryTest.java
+new file mode 100644
+index 0000000..63f49de
+--- /dev/null
++++ b/lucene/queries/src/test/org/apache/lucene/queries/TermsQueryTest.java
+@@ -0,0 +1,216 @@
++package org.apache.lucene.queries;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field.Store;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.ConstantScoreQuery;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.Sort;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.RamUsageTester;
++import org.apache.lucene.util.TestUtil;
++
++import com.carrotsearch.randomizedtesting.generators.RandomStrings;
++
++public class TermsQueryTest extends LuceneTestCase {
++
++  public void testDuel() throws IOException {
++    final int iters = atLeast(2);
++    for (int iter = 0; iter < iters; ++iter) {
++      final List<Term> allTerms = new ArrayList<>();
++      final int numTerms = TestUtil.nextInt(random(), 1, 1 << TestUtil.nextInt(random(), 1, 10));
++      for (int i = 0; i < numTerms; ++i) {
++        final String field = usually() ? "f" : "g";
++        final String value = TestUtil.randomAnalysisString(random(), 10, true);
++        allTerms.add(new Term(field, value));
++      }
++      Directory dir = newDirectory();
++      RandomIndexWriter iw = new RandomIndexWriter(random(), dir);
++      final int numDocs = atLeast(100);
++      for (int i = 0; i < numDocs; ++i) {
++        Document doc = new Document();
++        final Term term = allTerms.get(random().nextInt(allTerms.size()));
++        doc.add(new StringField(term.field(), term.text(), Store.NO));
++        iw.addDocument(doc);
++      }
++      if (random().nextBoolean()) {
++        iw.deleteDocuments(new TermQuery(allTerms.get(0)));
++      }
++      iw.commit();
++      final IndexReader reader = iw.getReader();
++      final IndexSearcher searcher = newSearcher(reader);
++      iw.close();
++
++      for (int i = 0; i < 100; ++i) {
++        final float boost = random().nextFloat() * 10;
++        final int numQueryTerms = TestUtil.nextInt(random(), 1, 1 << TestUtil.nextInt(random(), 1, 8));
++        List<Term> queryTerms = new ArrayList<>();
++        for (int j = 0; j < numQueryTerms; ++j) {
++          queryTerms.add(allTerms.get(random().nextInt(allTerms.size())));
++        }
++        final BooleanQuery bq = new BooleanQuery();
++        for (Term t : queryTerms) {
++          bq.add(new TermQuery(t), Occur.SHOULD);
++        }
++        final Query q1 = new ConstantScoreQuery(bq);
++        q1.setBoost(boost);
++        final Query q2 = new TermsQuery(queryTerms);
++        q2.setBoost(boost);
++        assertSameMatches(searcher, q1, q2, true);
++      }
++
++      reader.close();
++      dir.close();
++    }
++  }
++
++  private void assertSameMatches(IndexSearcher searcher, Query q1, Query q2, boolean scores) throws IOException {
++    final int maxDoc = searcher.getIndexReader().maxDoc();
++    final TopDocs td1 = searcher.search(q1, maxDoc, scores ? Sort.RELEVANCE : Sort.INDEXORDER);
++    final TopDocs td2 = searcher.search(q2, maxDoc, scores ? Sort.RELEVANCE : Sort.INDEXORDER);
++    assertEquals(td1.totalHits, td2.totalHits);
++    for (int i = 0; i < td1.scoreDocs.length; ++i) {
++      assertEquals(td1.scoreDocs[i].doc, td2.scoreDocs[i].doc);
++      if (scores) {
++        assertEquals(td1.scoreDocs[i].score, td2.scoreDocs[i].score, 10e-7);
++      }
++    }
++  }
++
++  private TermsQuery termsQuery(boolean singleField, Term...terms) {
++    return termsQuery(singleField, Arrays.asList(terms));
++  }
++
++  private TermsQuery termsQuery(boolean singleField, Collection<Term> termList) {
++    if (!singleField) {
++      return new TermsQuery(new ArrayList<>(termList));
++    }
++    final TermsQuery filter;
++    List<BytesRef> bytes = new ArrayList<>();
++    String field = null;
++    for (Term term : termList) {
++        bytes.add(term.bytes());
++        if (field != null) {
++          assertEquals(term.field(), field);
++        }
++        field = term.field();
++    }
++    assertNotNull(field);
++    filter = new TermsQuery(field, bytes);
++    return filter;
++  }
++
++  public void testHashCodeAndEquals() {
++    int num = atLeast(100);
++    final boolean singleField = random().nextBoolean();
++    List<Term> terms = new ArrayList<>();
++    Set<Term> uniqueTerms = new HashSet<>();
++    for (int i = 0; i < num; i++) {
++      String field = "field" + (singleField ? "1" : random().nextInt(100));
++      String string = TestUtil.randomRealisticUnicodeString(random());
++      terms.add(new Term(field, string));
++      uniqueTerms.add(new Term(field, string));
++      TermsQuery left = termsQuery(singleField ? random().nextBoolean() : false, uniqueTerms);
++      Collections.shuffle(terms, random());
++      TermsQuery right = termsQuery(singleField ? random().nextBoolean() : false, terms);
++      assertEquals(right, left);
++      assertEquals(right.hashCode(), left.hashCode());
++      if (uniqueTerms.size() > 1) {
++        List<Term> asList = new ArrayList<>(uniqueTerms);
++        asList.remove(0);
++        TermsQuery notEqual = termsQuery(singleField ? random().nextBoolean() : false, asList);
++        assertFalse(left.equals(notEqual));
++        assertFalse(right.equals(notEqual));
++      }
++    }
++  }
++
++  public void testSingleFieldEquals() {
++    // Two terms with the same hash code
++    assertEquals("AaAaBB".hashCode(), "BBBBBB".hashCode());
++    TermsQuery left = termsQuery(true, new Term("id", "AaAaAa"), new Term("id", "AaAaBB"));
++    TermsQuery right = termsQuery(true, new Term("id", "AaAaAa"), new Term("id", "BBBBBB"));
++    assertFalse(left.equals(right));
++  }
++
++  public void testNoTerms() {
++    List<Term> emptyTerms = Collections.emptyList();
++    List<BytesRef> emptyBytesRef = Collections.emptyList();
++    try {
++      new TermsQuery(emptyTerms);
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++
++    try {
++      new TermsQuery(emptyTerms.toArray(new Term[0]));
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++
++    try {
++      new TermsQuery(null, emptyBytesRef.toArray(new BytesRef[0]));
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++
++    try {
++      new TermsQuery(null, emptyBytesRef);
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++  }
++
++  public void testToString() {
++    TermsQuery termsQuery = new TermsQuery(new Term("field1", "a"),
++                                              new Term("field1", "b"),
++                                              new Term("field1", "c"));
++    assertEquals("field1:a field1:b field1:c", termsQuery.toString());
++  }
++
++  public void testRamBytesUsed() {
++    List<Term> terms = new ArrayList<>();
++    final int numTerms = 1000 + random().nextInt(1000);
++    for (int i = 0; i < numTerms; ++i) {
++      terms.add(new Term("f", RandomStrings.randomUnicodeOfLength(random(), 10)));
++    }
++    TermsQuery query = new TermsQuery(terms);
++    final long actualRamBytesUsed = RamUsageTester.sizeOf(query);
++    final long expectedRamBytesUsed = query.ramBytesUsed();
++    // error margin within 1%
++    assertEquals(actualRamBytesUsed, expectedRamBytesUsed, actualRamBytesUsed / 100);
++  }
++
++}
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/CorePlusExtensionsParser.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/CorePlusExtensionsParser.java
+index ec53e14..b257f3f 100644
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/CorePlusExtensionsParser.java
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/CorePlusExtensionsParser.java
+@@ -49,7 +49,6 @@ public class CorePlusExtensionsParser extends CoreParser {
+ 
+   private CorePlusExtensionsParser(String defaultField, Analyzer analyzer, QueryParser parser) {
+     super(defaultField, analyzer, parser);
+-    filterFactory.addBuilder("TermsFilter", new TermsFilterBuilder(analyzer));
+     filterFactory.addBuilder("DuplicateFilter", new DuplicateFilterBuilder());
+     String fields[] = {"contents"};
+     queryFactory.addBuilder("LikeThisQuery", new LikeThisQueryBuilder(analyzer, fields));
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/BooleanQueryBuilder.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/BooleanQueryBuilder.java
+index d59508c..367faa0 100644
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/BooleanQueryBuilder.java
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/BooleanQueryBuilder.java
+@@ -68,24 +68,16 @@ public class BooleanQueryBuilder implements QueryBuilder {
+ 
+   static BooleanClause.Occur getOccursValue(Element clauseElem) throws ParserException {
+     String occs = clauseElem.getAttribute("occurs");
+-    BooleanClause.Occur occurs = BooleanClause.Occur.SHOULD;
+-    if ("must".equalsIgnoreCase(occs)) {
+-      occurs = BooleanClause.Occur.MUST;
+-    } else {
+-      if ("mustNot".equalsIgnoreCase(occs)) {
+-        occurs = BooleanClause.Occur.MUST_NOT;
+-      } else {
+-        if (("should".equalsIgnoreCase(occs)) || ("".equals(occs))) {
+-          occurs = BooleanClause.Occur.SHOULD;
+-        } else {
+-          if (occs != null) {
+-            throw new ParserException("Invalid value for \"occurs\" attribute of clause:" + occs);
+-          }
+-        }
+-      }
++    if (occs == null || "should".equalsIgnoreCase(occs)) {
++      return BooleanClause.Occur.SHOULD;
++    } else if ("must".equalsIgnoreCase(occs)) {
++      return BooleanClause.Occur.MUST;
++    } else if ("mustNot".equalsIgnoreCase(occs)) {
++      return BooleanClause.Occur.MUST_NOT;
++    } else if ("filter".equals(occs)) {
++      return BooleanClause.Occur.FILTER;
+     }
+-    return occurs;
+-
++    throw new ParserException("Invalid value for \"occurs\" attribute of clause:" + occs);
+   }
+ 
+ }
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/TermsFilterBuilder.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/TermsFilterBuilder.java
+deleted file mode 100644
+index 59f424d..0000000
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/TermsFilterBuilder.java
++++ /dev/null
+@@ -1,72 +0,0 @@
+-package org.apache.lucene.queryparser.xml.builders;
+-
+-import org.apache.lucene.analysis.Analyzer;
+-import org.apache.lucene.analysis.TokenStream;
+-import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
+-import org.apache.lucene.search.Filter;
+-import org.apache.lucene.queries.TermsFilter;
+-import org.apache.lucene.util.BytesRef;
+-import org.apache.lucene.queryparser.xml.DOMUtils;
+-import org.apache.lucene.queryparser.xml.FilterBuilder;
+-import org.apache.lucene.queryparser.xml.ParserException;
+-import org.w3c.dom.Element;
+-
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/**
+- * Builder for {@link TermsFilter}
+- */
+-public class TermsFilterBuilder implements FilterBuilder {
+-
+-  private final Analyzer analyzer;
+-
+-  public TermsFilterBuilder(Analyzer analyzer) {
+-    this.analyzer = analyzer;
+-  }
+-
+-  /*
+-    * (non-Javadoc)
+-    *
+-    * @see org.apache.lucene.xmlparser.FilterBuilder#process(org.w3c.dom.Element)
+-    */
+-  @Override
+-  public Filter getFilter(Element e) throws ParserException {
+-    List<BytesRef> terms = new ArrayList<>();
+-    String text = DOMUtils.getNonBlankTextOrFail(e);
+-    String fieldName = DOMUtils.getAttributeWithInheritanceOrFail(e, "fieldName");
+-
+-    try (TokenStream ts = analyzer.tokenStream(fieldName, text)) {
+-      TermToBytesRefAttribute termAtt = ts.addAttribute(TermToBytesRefAttribute.class);
+-      BytesRef bytes = termAtt.getBytesRef();
+-      ts.reset();
+-      while (ts.incrementToken()) {
+-        termAtt.fillBytesRef();
+-        terms.add(BytesRef.deepCopyOf(bytes));
+-      }
+-      ts.end();
+-    }
+-    catch (IOException ioe) {
+-      throw new RuntimeException("Error constructing terms from index:" + ioe);
+-    }
+-    return new TermsFilter(fieldName, terms);
+-  }
+-}
+diff --git a/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/TermsFilterQuery.xml b/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/TermsFilterQuery.xml
+deleted file mode 100644
+index 788de85..0000000
+--- a/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/TermsFilterQuery.xml
++++ /dev/null
+@@ -1,46 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<FilteredQuery>
+-	<Query>
+-		<BooleanQuery fieldName="contents">
+-			<Clause occurs="should">
+-				<TermQuery>merger</TermQuery>
+-			</Clause>
+-			<Clause occurs="must">
+-				<TermQuery>bank</TermQuery> 
+-			</Clause>
+-		</BooleanQuery>	
+-	</Query>
+-	<Filter>
+-		<!-- TermsFilter uses an analyzer to tokenize Field text and creates a filter for docs which 
+-			have ANY of the supplied terms. Unlike a RangeFilter this can be used for filtering on 
+-			multiple terms that are not necessarily in a sequence. An example might be a list of primary
+-			keys from a database query result or perhaps a choice of "category" labels picked by the end 
+-			user.
+-			As a filter, this is much faster than the equivalent query (a BooleanQuery with many 
+-			"should" TermQueries)
+-			
+-			This example might be just a list of Saturdays ie not a contiguous range of values
+-			which can be handled by rangefilter
+-		-->
+-		<TermsFilter fieldName="date">			
+-			19870601 19870608 19870615
+-		</TermsFilter> 
+-	</Filter>
+-	
+-</FilteredQuery>
+diff --git a/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/TestParser.java b/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/TestParser.java
+index bf1ad37..7eedefb 100644
+--- a/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/TestParser.java
++++ b/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/TestParser.java
+@@ -156,11 +156,6 @@ public class TestParser extends LuceneTestCase {
+     dumpResults("FuzzyLikeThis", q, 5);
+   }
+ 
+-  public void testTermsFilterXML() throws Exception {
+-    Query q = parse("TermsFilterQuery.xml");
+-    dumpResults("Terms Filter", q, 5);
+-  }
+-
+   public void testBoostingTermQueryXML() throws Exception {
+     Query q = parse("BoostingTermQuery.xml");
+     dumpResults("BoostingTermQuery", q, 5);
+diff --git a/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/albumFilteredQuery.xsl b/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/albumFilteredQuery.xsl
+index 28b7607..d3f8899 100644
+--- a/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/albumFilteredQuery.xsl
++++ b/lucene/queryparser/src/test/org/apache/lucene/queryparser/xml/albumFilteredQuery.xsl
+@@ -21,8 +21,6 @@
+ 	Other query fields are fed directly through an analyzer and so do not need to adhere to  
+ 	traditional Lucene query syntax. Terms within a field are ORed while different fields are ANDed
+  -->	
+-<FilteredQuery>
+-	<Query>
+ 		<BooleanQuery>
+ 			<xsl:if test="count(artist)>0">
+ 			    <Clause occurs="must">
+@@ -39,16 +37,11 @@
+ 			      <TermsQuery fieldName="releaseDate"><xsl:value-of select="releaseDate"/></TermsQuery>
+ 			   </Clause>
+ 		   </xsl:if>
++			<Clause occurs="filter">
++				<TermsQuery fieldName="genre">
++					<xsl:value-of select="genre"/>
++				</TermsQuery>
++			</Clause>
+ 	</BooleanQuery>
+-	</Query>
+-	<Filter>
+-		<CachedFilter>
+-			<!-- Example filter to be cached for fast, repeated use -->
+-			<TermsFilter fieldName="genre">			
+-				<xsl:value-of select="genre"/>
+-			</TermsFilter>
+-		</CachedFilter>		
+-	</Filter>	
+-</FilteredQuery>
+ </xsl:template>
+-</xsl:stylesheet>
+\ No newline at end of file
++</xsl:stylesheet>
+diff --git a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java
+index 46b06bb..0fc5750 100644
+--- a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java
++++ b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java
+@@ -17,11 +17,12 @@ package org.apache.lucene.spatial.prefix;
+  * limitations under the License.
+  */
+ 
+-import com.spatial4j.core.shape.Point;
+-import com.spatial4j.core.shape.Shape;
++import java.util.ArrayList;
++import java.util.List;
+ 
+-import org.apache.lucene.queries.TermsFilter;
++import org.apache.lucene.queries.TermsQuery;
+ import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.QueryWrapperFilter;
+ import org.apache.lucene.spatial.prefix.tree.Cell;
+ import org.apache.lucene.spatial.prefix.tree.CellIterator;
+ import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
+@@ -31,12 +32,12 @@ import org.apache.lucene.spatial.query.UnsupportedSpatialOperation;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefBuilder;
+ 
+-import java.util.ArrayList;
+-import java.util.List;
++import com.spatial4j.core.shape.Point;
++import com.spatial4j.core.shape.Shape;
+ 
+ /**
+  * A basic implementation of {@link PrefixTreeStrategy} using a large
+- * {@link TermsFilter} of all the cells from
++ * {@link TermsQuery} of all the cells from
+  * {@link SpatialPrefixTree#getTreeCellIterator(com.spatial4j.core.shape.Shape, int)}.
+  * It only supports the search of indexed Point shapes.
+  * <p>
+@@ -92,7 +93,7 @@ public class TermQueryPrefixTreeStrategy extends PrefixTreeStrategy {
+       byteRef.bytes = masterBytes.bytes();
+     }
+     //unfortunately TermsFilter will needlessly sort & dedupe
+-    return new TermsFilter(getFieldName(), terms);
++    return new QueryWrapperFilter(new TermsQuery(getFieldName(), terms));
+   }
+ 
+ }
+diff --git a/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/NumberRangeFacetsTest.java b/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/NumberRangeFacetsTest.java
+index 83e0528..a2b1ab3 100644
+--- a/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/NumberRangeFacetsTest.java
++++ b/lucene/spatial/src/test/org/apache/lucene/spatial/prefix/NumberRangeFacetsTest.java
+@@ -17,17 +17,19 @@ package org.apache.lucene.spatial.prefix;
+  * limitations under the License.
+  */
+ 
++import static com.carrotsearch.randomizedtesting.RandomizedTest.randomInt;
++import static com.carrotsearch.randomizedtesting.RandomizedTest.randomIntBetween;
++
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Calendar;
+ import java.util.Collections;
+ import java.util.List;
+ 
+-import com.carrotsearch.randomizedtesting.annotations.Repeat;
+-import com.spatial4j.core.shape.Shape;
+ import org.apache.lucene.index.Term;
+-import org.apache.lucene.queries.TermsFilter;
++import org.apache.lucene.queries.TermsQuery;
+ import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.QueryWrapperFilter;
+ import org.apache.lucene.spatial.StrategyTestCase;
+ import org.apache.lucene.spatial.prefix.NumberRangePrefixTreeStrategy.Facets;
+ import org.apache.lucene.spatial.prefix.tree.Cell;
+@@ -38,8 +40,8 @@ import org.apache.lucene.spatial.prefix.tree.NumberRangePrefixTree.UnitNRShape;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+-import static com.carrotsearch.randomizedtesting.RandomizedTest.randomInt;
+-import static com.carrotsearch.randomizedtesting.RandomizedTest.randomIntBetween;
++import com.carrotsearch.randomizedtesting.annotations.Repeat;
++import com.spatial4j.core.shape.Shape;
+ 
+ public class NumberRangeFacetsTest extends StrategyTestCase {
+ 
+@@ -128,7 +130,7 @@ public class NumberRangeFacetsTest extends StrategyTestCase {
+           for (Integer acceptDocId : acceptFieldIds) {
+             terms.add(new Term("id", acceptDocId.toString()));
+           }
+-          filter = new TermsFilter(terms);
++          filter = new QueryWrapperFilter(new TermsQuery(terms));
+         }
+       }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/ExpandComponent.java b/solr/core/src/java/org/apache/solr/handler/component/ExpandComponent.java
+index cf17fd9..69ae5f9 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/ExpandComponent.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/ExpandComponent.java
+@@ -27,15 +27,6 @@ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ 
+-import com.carrotsearch.hppc.IntObjectOpenHashMap;
+-import com.carrotsearch.hppc.IntOpenHashSet;
+-import com.carrotsearch.hppc.LongObjectMap;
+-import com.carrotsearch.hppc.LongObjectOpenHashMap;
+-import com.carrotsearch.hppc.LongOpenHashSet;
+-import com.carrotsearch.hppc.cursors.IntObjectCursor;
+-import com.carrotsearch.hppc.cursors.LongCursor;
+-import com.carrotsearch.hppc.cursors.LongObjectCursor;
+-import com.carrotsearch.hppc.cursors.ObjectCursor;
+ import org.apache.lucene.index.DocValues;
+ import org.apache.lucene.index.DocValuesType;
+ import org.apache.lucene.index.FieldInfo;
+@@ -46,11 +37,12 @@ import org.apache.lucene.index.LeafReaderContext;
+ import org.apache.lucene.index.MultiDocValues;
+ import org.apache.lucene.index.NumericDocValues;
+ import org.apache.lucene.index.SortedDocValues;
+-import org.apache.lucene.queries.TermsFilter;
++import org.apache.lucene.queries.TermsQuery;
+ import org.apache.lucene.search.Collector;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.LeafCollector;
+ import org.apache.lucene.search.Query;
++import org.apache.lucene.search.QueryWrapperFilter;
+ import org.apache.lucene.search.ScoreDoc;
+ import org.apache.lucene.search.Scorer;
+ import org.apache.lucene.search.Sort;
+@@ -89,6 +81,16 @@ import org.apache.solr.search.SolrIndexSearcher;
+ import org.apache.solr.util.plugin.PluginInfoInitialized;
+ import org.apache.solr.util.plugin.SolrCoreAware;
+ 
++import com.carrotsearch.hppc.IntObjectOpenHashMap;
++import com.carrotsearch.hppc.IntOpenHashSet;
++import com.carrotsearch.hppc.LongObjectMap;
++import com.carrotsearch.hppc.LongObjectOpenHashMap;
++import com.carrotsearch.hppc.LongOpenHashSet;
++import com.carrotsearch.hppc.cursors.IntObjectCursor;
++import com.carrotsearch.hppc.cursors.LongCursor;
++import com.carrotsearch.hppc.cursors.LongObjectCursor;
++import com.carrotsearch.hppc.cursors.ObjectCursor;
++
+ /**
+  * The ExpandComponent is designed to work with the CollapsingPostFilter.
+  * The CollapsingPostFilter collapses a result set on a field.
+@@ -658,7 +660,7 @@ public class ExpandComponent extends SearchComponent implements PluginInfoInitia
+       bytesRefs[++index] = term.toBytesRef();
+     }
+ 
+-    return new SolrConstantScoreQuery(new TermsFilter(fname, bytesRefs));
++    return new SolrConstantScoreQuery(new QueryWrapperFilter(new TermsQuery(fname, bytesRefs)));
+   }
+ 
+   private Query getGroupQuery(String fname,
+@@ -672,7 +674,7 @@ public class ExpandComponent extends SearchComponent implements PluginInfoInitia
+       IntObjectCursor<BytesRef> cursor = it.next();
+       bytesRefs[++index] = cursor.value;
+     }
+-    return new SolrConstantScoreQuery(new TermsFilter(fname, bytesRefs));
++    return new SolrConstantScoreQuery(new QueryWrapperFilter(new TermsQuery(fname, bytesRefs)));
+   }
+ 
+ 
+diff --git a/solr/core/src/java/org/apache/solr/search/TermsQParserPlugin.java b/solr/core/src/java/org/apache/solr/search/TermsQParserPlugin.java
+index 73ab4e6..2b88d60 100644
+--- a/solr/core/src/java/org/apache/solr/search/TermsQParserPlugin.java
++++ b/solr/core/src/java/org/apache/solr/search/TermsQParserPlugin.java
+@@ -17,8 +17,11 @@ package org.apache.solr.search;
+  * limitations under the License.
+  */
+ 
++import java.util.Arrays;
++import java.util.regex.Pattern;
++
+ import org.apache.lucene.index.Term;
+-import org.apache.lucene.queries.TermsFilter;
++import org.apache.lucene.queries.TermsQuery;
+ import org.apache.lucene.search.AutomatonQuery;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
+@@ -37,9 +40,6 @@ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.request.SolrQueryRequest;
+ import org.apache.solr.schema.FieldType;
+ 
+-import java.util.Arrays;
+-import java.util.regex.Pattern;
+-
+ /**
+  * Finds documents whose specified field has any of the specified values. It's like
+  * {@link TermQParserPlugin} but multi-valued, and supports a variety of internal algorithms.
+@@ -68,7 +68,7 @@ public class TermsQParserPlugin extends QParserPlugin {
+     termsFilter {
+       @Override
+       Filter makeFilter(String fname, BytesRef[] bytesRefs) {
+-        return new TermsFilter(fname, bytesRefs);
++        return new QueryWrapperFilter(new TermsQuery(fname, bytesRefs));
+       }
+     },
+     booleanQuery {
+

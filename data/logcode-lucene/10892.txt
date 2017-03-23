@@ -1,0 +1,3218 @@
+GitDiffStart: f2f91bae46cbc4a883324521767e4701fbbbc14a | Fri Sep 28 22:31:23 2012 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index fbce028..61632f6 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -28,6 +28,15 @@ New Features
+   output for a single input.  UpToTwoPositiveIntsOutputs was moved
+   from lucene/core to lucene/misc.  (Mike McCandless)
+ 
++* LUCENE-3842: New AnalyzingCompletionLookup, for doing auto-suggest
++  using an analyzer.  This can create powerful suggesters: if the analyzer
++  remove stop words then "ghost chr..." could suggest "The Ghost of
++  Christmas Past"; if SynonymFilter is used to map wifi and wireless
++  network to hotspot, then "wirele..." could suggest "wifi router";
++  token normalization likes stemmers, accent removel, etc. would allow
++  the suggester to ignore such variations. (Robert Muir, Sudarshan
++  Gaikaiwari, Mike McCandless)
++
+ Bug Fixes
+ 
+ * LUCENE-4411: when sampling is enabled for a FacetRequest, its depth
+diff --git a/lucene/core/src/java/org/apache/lucene/analysis/TokenStreamToAutomaton.java b/lucene/core/src/java/org/apache/lucene/analysis/TokenStreamToAutomaton.java
+new file mode 100644
+index 0000000..55fcbc4
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/analysis/TokenStreamToAutomaton.java
+@@ -0,0 +1,207 @@
++package org.apache.lucene.analysis;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStreamWriter;
++import java.io.Writer;
++
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.RollingBuffer;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.State;
++import org.apache.lucene.util.automaton.Transition;
++
++// TODO: maybe also toFST?  then we can translate atts into FST outputs/weights
++
++/** Consumes a TokenStream and creates an {@link Automaton}
++ *  where the transition labels are UTF8 bytes from the {@link
++ *  TermToBytesRefAttribute}.  Between tokens we insert
++ *  POS_SEP and for holes we insert HOLE.  */
++public class TokenStreamToAutomaton {
++
++  /** Sole constructor. */
++  public TokenStreamToAutomaton() {
++  }
++
++  private static class Position implements RollingBuffer.Resettable {
++    // Any tokens that ended at our position arrive to this state:
++    State arriving;
++
++    // Any tokens that start at our position leave from this state:
++    State leaving;
++
++    @Override
++    public void reset() {
++      arriving = null;
++      leaving = null;
++    }
++  }
++
++  private static class Positions extends RollingBuffer<Position> {
++    @Override
++    protected Position newInstance() {
++      return new Position();
++    }
++  }
++
++  /** Subclass & implement this if you need to change the
++   *  token (such as escaping certain bytes) before it's
++   *  turned into a graph. */ 
++  protected BytesRef changeToken(BytesRef in) {
++    return in;
++  }
++
++  /** We create transition between two adjacent tokens. */
++  public static final int POS_SEP = 256;
++
++  /** We add this arc to represent a hole. */
++  public static final int HOLE = 257;
++
++  /** Pulls the graph (including {@link
++   *  PositionLengthAttribute}) from the provided {@link
++   *  TokenStream}, and creates the corresponding
++   *  automaton where arcs are bytes from each term. */
++  public Automaton toAutomaton(TokenStream in) throws IOException {
++    final Automaton a = new Automaton();
++
++    final TermToBytesRefAttribute termBytesAtt = in.addAttribute(TermToBytesRefAttribute.class);
++    final PositionIncrementAttribute posIncAtt = in.addAttribute(PositionIncrementAttribute.class);
++    final PositionLengthAttribute posLengthAtt = in.addAttribute(PositionLengthAttribute.class);
++    final BytesRef term = termBytesAtt.getBytesRef();
++
++    in.reset();
++
++    // Only temporarily holds states ahead of our current
++    // position:
++
++    final RollingBuffer<Position> positions = new Positions();
++
++    int pos = -1;
++    Position posData = null;
++
++    while (in.incrementToken()) {
++      int posInc = posIncAtt.getPositionIncrement();
++      assert pos > -1 || posInc > 0;
++
++      if (posInc > 0) {
++
++        // New node:
++        pos += posInc;
++
++        posData = positions.get(pos);
++        assert posData.leaving == null;
++
++        if (posData.arriving == null) {
++          // No token ever arrived to this position
++          if (pos == 0) {
++            // OK: this is the first token
++            posData.leaving = a.getInitialState();
++          } else {
++            // This means there's a hole (eg, StopFilter
++            // does this):
++            posData.leaving = new State();
++            addHoles(a.getInitialState(), positions, pos);
++          }
++        } else {
++          posData.leaving = new State();
++          posData.arriving.addTransition(new Transition(POS_SEP, posData.leaving));
++          if (posInc > 1) {
++            // A token spanned over a hole; add holes
++            // "under" it:
++            addHoles(a.getInitialState(), positions, pos);
++          }
++        }
++        positions.freeBefore(pos);
++      }
++
++      final int endPos = pos + posLengthAtt.getPositionLength();
++
++      termBytesAtt.fillBytesRef();
++      final BytesRef term2 = changeToken(term);
++      final Position endPosData = positions.get(endPos);
++      if (endPosData.arriving == null) {
++        endPosData.arriving = new State();
++      }
++
++      State state = posData.leaving;
++      for(int byteIDX=0;byteIDX<term2.length;byteIDX++) {
++        final State nextState = byteIDX == term2.length-1 ? endPosData.arriving : new State();
++        state.addTransition(new Transition(term2.bytes[term2.offset + byteIDX] & 0xff, nextState));
++        state = nextState;
++      }
++    }
++
++    pos++;
++    while (pos <= positions.getMaxPos()) {
++      posData = positions.get(pos);
++      if (posData.arriving != null) {
++        posData.arriving.setAccept(true);
++      }
++      pos++;
++    }
++
++    //toDot(a);
++
++    return a;
++  }
++
++  // for debugging!
++  /*
++  private static void toDot(Automaton a) throws IOException {
++    final String s = a.toDot();
++    Writer w = new OutputStreamWriter(new FileOutputStream("/tmp/out.dot"));
++    w.write(s);
++    w.close();
++    System.out.println("TEST: saved to /tmp/out.dot");
++  }
++  */
++
++  private static void addHoles(State startState, RollingBuffer<Position> positions, int pos) {
++    Position posData = positions.get(pos);
++    Position prevPosData = positions.get(pos-1);
++
++    while(posData.arriving == null || prevPosData.leaving == null) {
++      if (posData.arriving == null) {
++        posData.arriving = new State();
++        posData.arriving.addTransition(new Transition(POS_SEP, posData.leaving));
++      }
++      if (prevPosData.leaving == null) {
++        if (pos == 1) {
++          prevPosData.leaving = startState;
++        } else {
++          prevPosData.leaving = new State();
++        }
++        if (prevPosData.arriving != null) {
++          prevPosData.arriving.addTransition(new Transition(POS_SEP, prevPosData.leaving));
++        }
++      }
++      prevPosData.leaving.addTransition(new Transition(HOLE, posData.arriving));
++      pos--;
++      if (pos <= 0) {
++        break;
++      }
++      posData = prevPosData;
++      prevPosData = positions.get(pos-1);
++    }
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/RollingBuffer.java b/lucene/core/src/java/org/apache/lucene/util/RollingBuffer.java
+new file mode 100644
+index 0000000..d31bb4c
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/RollingBuffer.java
+@@ -0,0 +1,139 @@
++package org.apache.lucene.util;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// TODO: probably move this to core at some point (eg,
++// cutover kuromoji, synfilter, LookaheadTokenFilter)
++
++/** Acts like forever growing T[], but internally uses a
++ *  circular buffer to reuse instances of T.
++ * 
++ *  @lucene.internal */
++public abstract class RollingBuffer<T extends RollingBuffer.Resettable> {
++
++  /**
++   * Implement to reset an instance
++   */
++  public static interface Resettable {
++    public void reset();
++  }
++
++  @SuppressWarnings("unchecked") private T[] buffer = (T[]) new RollingBuffer.Resettable[8];
++
++  // Next array index to write to:
++  private int nextWrite;
++
++  // Next position to write:
++  private int nextPos;
++
++  // How many valid Position are held in the
++  // array:
++  private int count;
++
++  public RollingBuffer() {
++    for(int idx=0;idx<buffer.length;idx++) {
++      buffer[idx] = newInstance();
++    }
++  }
++
++  protected abstract T newInstance();
++
++  public void reset() {
++    nextWrite--;
++    while (count > 0) {
++      if (nextWrite == -1) {
++        nextWrite = buffer.length - 1;
++      }
++      buffer[nextWrite--].reset();
++      count--;
++    }
++    nextWrite = 0;
++    nextPos = 0;
++    count = 0;
++  }
++
++  // For assert:
++  private boolean inBounds(int pos) {
++    return pos < nextPos && pos >= nextPos - count;
++  }
++
++  private int getIndex(int pos) {
++    int index = nextWrite - (nextPos - pos);
++    if (index < 0) {
++      index += buffer.length;
++    }
++    return index;
++  }
++
++  /** Get T instance for this absolute position;
++   *  this is allowed to be arbitrarily far "in the
++   *  future" but cannot be before the last freeBefore. */
++  public T get(int pos) {
++    //System.out.println("RA.get pos=" + pos + " nextPos=" + nextPos + " nextWrite=" + nextWrite + " count=" + count);
++    while (pos >= nextPos) {
++      if (count == buffer.length) {
++        @SuppressWarnings("unchecked") T[] newBuffer = (T[]) new Resettable[ArrayUtil.oversize(1+count, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
++        //System.out.println("  grow length=" + newBuffer.length);
++        System.arraycopy(buffer, nextWrite, newBuffer, 0, buffer.length-nextWrite);
++        System.arraycopy(buffer, 0, newBuffer, buffer.length-nextWrite, nextWrite);
++        for(int i=buffer.length;i<newBuffer.length;i++) {
++          newBuffer[i] = newInstance();
++        }
++        nextWrite = buffer.length;
++        buffer = newBuffer;
++      }
++      if (nextWrite == buffer.length) {
++        nextWrite = 0;
++      }
++      // Should have already been reset:
++      nextWrite++;
++      nextPos++;
++      count++;
++    }
++    assert inBounds(pos);
++    final int index = getIndex(pos);
++    //System.out.println("  pos=" + pos + " nextPos=" + nextPos + " -> index=" + index);
++    //assert buffer[index].pos == pos;
++    return buffer[index];
++  }
++
++  /** Returns the maximum position looked up, or -1 if no
++  *  position has been looked up sinc reset/init.  */
++  public int getMaxPos() {
++    return nextPos-1;
++  }
++
++  public void freeBefore(int pos) {
++    final int toFree = count - (nextPos - pos);
++    assert toFree >= 0;
++    assert toFree <= count: "toFree=" + toFree + " count=" + count;
++    int index = nextWrite - count;
++    if (index < 0) {
++      index += buffer.length;
++    }
++    for(int i=0;i<toFree;i++) {
++      if (index == buffer.length) {
++        index = 0;
++      }
++      //System.out.println("  fb idx=" + index);
++      buffer[index].reset();
++      index++;
++    }
++    count -= toFree;
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/SpecialOperations.java b/lucene/core/src/java/org/apache/lucene/util/automaton/SpecialOperations.java
+index d400b91..0e6adf6 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/SpecialOperations.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/SpecialOperations.java
+@@ -35,6 +35,8 @@ import java.util.HashSet;
+ import java.util.Set;
+ 
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.IntsRef;
++import org.apache.lucene.util.fst.Util;
+ 
+ /**
+  * Special automata operations.
+@@ -209,4 +211,60 @@ final public class SpecialOperations {
+     a.clearNumberedStates();
+     return accept;
+   }
++
++  // TODO: this is a dangerous method ... Automaton could be
++  // huge ... and it's better in general for caller to
++  // enumerate & process in a single walk:
++
++  /**
++   * Returns the set of accepted strings, assuming that at most
++   * <code>limit</code> strings are accepted. If more than <code>limit</code> 
++   * strings are accepted, null is returned. If <code>limit</code>&lt;0, then 
++   * the limit is infinite.
++   */
++  public static Set<IntsRef> getFiniteStrings(Automaton a, int limit) {
++    HashSet<IntsRef> strings = new HashSet<IntsRef>();
++    if (a.isSingleton()) {
++      if (limit > 0) {
++        strings.add(Util.toUTF32(a.singleton, new IntsRef()));
++      } else {
++        return null;
++      }
++    } else if (!getFiniteStrings(a.initial, new HashSet<State>(), strings, new IntsRef(), limit)) {
++      return null;
++    }
++    return strings;
++  }
++  
++  /**
++   * Returns the strings that can be produced from the given state, or
++   * false if more than <code>limit</code> strings are found. 
++   * <code>limit</code>&lt;0 means "infinite".
++   */
++  private static boolean getFiniteStrings(State s, HashSet<State> pathstates, 
++      HashSet<IntsRef> strings, IntsRef path, int limit) {
++    pathstates.add(s);
++    for (Transition t : s.getTransitions()) {
++      if (pathstates.contains(t.to)) {
++        return false;
++      }
++      for (int n = t.min; n <= t.max; n++) {
++        path.grow(path.length+1);
++        path.ints[path.length] = n;
++        path.length++;
++        if (t.to.accept) {
++          strings.add(IntsRef.deepCopyOf(path));
++          if (limit >= 0 && strings.size() > limit) {
++            return false;
++          }
++        }
++        if (!getFiniteStrings(t.to, pathstates, strings, path, limit)) {
++          return false;
++        }
++        path.length--;
++      }
++    }
++    pathstates.remove(s);
++    return true;
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/automaton/State.java b/lucene/core/src/java/org/apache/lucene/util/automaton/State.java
+index 486452f..73e8a92 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/automaton/State.java
++++ b/lucene/core/src/java/org/apache/lucene/util/automaton/State.java
+@@ -62,7 +62,7 @@ public class State implements Comparable<State> {
+   /**
+    * Resets transition set.
+    */
+-  final void resetTransitions() {
++  public final void resetTransitions() {
+     transitionsArray = new Transition[0];
+     numTransitions = 0;
+   }
+@@ -165,7 +165,11 @@ public class State implements Comparable<State> {
+     }
+   }
+   
+-  void addEpsilon(State to) {
++  /** Virtually adds an epsilon transition to the target
++   *  {@code to} state.  This is implemented by copying all
++   *  transitions from {@code to} to this state, and if {@code
++   *  to} is an accept state then set accept for this state. */
++  public void addEpsilon(State to) {
+     if (to.accept) accept = true;
+     for (Transition t : to.getTransitions())
+       addTransition(t);
+diff --git a/lucene/core/src/java/org/apache/lucene/util/fst/PositiveIntOutputs.java b/lucene/core/src/java/org/apache/lucene/util/fst/PositiveIntOutputs.java
+index fec7f0c..2460f25 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/fst/PositiveIntOutputs.java
++++ b/lucene/core/src/java/org/apache/lucene/util/fst/PositiveIntOutputs.java
+@@ -118,7 +118,7 @@ public final class PositiveIntOutputs extends Outputs<Long> {
+ 
+   private boolean valid(Long o) {
+     assert o != null;
+-    assert o == NO_OUTPUT || o > 0;
++    assert o == NO_OUTPUT || o > 0: "o=" + o;
+     return true;
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/fst/Util.java b/lucene/core/src/java/org/apache/lucene/util/fst/Util.java
+index 3d7439d..e7df2d8 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/fst/Util.java
++++ b/lucene/core/src/java/org/apache/lucene/util/fst/Util.java
+@@ -233,13 +233,14 @@ public final class Util {
+   private static class FSTPath<T> implements Comparable<FSTPath<T>> {
+     public FST.Arc<T> arc;
+     public T cost;
+-    public final IntsRef input = new IntsRef();
++    public final IntsRef input;
+     final Comparator<T> comparator;
+ 
+-    public FSTPath(T cost, FST.Arc<T> arc, Comparator<T> comparator) {
++    public FSTPath(T cost, FST.Arc<T> arc, Comparator<T> comparator, IntsRef input) {
+       this.arc = new FST.Arc<T>().copyFrom(arc);
+       this.cost = cost;
+       this.comparator = comparator;
++      this.input = input;
+     }
+ 
+     @Override
+@@ -258,11 +259,15 @@ public final class Util {
+     }
+   }
+ 
+-  private static class TopNSearcher<T> {
++  /** Utility class to find top N shortest paths from start
++   *  point(s). */
++  public static class TopNSearcher<T> {
+ 
+     private final FST<T> fst;
+-    private final FST.Arc<T> fromNode;
++    private final FST.BytesReader bytesReader;
+     private final int topN;
++
++    private final FST.Arc<T> scratchArc = new FST.Arc<T>();
+     
+     final Comparator<T> comparator;
+ 
+@@ -271,11 +276,13 @@ public final class Util {
+ 
+     TreeSet<FSTPath<T>> queue = null;
+ 
+-    public TopNSearcher(FST<T> fst, FST.Arc<T> fromNode, int topN, Comparator<T> comparator) {
++    public TopNSearcher(FST<T> fst, int topN, Comparator<T> comparator) {
+       this.fst = fst;
++      this.bytesReader = fst.getBytesReader(0);
+       this.topN = topN;
+-      this.fromNode = fromNode;
+       this.comparator = comparator;
++
++      queue = new TreeSet<FSTPath<T>>();
+     }
+ 
+     // If back plus this arc is competitive then add to queue:
+@@ -308,12 +315,19 @@ public final class Util {
+         // Queue isn't full yet, so any path we hit competes:
+       }
+ 
+-      final FSTPath<T> newPath = new FSTPath<T>(cost, path.arc, comparator);
++      // copy over the current input to the new input
++      // and add the arc.label to the end
++      IntsRef newInput = new IntsRef(path.input.length+1);     
++      System.arraycopy(path.input.ints, 0, newInput.ints, 0, path.input.length);
++      newInput.ints[path.input.length] = path.arc.label;
++      newInput.length = path.input.length+1;
++      final FSTPath<T> newPath = new FSTPath<T>(cost, path.arc, comparator, newInput);
+ 
+-      newPath.input.grow(path.input.length+1);
+-      System.arraycopy(path.input.ints, 0, newPath.input.ints, 0, path.input.length);
+-      newPath.input.ints[path.input.length] = path.arc.label;
+-      newPath.input.length = path.input.length+1;
++      // this is pointless right?  we do it above already:
++      //newPath.input.grow(path.input.length+1);
++      //System.arraycopy(path.input.ints, 0, newPath.input.ints, 0, path.input.length);
++      //newPath.input.ints[path.input.length] = path.arc.label;
++      //newPath.input.length = path.input.length+1;
+ 
+       //System.out.println("    add path=" + newPath);
+       queue.add(newPath);
+@@ -329,12 +343,38 @@ public final class Util {
+       }
+     }
+ 
++    /** Adds all leaving arcs, including 'finished' arc, if
++     *  the node is final, from this node into the queue.  */
++    public void addStartPaths(FST.Arc<T> node, T startOutput, boolean allowEmptyString, IntsRef input) throws IOException {
++
++      // De-dup NO_OUTPUT since it must be a singleton:
++      if (startOutput.equals(fst.outputs.getNoOutput())) {
++        startOutput = fst.outputs.getNoOutput();
++      }
++
++      FSTPath<T> path = new FSTPath<T>(startOutput, node, comparator, input);
++      fst.readFirstTargetArc(node, path.arc, bytesReader);
++
++      //System.out.println("add start paths");
++
++      // Bootstrap: find the min starting arc
++      while (true) {
++        if (allowEmptyString || path.arc.label != FST.END_LABEL) {
++          addIfCompetitive(path);
++        }
++        if (path.arc.isLast()) {
++          break;
++        }
++        fst.readNextArc(path.arc, bytesReader);
++      }
++    }
++
+     public MinResult<T>[] search() throws IOException {
+-      //System.out.println("  search topN=" + topN);
+-      final FST.Arc<T> scratchArc = new FST.Arc<T>();
+ 
+       final List<MinResult<T>> results = new ArrayList<MinResult<T>>();
+ 
++      //System.out.println("search topN=" + topN);
++
+       final FST.BytesReader fstReader = fst.getBytesReader(0);
+       final T NO_OUTPUT = fst.outputs.getNoOutput();
+ 
+@@ -352,69 +392,21 @@ public final class Util {
+         FSTPath<T> path;
+ 
+         if (queue == null) {
++          // Ran out of paths
++          break;
++        }
+ 
+-          if (results.size() != 0) {
+-            // Ran out of paths
+-            break;
+-          }
+-
+-          // First pass (top path): start from original fromNode
+-          if (topN > 1) {
+-            queue = new TreeSet<FSTPath<T>>();
+-          }
+-
+-          T minArcCost = null;
+-          FST.Arc<T> minArc = null;
+-
+-          path = new FSTPath<T>(NO_OUTPUT, fromNode, comparator);
+-          fst.readFirstTargetArc(fromNode, path.arc, fstReader);
+-
+-          // Bootstrap: find the min starting arc
+-          while (true) {
+-            T arcScore = path.arc.output;
+-            //System.out.println("  arc=" + (char) path.arc.label + " cost=" + arcScore);
+-            if (minArcCost == null || comparator.compare(arcScore, minArcCost) < 0) {
+-              minArcCost = arcScore;
+-              minArc = scratchArc.copyFrom(path.arc);
+-              //System.out.println("    **");
+-            }
+-            if (queue != null) {
+-              addIfCompetitive(path);
+-            }
+-            if (path.arc.isLast()) {
+-              break;
+-            }
+-            fst.readNextArc(path.arc, fstReader);
+-          }
+-
+-          assert minArc != null;
+-
+-          if (queue != null) {
+-            // Remove top path since we are now going to
+-            // pursue it:
+-            path = queue.pollFirst();
+-            //System.out.println("  remove init path=" + path);
+-            assert path.arc.label == minArc.label;
+-            if (bottom != null && queue.size() == topN-1) {
+-              bottom = queue.last();
+-              //System.out.println("    set init bottom: " + bottom);
+-            }
+-          } else {
+-            path.arc.copyFrom(minArc);
+-            path.input.grow(1);
+-            path.input.ints[0] = minArc.label;
+-            path.input.length = 1;
+-            path.cost = minArc.output;
+-          }
++        // Remove top path since we are now going to
++        // pursue it:
++        path = queue.pollFirst();
+ 
+-        } else {
+-          path = queue.pollFirst();
+-          if (path == null) {
+-            // There were less than topN paths available:
+-            break;
+-          }
++        if (path == null) {
++          // There were less than topN paths available:
++          break;
+         }
+ 
++        //System.out.println("  remove init path=" + path);
++
+         if (path.arc.label == FST.END_LABEL) {
+           //System.out.println("    empty string!  cost=" + path.cost);
+           // Empty string!
+@@ -480,7 +472,10 @@ public final class Util {
+           if (path.arc.label == FST.END_LABEL) {
+             // Add final output:
+             //System.out.println("    done!: " + path);
+-            results.add(new MinResult<T>(path.input, fst.outputs.add(path.cost, path.arc.output), comparator));
++            T finalOutput = fst.outputs.add(path.cost, path.arc.output);
++            if (acceptResult(path.input, finalOutput)) {
++              results.add(new MinResult<T>(path.input, finalOutput, comparator));
++            }
+             break;
+           } else {
+             path.input.grow(1+path.input.length);
+@@ -495,6 +490,10 @@ public final class Util {
+         (MinResult<T>[]) new MinResult[results.size()];
+       return results.toArray(arr);
+     }
++
++    protected boolean acceptResult(IntsRef input, T output) {
++      return true;
++    }
+   }
+ 
+   /** Holds a single input (IntsRef) + output, returned by
+@@ -521,14 +520,19 @@ public final class Util {
+   }
+ 
+   /** Starting from node, find the top N min cost 
+-   * completions to a final node.
++   *  completions to a final node.
+    *
+    *  <p>NOTE: you must share the outputs when you build the
+    *  FST (pass doShare=true to {@link
+    *  PositiveIntOutputs#getSingleton}). */
+-
+-  public static <T> MinResult<T>[] shortestPaths(FST<T> fst, FST.Arc<T> fromNode, Comparator<T> comparator, int topN) throws IOException {
+-    return new TopNSearcher<T>(fst, fromNode, topN, comparator).search();
++  public static <T> MinResult<T>[] shortestPaths(FST<T> fst, FST.Arc<T> fromNode, T startOutput, Comparator<T> comparator, int topN,
++                                                 boolean allowEmptyString) throws IOException {
++    TopNSearcher<T> searcher = new TopNSearcher<T>(fst, topN, comparator);
++
++    // since this search is initialized with a single start node 
++    // it is okay to start with an empty input path here
++    searcher.addStartPaths(fromNode, startOutput, allowEmptyString, new IntsRef());
++    return searcher.search();
+   } 
+ 
+   /**
+@@ -832,9 +836,22 @@ public final class Util {
+   public static BytesRef toBytesRef(IntsRef input, BytesRef scratch) {
+     scratch.grow(input.length);
+     for(int i=0;i<input.length;i++) {
+-      scratch.bytes[i] = (byte) input.ints[i+input.offset];
++      int value = input.ints[i+input.offset];
++      // NOTE: we allow -128 to 255
++      assert value >= Byte.MIN_VALUE && value <= 255: "value " + value + " doesn't fit into byte";
++      scratch.bytes[i] = (byte) value;
+     }
+     scratch.length = input.length;
+     return scratch;
+   }
++
++  // Uncomment for debugging:
++
++  /*
++  public static <T> void dotToFile(FST<T> fst, String filePath) throws IOException {
++    Writer w = new OutputStreamWriter(new FileOutputStream(filePath));
++    toDot(fst, w, true, true);
++    w.close();
++  }
++  */
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java b/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
+index 27e064a..0c77fa5 100644
+--- a/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
++++ b/lucene/core/src/test/org/apache/lucene/analysis/TestGraphTokenizers.java
+@@ -17,9 +17,15 @@ package org.apache.lucene.analysis;
+  * limitations under the License.
+  */
+ 
++import java.io.FileOutputStream;
+ import java.io.IOException;
++import java.io.OutputStreamWriter;
+ import java.io.Reader;
++import java.io.StringWriter;
++import java.io.PrintWriter;
++import java.io.Writer;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.List;
+ import java.util.Random;
+ 
+@@ -27,6 +33,9 @@ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+ import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+ import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.BasicAutomata;
++import org.apache.lucene.util.automaton.BasicOperations;
+ 
+ public class TestGraphTokenizers extends BaseTokenStreamTestCase {
+ 
+@@ -386,4 +395,229 @@ public class TestGraphTokenizers extends BaseTokenStreamTestCase {
+       checkRandomData(random, a, 5, atLeast(1000));
+     }
+   }
++
++  private static Token token(String term, int posInc, int posLength) {
++    final Token t = new Token(term, 0, 0);
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++
++  private static Token token(String term, int posInc, int posLength, int startOffset, int endOffset) {
++    final Token t = new Token(term, startOffset, endOffset);
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++
++  public void testSingleToken() throws Exception {
++
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("abc", 1, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton expected = BasicAutomata.makeString("abc");
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testMultipleHoles() throws Exception {
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("a", 1, 1),
++        token("b", 3, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton expected = join(s2a("a"), SEP_A, HOLE_A, SEP_A, HOLE_A, SEP_A, s2a("b")); 
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testSynOverMultipleHoles() throws Exception {
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("a", 1, 1),
++        token("x", 0, 3),
++        token("b", 3, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton a1 = join(s2a("a"), SEP_A, HOLE_A, SEP_A, HOLE_A, SEP_A, s2a("b")); 
++    final Automaton a2 = join(s2a("x"), SEP_A, s2a("b")); 
++    final Automaton expected = BasicOperations.union(a1, a2);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  // for debugging!
++  /*
++  private static void toDot(Automaton a) throws IOException {
++    final String s = a.toDot();
++    Writer w = new OutputStreamWriter(new FileOutputStream("/x/tmp/out.dot"));
++    w.write(s);
++    w.close();
++    System.out.println("TEST: saved to /x/tmp/out.dot");
++  }
++  */
++
++  private static final Automaton SEP_A = BasicAutomata.makeChar(TokenStreamToAutomaton.POS_SEP);
++  private static final Automaton HOLE_A = BasicAutomata.makeChar(TokenStreamToAutomaton.HOLE);
++
++  private Automaton join(String ... strings) {
++    List<Automaton> as = new ArrayList<Automaton>();
++    for(String s : strings) {
++      as.add(BasicAutomata.makeString(s));
++      as.add(SEP_A);
++    }
++    as.remove(as.size()-1);
++    return BasicOperations.concatenate(as);
++  }
++
++  private Automaton join(Automaton ... as) {
++    return BasicOperations.concatenate(Arrays.asList(as));
++  }
++
++  private Automaton s2a(String s) {
++    return BasicAutomata.makeString(s);
++  }
++
++  public void testTwoTokens() throws Exception {
++
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("abc", 1, 1),
++        token("def", 1, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton expected =  join("abc", "def");
++
++    //toDot(actual);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testHole() throws Exception {
++
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("abc", 1, 1),
++        token("def", 2, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++
++    final Automaton expected = join(s2a("abc"), SEP_A, HOLE_A, SEP_A, s2a("def"));
++
++    //toDot(actual);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testOverlappedTokensSausage() throws Exception {
++
++    // Two tokens on top of each other (sausage):
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("abc", 1, 1),
++        token("xyz", 0, 1)
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton a1 = BasicAutomata.makeString("abc");
++    final Automaton a2 = BasicAutomata.makeString("xyz");
++    final Automaton expected = BasicOperations.union(a1, a2);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testOverlappedTokensLattice() throws Exception {
++
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("abc", 1, 1),
++        token("xyz", 0, 2),
++        token("def", 1, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton a1 = BasicAutomata.makeString("xyz");
++    final Automaton a2 = join("abc", "def");
++                                                                   
++    final Automaton expected = BasicOperations.union(a1, a2);
++    //toDot(actual);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testSynOverHole() throws Exception {
++
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("a", 1, 1),
++        token("X", 0, 2),
++        token("b", 2, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton a1 = BasicOperations.union(
++                                               join(s2a("a"), SEP_A, HOLE_A),
++                                               BasicAutomata.makeString("X"));
++    final Automaton expected = BasicOperations.concatenate(a1,
++                                                           join(SEP_A, s2a("b")));
++    //toDot(actual);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testSynOverHole2() throws Exception {
++
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("xyz", 1, 1),
++        token("abc", 0, 3),
++        token("def", 2, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton expected = BasicOperations.union(
++                                                     join(s2a("xyz"), SEP_A, HOLE_A, SEP_A, s2a("def")),
++                                                     BasicAutomata.makeString("abc"));
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testOverlappedTokensLattice2() throws Exception {
++
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("abc", 1, 1),
++        token("xyz", 0, 3),
++        token("def", 1, 1),
++        token("ghi", 1, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton a1 = BasicAutomata.makeString("xyz");
++    final Automaton a2 = join("abc", "def", "ghi");
++    final Automaton expected = BasicOperations.union(a1, a2);
++    //toDot(actual);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  public void testToDot() throws Exception {
++    final TokenStream ts = new CannedTokenStream(new Token[] {token("abc", 1, 1, 0, 4)});
++    StringWriter w = new StringWriter();
++    new TokenStreamToDot("abcd", ts, new PrintWriter(w)).toDot();
++    assertTrue(w.toString().indexOf("abc / abcd") != -1);
++  }
++
++  public void testStartsWithHole() throws Exception {
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("abc", 2, 1),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton expected = join(HOLE_A, SEP_A, s2a("abc"));
++    //toDot(actual);
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
++
++  // TODO: testEndsWithHole... but we need posInc to set in TS.end()
++
++  public void testSynHangingOverEnd() throws Exception {
++    final TokenStream ts = new CannedTokenStream(
++      new Token[] {
++        token("a", 1, 1),
++        token("X", 0, 10),
++      });
++    final Automaton actual = (new TokenStreamToAutomaton()).toAutomaton(ts);
++    final Automaton expected = BasicOperations.union(BasicAutomata.makeString("a"),
++                                                     BasicAutomata.makeString("X"));
++    assertTrue(BasicOperations.sameLanguage(expected, actual));
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/index/BinaryTokenStream.java b/lucene/core/src/test/org/apache/lucene/index/BinaryTokenStream.java
+index 21ff12b..94b6b74 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/BinaryTokenStream.java
++++ b/lucene/core/src/test/org/apache/lucene/index/BinaryTokenStream.java
+@@ -21,9 +21,13 @@ import org.apache.lucene.analysis.TokenStream;
+ import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
+ import org.apache.lucene.util.AttributeImpl;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.analysis.CannedBinaryTokenStream; // javadocs
+ 
+ /**
+- * a binary tokenstream that lets you index a BytesRef
++ * A binary tokenstream that lets you index a single
++ * binary token (BytesRef value).
++ *
++ * @see CannedBinaryTokenStream
+  */
+ public final class BinaryTokenStream extends TokenStream {
+   private final ByteTermAttribute bytesAtt = addAttribute(ByteTermAttribute.class);
+@@ -61,7 +65,7 @@ public final class BinaryTokenStream extends TokenStream {
+     public BytesRef getBytesRef() {
+       return bytes;
+     }
+-    
++
+     public void setBytesRef(BytesRef bytes) {
+       this.bytes = bytes;
+     }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/automaton/TestSpecialOperations.java b/lucene/core/src/test/org/apache/lucene/util/automaton/TestSpecialOperations.java
+index 1071632..23811bf 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/automaton/TestSpecialOperations.java
++++ b/lucene/core/src/test/org/apache/lucene/util/automaton/TestSpecialOperations.java
+@@ -1,6 +1,11 @@
+ package org.apache.lucene.util.automaton;
+ 
++import java.util.Set;
++
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.IntsRef;
+ import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.fst.Util;
+ 
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+@@ -31,4 +36,20 @@ public class TestSpecialOperations extends LuceneTestCase {
+       assertEquals(AutomatonTestUtil.isFiniteSlow(a), SpecialOperations.isFinite(b));
+     }
+   }
++  
++  /**
++   * Basic test for getFiniteStrings
++   */
++  public void testFiniteStrings() {
++    Automaton a = BasicOperations.union(BasicAutomata.makeString("dog"), BasicAutomata.makeString("duck"));
++    MinimizationOperations.minimize(a);
++    Set<IntsRef> strings = SpecialOperations.getFiniteStrings(a, -1);
++    assertEquals(2, strings.size());
++    IntsRef dog = new IntsRef();
++    Util.toIntsRef(new BytesRef("dog"), dog);
++    assertTrue(strings.contains(dog));
++    IntsRef duck = new IntsRef();
++    Util.toIntsRef(new BytesRef("duck"), duck);
++    assertTrue(strings.contains(duck));
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java b/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java
+index 27326b9..a39f9b5 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java
++++ b/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java
+@@ -1206,9 +1206,11 @@ public class TestFSTs extends LuceneTestCase {
+     //w.close();
+ 
+     Util.MinResult<Long>[] r = Util.shortestPaths(fst,
+-                                           fst.getFirstArc(new FST.Arc<Long>()),
+-                                           minLongComparator,
+-                                           3);
++                                                  fst.getFirstArc(new FST.Arc<Long>()),
++                                                  outputs.getNoOutput(),
++                                                  minLongComparator,
++                                                  3,
++                                                  true);
+     assertEquals(3, r.length);
+ 
+     assertEquals(Util.toIntsRef(new BytesRef("aac"), scratch), r[0].input);
+@@ -1248,9 +1250,11 @@ public class TestFSTs extends LuceneTestCase {
+     //w.close();
+ 
+     Util.MinResult<Pair<Long,Long>>[] r = Util.shortestPaths(fst,
+-                                           fst.getFirstArc(new FST.Arc<Pair<Long,Long>>()),
+-                                           minPairWeightComparator,
+-                                           3);
++                                                             fst.getFirstArc(new FST.Arc<Pair<Long,Long>>()),
++                                                             outputs.getNoOutput(),
++                                                             minPairWeightComparator,
++                                                             3,
++                                                             true);
+     assertEquals(3, r.length);
+ 
+     assertEquals(Util.toIntsRef(new BytesRef("aac"), scratch), r[0].input);
+@@ -1322,7 +1326,7 @@ public class TestFSTs extends LuceneTestCase {
+ 
+       final int topN = _TestUtil.nextInt(random, 1, 10);
+ 
+-      Util.MinResult<Long>[] r = Util.shortestPaths(fst, arc, minLongComparator, topN);
++      Util.MinResult<Long>[] r = Util.shortestPaths(fst, arc, fst.outputs.getNoOutput(), minLongComparator, topN, true);
+ 
+       // 2. go thru whole treemap (slowCompletor) and check its actually the best suggestion
+       final List<Util.MinResult<Long>> matches = new ArrayList<Util.MinResult<Long>>();
+@@ -1426,7 +1430,7 @@ public class TestFSTs extends LuceneTestCase {
+ 
+       final int topN = _TestUtil.nextInt(random, 1, 10);
+ 
+-      Util.MinResult<Pair<Long,Long>>[] r = Util.shortestPaths(fst, arc, minPairWeightComparator, topN);
++      Util.MinResult<Pair<Long,Long>>[] r = Util.shortestPaths(fst, arc, fst.outputs.getNoOutput(), minPairWeightComparator, topN, true);
+ 
+       // 2. go thru whole treemap (slowCompletor) and check its actually the best suggestion
+       final List<Util.MinResult<Pair<Long,Long>>> matches = new ArrayList<Util.MinResult<Pair<Long,Long>>>();
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+new file mode 100644
+index 0000000..e6ce1de
+--- /dev/null
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggester.java
+@@ -0,0 +1,659 @@
++package org.apache.lucene.search.suggest.analyzing;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.StringReader;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.TokenStreamToAutomaton;
++import org.apache.lucene.search.spell.TermFreqIterator;
++import org.apache.lucene.search.suggest.Lookup;
++import org.apache.lucene.search.suggest.fst.Sort;
++import org.apache.lucene.store.ByteArrayDataInput;
++import org.apache.lucene.store.ByteArrayDataOutput;
++import org.apache.lucene.store.InputStreamDataInput;
++import org.apache.lucene.store.OutputStreamDataOutput;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.CharsRef;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.IntsRef;
++import org.apache.lucene.util.UnicodeUtil;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.SpecialOperations;
++import org.apache.lucene.util.automaton.State;
++import org.apache.lucene.util.automaton.Transition;
++import org.apache.lucene.util.fst.Builder;
++import org.apache.lucene.util.fst.ByteSequenceOutputs;
++import org.apache.lucene.util.fst.FST.BytesReader;
++import org.apache.lucene.util.fst.FST;
++import org.apache.lucene.util.fst.PairOutputs.Pair;
++import org.apache.lucene.util.fst.PairOutputs;
++import org.apache.lucene.util.fst.PositiveIntOutputs;
++import org.apache.lucene.util.fst.Util.MinResult;
++import org.apache.lucene.util.fst.Util;
++
++/**
++ * Suggester that first analyzes the surface form, adds the
++ * analyzed form to a weighted FST, and then does the same
++ * thing at lookup time.  This means lookup is based on the
++ * analyzed form while suggestions are still the surface
++ * form(s).
++ *
++ * <p>
++ * This can result in powerful suggester functionality.  For
++ * example, if you use an analyzer removing stop words, 
++ * then the partial text "ghost chr..." could see the
++ * suggestion "The Ghost of Christmas Past".  If
++ * SynonymFilter is used to map wifi and wireless network to
++ * hotspot then the partial text "wirele..." could suggest
++ * "wifi router".  Token normalization like stemmers, accent
++ * removal, etc., would allow suggestions to ignore such
++ * variations.
++ *
++ * <p>
++ * There are some limitations:
++ * <ul>
++ *
++ *   <li> A lookup from a query like "net" in English won't
++ *        be any different than "net " (ie, user added a
++ *        trailing space) because analyzers don't reflect
++ *        when they've seen a token separator and when they
++ *        haven't.
++ *
++ *   <li> If you're using {@code StopFilter}, and the user will
++ *        type "fast apple", but so far all they've typed is
++ *        "fast a", again because the analyzer doesn't convey whether
++ *        it's seen a token separator after the "a",
++ *        {@code StopFilter} will remove that "a" causing
++ *        far more matches than you'd expect.
++ *
++ *   <li> Lookups with the empty string return no results
++ *        instead of all results.
++ * 
++ * @lucene.experimental
++ */
++public class AnalyzingSuggester extends Lookup {
++ 
++  /**
++   * FST<Weight,Surface>: 
++   *  input is the analyzed form, with a null byte between terms
++   *  weights are encoded as costs: (Integer.MAX_VALUE-weight)
++   *  surface is the original, unanalyzed form.
++   */
++  private FST<Pair<Long,BytesRef>> fst = null;
++  
++  /** 
++   * Analyzer that will be used for analyzing suggestions at
++   * index time.
++   */
++  private final Analyzer indexAnalyzer;
++
++  /** 
++   * Analyzer that will be used for analyzing suggestions at
++   * query time.
++   */
++  private final Analyzer queryAnalyzer;
++  
++  /** 
++   * True if exact match suggestions should always be returned first.
++   */
++  private final boolean exactFirst;
++  
++  /** 
++   * True if separator between tokens should be preservered.
++   */
++  private final boolean preserveSep;
++
++  /** Include this flag in the options parameter to {@link
++   *  #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)} to always
++   *  return the exact match first, regardless of score.  This
++   *  has no performance impact but could result in
++   *  low-quality suggestions. */
++  public static final int EXACT_FIRST = 1;
++
++  /** Include this flag in the options parameter to {@link
++   *  #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)} to preserve
++   *  token separators when matching. */
++  public static final int PRESERVE_SEP = 2;
++
++  /** Represents the separation between tokens, if
++   *  PRESERVE_SEP was specified */
++  private static final int SEP_LABEL = 0xff;
++
++  /** Marks end of the analyzed input and start of dedup
++   *  byte. */
++  private static final int END_BYTE = 0x0;
++
++  /** Maximum number of dup surface forms (different surface
++   *  forms for the same analyzed form). */
++  private final int maxSurfaceFormsPerAnalyzedForm;
++
++  /** Maximum graph paths to index for a single analyzed
++   *  surface form.  This only matters if your analyzer
++   *  makes lots of alternate paths (e.g. contains
++   *  SynonymFilter). */
++  private final int maxGraphExpansions;
++
++  /**
++   * Calls {@link #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)
++   * AnalyzingSuggester(analyzer, analyzer, EXACT_FIRST |
++   * PRESERVE_SEP, 256, -1)}
++   */
++  public AnalyzingSuggester(Analyzer analyzer) {
++    this(analyzer, analyzer, EXACT_FIRST | PRESERVE_SEP, 256, -1);
++  }
++
++  /**
++   * Calls {@link #AnalyzingSuggester(Analyzer,Analyzer,int,int,int)
++   * AnalyzingSuggester(indexAnalyzer, queryAnalyzer, EXACT_FIRST |
++   * PRESERVE_SEP, 256, -1)}
++   */
++  public AnalyzingSuggester(Analyzer indexAnalyzer, Analyzer queryAnalyzer) {
++    this(indexAnalyzer, queryAnalyzer, EXACT_FIRST | PRESERVE_SEP, 256, -1);
++  }
++
++  /**
++   * Creates a new suggester.
++   * 
++   * @param indexAnalyzer Analyzer that will be used for
++   *   analyzing suggestions while building the index.
++   * @param queryAnalyzer Analyzer that will be used for
++   *   analyzing query text during lookup
++   * @param options see {@link #EXACT_FIRST}, {@link #PRESERVE_SEP}
++   * @param maxSurfaceFormsPerAnalyzedForm Maximum number of
++   *   surface forms to keep for a single analyzed form.
++   *   When there are too many surface forms we discard the
++   *   lowest weighted ones.
++   * @param maxGraphExpansions Maximum number of graph paths
++   *   to expand from the analyzed form.  Set this to -1 for
++   *   no limit.
++   */
++  public AnalyzingSuggester(Analyzer indexAnalyzer, Analyzer queryAnalyzer, int options, int maxSurfaceFormsPerAnalyzedForm, int maxGraphExpansions) {
++    this.indexAnalyzer = indexAnalyzer;
++    this.queryAnalyzer = queryAnalyzer;
++    if ((options & ~(EXACT_FIRST | PRESERVE_SEP)) != 0) {
++      throw new IllegalArgumentException("options should only contain EXACT_FIRST and PRESERVE_SEP; got " + options);
++    }
++    this.exactFirst = (options & EXACT_FIRST) != 0;
++    this.preserveSep = (options & PRESERVE_SEP) != 0;
++
++    // NOTE: this is just an implementation limitation; if
++    // somehow this is a problem we could fix it by using
++    // more than one byte to disambiguate ... but 256 seems
++    // like it should be way more then enough.
++    if (maxSurfaceFormsPerAnalyzedForm <= 0 || maxSurfaceFormsPerAnalyzedForm > 256) {
++      throw new IllegalArgumentException("maxSurfaceFormsPerAnalyzedForm must be > 0 and < 256 (got: " + maxSurfaceFormsPerAnalyzedForm + ")");
++    }
++    this.maxSurfaceFormsPerAnalyzedForm = maxSurfaceFormsPerAnalyzedForm;
++
++    if (maxGraphExpansions < 1 && maxGraphExpansions != -1) {
++      throw new IllegalArgumentException("maxGraphExpansions must -1 (no limit) or > 0 (got: " + maxGraphExpansions + ")");
++    }
++    this.maxGraphExpansions = maxGraphExpansions;
++  }
++
++  /** Returns byte size of the underlying FST. */
++  public long sizeInBytes() {
++    return fst == null ? 0 : fst.sizeInBytes();
++  }
++
++  // Replaces SEP with epsilon or remaps them if
++  // we were asked to preserve them:
++  private void replaceSep(Automaton a) {
++
++    State[] states = a.getNumberedStates();
++
++    // Go in reverse topo sort so we know we only have to
++    // make one pass:
++    for(int stateNumber=states.length-1;stateNumber >=0;stateNumber--) {
++      final State state = states[stateNumber];
++      List<Transition> newTransitions = new ArrayList<Transition>();
++      for(Transition t : state.getTransitions()) {
++        assert t.getMin() == t.getMax();
++        if (t.getMin() == TokenStreamToAutomaton.POS_SEP) {
++          if (preserveSep) {
++            // Remap to SEP_LABEL:
++            t = new Transition(SEP_LABEL, t.getDest());
++          } else {
++            // NOTE: sort of weird because this will grow
++            // the transition array we are iterating over,
++            // but because we are going in reverse topo sort
++            // it will not add any SEP/HOLE transitions:
++            state.addEpsilon(t.getDest());
++            t = null;
++          }
++        } else if (t.getMin() == TokenStreamToAutomaton.HOLE) {
++
++          // Just remove the hole: there will then be two
++          // SEP tokens next to each other, which will only
++          // match another hole at search time.  Note that
++          // it will also match an empty-string token ... if
++          // that's somehow a problem we can always map HOLE
++          // to a dedicated byte (and escape it in the
++          // input).
++
++          // NOTE: sort of weird because this will grow
++          // the transition array we are iterating over,
++          // but because we are going in reverse topo sort
++          // it will not add any SEP/HOLE transitions:
++          state.addEpsilon(t.getDest());
++          t = null;
++        }
++        if (t != null) {
++          newTransitions.add(t);
++        }
++      }
++      state.resetTransitions();
++      state.setTransitions(newTransitions.toArray(new Transition[newTransitions.size()]));
++    }
++  }
++
++  /** Just escapes the bytes we steal (0xff, 0x0). */
++  private static final class  EscapingTokenStreamToAutomaton extends TokenStreamToAutomaton {
++
++    final BytesRef spare = new BytesRef();
++
++    @Override
++    protected BytesRef changeToken(BytesRef in) {
++      int upto = 0;
++      for(int i=0;i<in.length;i++) {
++        byte b = in.bytes[in.offset+i];
++        if (b == (byte) 0xff) {
++          if (spare.bytes.length == upto) {
++            spare.grow(upto+2);
++          }
++          spare.bytes[upto++] = (byte) 0xff;
++          spare.bytes[upto++] = b;
++        } else {
++          if (spare.bytes.length == upto) {
++            spare.grow(upto+1);
++          }
++          spare.bytes[upto++] = b;
++        }
++      }
++      spare.offset = 0;
++      spare.length = upto;
++      return spare;
++    }
++  }
++  
++  @Override
++  public void build(TermFreqIterator iterator) throws IOException {
++    String prefix = getClass().getSimpleName();
++    File directory = Sort.defaultTempDir();
++    File tempInput = File.createTempFile(prefix, ".input", directory);
++    File tempSorted = File.createTempFile(prefix, ".sorted", directory);
++    
++    Sort.ByteSequencesWriter writer = new Sort.ByteSequencesWriter(tempInput);
++    Sort.ByteSequencesReader reader = null;
++    BytesRef scratch = new BytesRef();
++
++    TokenStreamToAutomaton ts2a = new EscapingTokenStreamToAutomaton();
++
++    // analyzed sequence + 0(byte) + weight(int) + surface + analyzedLength(short) 
++    boolean success = false;
++    byte buffer[] = new byte[8];
++    try {
++      ByteArrayDataOutput output = new ByteArrayDataOutput(buffer);
++      BytesRef surfaceForm;
++      while ((surfaceForm = iterator.next()) != null) {
++
++        // Analyze surface form:
++        TokenStream ts = indexAnalyzer.tokenStream("", new StringReader(surfaceForm.utf8ToString()));
++
++        // Create corresponding automaton: labels are bytes
++        // from each analyzed token, with byte 0 used as
++        // separator between tokens:
++        Automaton automaton = ts2a.toAutomaton(ts);
++        ts.end();
++        ts.close();
++
++        replaceSep(automaton);
++
++        assert SpecialOperations.isFinite(automaton);
++
++        // Get all paths from the automaton (there can be
++        // more than one path, eg if the analyzer created a
++        // graph using SynFilter or WDF):
++
++        // TODO: we could walk & add simultaneously, so we
++        // don't have to alloc [possibly biggish]
++        // intermediate HashSet in RAM:
++        Set<IntsRef> paths = SpecialOperations.getFiniteStrings(automaton, maxGraphExpansions);
++        for (IntsRef path : paths) {
++
++          Util.toBytesRef(path, scratch);
++          
++          // length of the analyzed text (FST input)
++          short analyzedLength = (short) scratch.length;
++          // compute the required length:
++          // analyzed sequence + 12 (separator) + weight (4) + surface + analyzedLength (short)
++          int requiredLength = analyzedLength + 2 + 4 + surfaceForm.length + 2;
++          
++          buffer = ArrayUtil.grow(buffer, requiredLength);
++          
++          output.reset(buffer);
++          output.writeBytes(scratch.bytes, scratch.offset, scratch.length);
++          output.writeByte((byte)0); // separator: not used, just for sort order
++          output.writeByte((byte)0); // separator: not used, just for sort order
++
++          // NOTE: important that writeInt is big-endian,
++          // because this means we sort secondarily by
++          // cost ascending (= weight descending) so that
++          // when we discard too many surface forms for a
++          // single analyzed form we are discarding the
++          // least weight ones:
++          output.writeInt(encodeWeight(iterator.weight()));
++
++          output.writeBytes(surfaceForm.bytes, surfaceForm.offset, surfaceForm.length);
++          output.writeShort(analyzedLength);
++          writer.write(buffer, 0, output.getPosition());
++        }
++      }
++      writer.close();
++
++      // Sort all input/output pairs (required by FST.Builder):
++      new Sort().sort(tempInput, tempSorted);
++      reader = new Sort.ByteSequencesReader(tempSorted);
++     
++      PairOutputs<Long,BytesRef> outputs = new PairOutputs<Long,BytesRef>(PositiveIntOutputs.getSingleton(true), ByteSequenceOutputs.getSingleton());
++      Builder<Pair<Long,BytesRef>> builder = new Builder<Pair<Long,BytesRef>>(FST.INPUT_TYPE.BYTE1, outputs);
++
++      // Build FST:
++      BytesRef previous = null;
++      BytesRef analyzed = new BytesRef();
++      BytesRef surface = new BytesRef();
++      IntsRef scratchInts = new IntsRef();
++      ByteArrayDataInput input = new ByteArrayDataInput();
++
++      int dedup = 0;
++      while (reader.read(scratch)) {
++        input.reset(scratch.bytes, scratch.offset, scratch.length);
++        input.setPosition(input.length()-2);
++        short analyzedLength = input.readShort();
++
++        analyzed.bytes = scratch.bytes;
++        analyzed.offset = scratch.offset;
++        analyzed.length = analyzedLength;
++        
++        input.setPosition(analyzedLength + 2); // analyzed sequence + separator
++        long cost = input.readInt();
++   
++        surface.bytes = scratch.bytes;
++        surface.offset = input.getPosition();
++        surface.length = input.length() - input.getPosition() - 2;
++
++        if (previous == null) {
++          previous = new BytesRef();
++          previous.copyBytes(analyzed);
++        } else if (analyzed.equals(previous)) {
++          dedup++;
++          if (dedup >= maxSurfaceFormsPerAnalyzedForm) {
++            // More than maxSurfaceFormsPerAnalyzedForm
++            // dups: skip the rest:
++            continue;
++          }
++        } else {
++          dedup = 0;
++          previous.copyBytes(analyzed);
++        }
++
++        analyzed.grow(analyzed.length+2);
++
++        // TODO: I think we can avoid the extra 2 bytes when
++        // there is no dup (dedup==0), but we'd have to fix
++        // the exactFirst logic ... which would be sort of
++        // hairy because we'd need to special case the two
++        // (dup/not dup)...
++
++        // NOTE: must be byte 0 so we sort before whatever
++        // is next
++        analyzed.bytes[analyzed.length] = 0;
++        analyzed.bytes[analyzed.length+1] = (byte) dedup;
++        analyzed.length += 2;
++
++        Util.toIntsRef(analyzed, scratchInts);
++        //System.out.println("ADD: " + scratchInts + " -> " + cost + ": " + surface.utf8ToString());
++        builder.add(scratchInts, outputs.newPair(cost, BytesRef.deepCopyOf(surface)));
++      }
++      fst = builder.finish();
++
++      //Util.dotToFile(fst, "/tmp/suggest.dot");
++      
++      success = true;
++    } finally {
++      if (success) {
++        IOUtils.close(reader, writer);
++      } else {
++        IOUtils.closeWhileHandlingException(reader, writer);
++      }
++      
++      tempInput.delete();
++      tempSorted.delete();
++    }
++  }
++
++  @Override
++  public boolean store(OutputStream output) throws IOException {
++    try {
++      fst.save(new OutputStreamDataOutput(output));
++    } finally {
++      IOUtils.close(output);
++    }
++    return true;
++  }
++
++  @Override
++  public boolean load(InputStream input) throws IOException {
++    try {
++      this.fst = new FST<Pair<Long,BytesRef>>(new InputStreamDataInput(input), new PairOutputs<Long,BytesRef>(PositiveIntOutputs.getSingleton(true), ByteSequenceOutputs.getSingleton()));
++    } finally {
++      IOUtils.close(input);
++    }
++    return true;
++  }
++
++  @Override
++  public List<LookupResult> lookup(final CharSequence key, boolean onlyMorePopular, int num) {
++    assert num > 0;
++
++    //System.out.println("lookup key=" + key + " num=" + num);
++
++    try {
++
++      // TODO: is there a Reader from a CharSequence?
++      // Turn tokenstream into automaton:
++      TokenStream ts = queryAnalyzer.tokenStream("", new StringReader(key.toString()));
++      Automaton automaton = (new EscapingTokenStreamToAutomaton()).toAutomaton(ts);
++      ts.end();
++      ts.close();
++
++      // TODO: we could use the end offset to "guess"
++      // whether the final token was a partial token; this
++      // would only be a heuristic ... but maybe an OK one.
++      // This way we could eg differentiate "net" from "net ",
++      // which we can't today...
++
++      replaceSep(automaton);
++
++      // TODO: we can optimize this somewhat by determinizing
++      // while we convert
++      automaton = Automaton.minimize(automaton);
++
++      final CharsRef spare = new CharsRef();
++
++      //System.out.println("  now intersect exactFirst=" + exactFirst);
++    
++      // Intersect automaton w/ suggest wFST and get all
++      // prefix starting nodes & their outputs:
++      final List<FSTUtil.Path<Pair<Long,BytesRef>>> prefixPaths;
++      prefixPaths = FSTUtil.intersectPrefixPaths(automaton, fst);
++
++      //System.out.println("  prefixPaths: " + prefixPaths.size());
++
++      BytesReader bytesReader = fst.getBytesReader(0);
++
++      FST.Arc<Pair<Long,BytesRef>> scratchArc = new FST.Arc<Pair<Long,BytesRef>>();
++
++      List<LookupResult> results = new ArrayList<LookupResult>();
++
++      if (exactFirst) {
++
++        Util.TopNSearcher<Pair<Long,BytesRef>> searcher;
++        searcher = new Util.TopNSearcher<Pair<Long,BytesRef>>(fst, num, weightComparator);
++
++        int count = 0;
++        for (FSTUtil.Path<Pair<Long,BytesRef>> path : prefixPaths) {
++          if (fst.findTargetArc(END_BYTE, path.fstNode, scratchArc, bytesReader) != null) {
++            // This node has END_BYTE arc leaving, meaning it's an
++            // "exact" match:
++            count++;
++          }
++        }
++
++        searcher = new Util.TopNSearcher<Pair<Long,BytesRef>>(fst, count * maxSurfaceFormsPerAnalyzedForm, weightComparator);
++
++        // NOTE: we could almost get away with only using
++        // the first start node.  The only catch is if
++        // maxSurfaceFormsPerAnalyzedForm had kicked in and
++        // pruned our exact match from one of these nodes
++        // ...:
++        for (FSTUtil.Path<Pair<Long,BytesRef>> path : prefixPaths) {
++          if (fst.findTargetArc(END_BYTE, path.fstNode, scratchArc, bytesReader) != null) {
++            // This node has END_BYTE arc leaving, meaning it's an
++            // "exact" match:
++            searcher.addStartPaths(scratchArc, fst.outputs.add(path.output, scratchArc.output), false, path.input);
++          }
++        }
++
++        MinResult<Pair<Long,BytesRef>> completions[] = searcher.search();
++
++        // NOTE: this is rather inefficient: we enumerate
++        // every matching "exactly the same analyzed form"
++        // path, and then do linear scan to see if one of
++        // these exactly matches the input.  It should be
++        // possible (though hairy) to do something similar
++        // to getByOutput, since the surface form is encoded
++        // into the FST output, so we more efficiently hone
++        // in on the exact surface-form match.  Still, I
++        // suspect very little time is spent in this linear
++        // seach: it's bounded by how many prefix start
++        // nodes we have and the
++        // maxSurfaceFormsPerAnalyzedForm:
++        for(MinResult<Pair<Long,BytesRef>> completion : completions) {
++          spare.grow(completion.output.output2.length);
++          UnicodeUtil.UTF8toUTF16(completion.output.output2, spare);
++          if (CHARSEQUENCE_COMPARATOR.compare(spare, key) == 0) {
++            results.add(new LookupResult(spare.toString(), decodeWeight(completion.output.output1)));
++            break;
++          }
++        }
++
++        if (results.size() == num) {
++          // That was quick:
++          return results;
++        }
++      }
++
++      Util.TopNSearcher<Pair<Long,BytesRef>> searcher;
++      searcher = new Util.TopNSearcher<Pair<Long,BytesRef>>(fst,
++                                                            num - results.size(),
++                                                            weightComparator) {
++        private final Set<BytesRef> seen = new HashSet<BytesRef>();
++
++        @Override
++        protected boolean acceptResult(IntsRef input, Pair<Long,BytesRef> output) {
++          
++          // Dedup: when the input analyzes to a graph we
++          // can get duplicate surface forms:
++          if (seen.contains(output.output2)) {
++            return false;
++          }
++          seen.add(output.output2);
++          
++          if (!exactFirst) {
++            return true;
++          } else {
++            // In exactFirst mode, don't accept any paths
++            // matching the surface form since that will
++            // create duplicate results:
++            spare.grow(output.output2.length);
++            UnicodeUtil.UTF8toUTF16(output.output2, spare);
++            return CHARSEQUENCE_COMPARATOR.compare(spare, key) != 0;
++          }
++        }
++      };
++
++      for (FSTUtil.Path<Pair<Long,BytesRef>> path : prefixPaths) {
++        searcher.addStartPaths(path.fstNode, path.output, true, path.input);
++      }
++
++      MinResult<Pair<Long,BytesRef>> completions[] = searcher.search();
++
++      for(MinResult<Pair<Long,BytesRef>> completion : completions) {
++        spare.grow(completion.output.output2.length);
++        UnicodeUtil.UTF8toUTF16(completion.output.output2, spare);
++        LookupResult result = new LookupResult(spare.toString(), decodeWeight(completion.output.output1));
++        //System.out.println("    result=" + result);
++        results.add(result);
++      }
++
++      return results;
++    } catch (IOException bogus) {
++      throw new RuntimeException(bogus);
++    }
++  }
++
++  /**
++   * Returns the weight associated with an input string,
++   * or null if it does not exist.
++   */
++  public Object get(CharSequence key) {
++    throw new UnsupportedOperationException();
++  }
++  
++  /** cost -> weight */
++  private static int decodeWeight(long encoded) {
++    return (int)(Integer.MAX_VALUE - encoded);
++  }
++  
++  /** weight -> cost */
++  private static int encodeWeight(long value) {
++    if (value < 0 || value > Integer.MAX_VALUE) {
++      throw new UnsupportedOperationException("cannot encode value: " + value);
++    }
++    return Integer.MAX_VALUE - (int)value;
++  }
++   
++  static final Comparator<Pair<Long,BytesRef>> weightComparator = new Comparator<Pair<Long,BytesRef>> () {
++    public int compare(Pair<Long,BytesRef> left, Pair<Long,BytesRef> right) {
++      return left.output1.compareTo(right.output1);
++    }
++  };
++}
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/FSTUtil.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/FSTUtil.java
+new file mode 100644
+index 0000000..c22da8f
+--- /dev/null
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/FSTUtil.java
+@@ -0,0 +1,118 @@
++package org.apache.lucene.search.suggest.analyzing;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.ArrayList;
++import java.util.List;
++import java.io.IOException;
++
++import org.apache.lucene.util.IntsRef;
++import org.apache.lucene.util.automaton.Automaton;
++import org.apache.lucene.util.automaton.State;
++import org.apache.lucene.util.automaton.Transition;
++import org.apache.lucene.util.fst.FST;
++
++// TODO: move to core?  nobody else uses it yet though...
++
++/**
++ * Exposes a utility method to enumerate all paths
++ * intersecting an {@link Automaton} with an {@link FST}.
++ */
++public class FSTUtil {
++
++  private FSTUtil() {
++  }
++
++  /** Holds a pair (automaton, fst) of states and accumulated output in the intersected machine. */
++  public static final class Path<T> {
++
++    /** Node in the automaton where path ends: */
++    public final State state;
++
++    /** Node in the FST where path ends: */
++    public final FST.Arc<T> fstNode;
++
++    /** Output of the path so far: */
++    T output;
++
++    /** Input of the path so far: */
++    public final IntsRef input;
++
++    /** Sole constructor. */
++    public Path(State state, FST.Arc<T> fstNode, T output, IntsRef input) {
++      this.state = state;
++      this.fstNode = fstNode;
++      this.output = output;
++      this.input = input;
++    }
++  }
++
++  /** Enumerates all paths in the automaton that also
++   *  intersect the FST, accumulating the FST end node and
++   *  output for each path. */
++  public static<T> List<Path<T>> intersectPrefixPaths(Automaton a, FST<T> fst) throws IOException {
++    final List<Path<T>> queue = new ArrayList<Path<T>>();
++    final List<Path<T>> endNodes = new ArrayList<Path<T>>();
++
++    queue.add(new Path<T>(a.getInitialState(),
++                          fst.getFirstArc(new FST.Arc<T>()),       
++                          fst.outputs.getNoOutput(),
++                          new IntsRef()));
++
++    final FST.Arc<T> scratchArc = new FST.Arc<T>();
++    final FST.BytesReader fstReader = fst.getBytesReader(0);
++
++    //System.out.println("fst/a intersect");
++
++    while (queue.size() != 0) {
++      final Path<T> path = queue.remove(queue.size()-1);
++      //System.out.println("  cycle path=" + path);
++      if (path.state.isAccept()) {
++        endNodes.add(path);
++      }
++
++      IntsRef currentInput = path.input;
++      for(Transition t : path.state.getTransitions()) {
++        
++        // TODO: we can fix this if necessary:
++        if (t.getMin() != t.getMax()) {
++          throw new IllegalStateException("can only handle Transitions that match one character");
++        }
++
++        //System.out.println("    t=" + (char) t.getMin());
++
++        final FST.Arc<T> nextArc = fst.findTargetArc(t.getMin(), path.fstNode, scratchArc, fstReader);
++        if (nextArc != null) {
++          //System.out.println("      fst matches");
++          // Path continues:
++          IntsRef newInput = new IntsRef(currentInput.length + 1);
++          newInput.copyInts(currentInput);
++          newInput.ints[currentInput.length] = t.getMin();
++          newInput.length = currentInput.length + 1;
++
++          queue.add(new Path<T>(t.getDest(),
++                                new FST.Arc<T>().copyFrom(nextArc),
++                                fst.outputs.add(path.output, nextArc.output),
++                                newInput));
++        }
++      }
++    }
++
++    return endNodes;
++  }
++}
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/package.html b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/package.html
+new file mode 100644
+index 0000000..114af3e
+--- /dev/null
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/package.html
+@@ -0,0 +1,22 @@
++<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++<html><head></head>
++<body>
++Analyzer based autosuggest.
++</body>
++</html>
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/WFSTCompletionLookup.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/WFSTCompletionLookup.java
+index 1c16f74..0ee6055 100644
+--- a/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/WFSTCompletionLookup.java
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/fst/WFSTCompletionLookup.java
+@@ -56,7 +56,6 @@ import org.apache.lucene.util.fst.Util.MinResult;
+  * Input weights must be between 0 and {@link Integer#MAX_VALUE}, any
+  * other values will be rejected.
+  * 
+- * @see Util#shortestPaths(FST, FST.Arc, Comparator, int)
+  * @lucene.experimental
+  */
+ public class WFSTCompletionLookup extends Lookup {
+@@ -168,12 +167,14 @@ public class WFSTCompletionLookup extends Lookup {
+         return results; // that was quick
+       }
+     }
+-    
++
+     // complete top-N
+     MinResult<Long> completions[] = null;
+     try {
+-      completions = Util.shortestPaths(fst, arc, weightComparator, num);
+-    } catch (IOException bogus) { throw new RuntimeException(bogus); }
++      completions = Util.shortestPaths(fst, arc, prefixOutput, weightComparator, num, !exactFirst);
++    } catch (IOException bogus) {
++      throw new RuntimeException(bogus);
++    }
+     
+     BytesRef suffix = new BytesRef(8);
+     for (MinResult<Long> completion : completions) {
+@@ -183,7 +184,7 @@ public class WFSTCompletionLookup extends Lookup {
+       scratch.append(suffix);
+       spare.grow(scratch.length);
+       UnicodeUtil.UTF8toUTF16(scratch, spare);
+-      results.add(new LookupResult(spare.toString(), decodeWeight(prefixOutput + completion.output)));
++      results.add(new LookupResult(spare.toString(), decodeWeight(completion.output)));
+     }
+     return results;
+   }
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java
+index 195ad59..6dbb960 100644
+--- a/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java
+@@ -19,6 +19,7 @@ package org.apache.lucene.search.suggest;
+ 
+ import java.io.BufferedReader;
+ import java.io.InputStreamReader;
++import java.lang.reflect.Constructor;
+ import java.net.URL;
+ import java.nio.charset.Charset;
+ import java.util.ArrayList;
+@@ -30,7 +31,11 @@ import java.util.Random;
+ import java.util.concurrent.Callable;
+ 
+ import org.apache.lucene.util.*;
+-import org.apache.lucene.search.suggest.Lookup;
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.search.suggest.Lookup; // javadocs
++import org.apache.lucene.search.suggest.analyzing.AnalyzingSuggester;
+ import org.apache.lucene.search.suggest.fst.FSTCompletionLookup;
+ import org.apache.lucene.search.suggest.fst.WFSTCompletionLookup;
+ import org.apache.lucene.search.suggest.jaspell.JaspellLookup;
+@@ -49,7 +54,8 @@ public class LookupBenchmarkTest extends LuceneTestCase {
+       JaspellLookup.class, 
+       TSTLookup.class,
+       FSTCompletionLookup.class,
+-      WFSTCompletionLookup.class);
++      WFSTCompletionLookup.class,
++      AnalyzingSuggester.class);
+ 
+   private final static int rounds = 15;
+   private final static int warmup = 5;
+@@ -133,10 +139,19 @@ public class LookupBenchmarkTest extends LuceneTestCase {
+     System.err.println("-- RAM consumption");
+     for (Class<? extends Lookup> cls : benchmarkClasses) {
+       Lookup lookup = buildLookup(cls, dictionaryInput);
++      long sizeInBytes;
++      if (lookup instanceof AnalyzingSuggester) {
++        // Just get size of FST: else we are also measuring
++        // size of MockAnalyzer which is non-trivial and
++        // varies depending on test seed:
++        sizeInBytes = ((AnalyzingSuggester) lookup).sizeInBytes();
++      } else {
++        sizeInBytes = RamUsageEstimator.sizeOf(lookup);
++      }
+       System.err.println(
+           String.format(Locale.ROOT, "%-15s size[B]:%,13d",
+               lookup.getClass().getSimpleName(), 
+-              RamUsageEstimator.sizeOf(lookup)));
++              sizeInBytes));
+     }
+   }
+ 
+@@ -144,7 +159,13 @@ public class LookupBenchmarkTest extends LuceneTestCase {
+    * Create {@link Lookup} instance and populate it. 
+    */
+   private Lookup buildLookup(Class<? extends Lookup> cls, TermFreq[] input) throws Exception {
+-    Lookup lookup = cls.newInstance();
++    Lookup lookup = null;
++    try {
++      lookup = cls.newInstance();
++    } catch (InstantiationException e) {
++      Constructor<? extends Lookup> ctor = cls.getConstructor(Analyzer.class);
++      lookup = ctor.newInstance(new MockAnalyzer(random, MockTokenizer.KEYWORD, false));
++    }
+     lookup.build(new TermFreqArrayIterator(input));
+     return lookup;
+   }
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggesterTest.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggesterTest.java
+new file mode 100644
+index 0000000..d7e9c48
+--- /dev/null
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/AnalyzingSuggesterTest.java
+@@ -0,0 +1,788 @@
++package org.apache.lucene.search.suggest.analyzing;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.io.Reader;
++import java.io.StringReader;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.TreeSet;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.CannedBinaryTokenStream.BinaryToken;
++import org.apache.lucene.analysis.CannedBinaryTokenStream;
++import org.apache.lucene.analysis.CannedTokenStream;
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.analysis.MockTokenFilter;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.analysis.Token;
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.Tokenizer;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
++import org.apache.lucene.search.suggest.Lookup.LookupResult;
++import org.apache.lucene.search.suggest.TermFreq;
++import org.apache.lucene.search.suggest.TermFreqArrayIterator;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
++
++public class AnalyzingSuggesterTest extends LuceneTestCase {
++  
++  /** this is basically the WFST test ported to KeywordAnalyzer. so it acts the same */
++  public void testKeyword() throws Exception {
++    TermFreq keys[] = new TermFreq[] {
++        new TermFreq("foo", 50),
++        new TermFreq("bar", 10),
++        new TermFreq("barbar", 12),
++        new TermFreq("barbara", 6)
++    };
++    
++    AnalyzingSuggester suggester = new AnalyzingSuggester(new MockAnalyzer(random(), MockTokenizer.KEYWORD, false));
++    suggester.build(new TermFreqArrayIterator(keys));
++    
++    // top N of 2, but only foo is available
++    List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("f", random()), false, 2);
++    assertEquals(1, results.size());
++    assertEquals("foo", results.get(0).key.toString());
++    assertEquals(50, results.get(0).value, 0.01F);
++    
++    // top N of 1 for 'bar': we return this even though
++    // barbar is higher because exactFirst is enabled:
++    results = suggester.lookup(_TestUtil.stringToCharSequence("bar", random()), false, 1);
++    assertEquals(1, results.size());
++    assertEquals("bar", results.get(0).key.toString());
++    assertEquals(10, results.get(0).value, 0.01F);
++    
++    // top N Of 2 for 'b'
++    results = suggester.lookup(_TestUtil.stringToCharSequence("b", random()), false, 2);
++    assertEquals(2, results.size());
++    assertEquals("barbar", results.get(0).key.toString());
++    assertEquals(12, results.get(0).value, 0.01F);
++    assertEquals("bar", results.get(1).key.toString());
++    assertEquals(10, results.get(1).value, 0.01F);
++    
++    // top N of 3 for 'ba'
++    results = suggester.lookup(_TestUtil.stringToCharSequence("ba", random()), false, 3);
++    assertEquals(3, results.size());
++    assertEquals("barbar", results.get(0).key.toString());
++    assertEquals(12, results.get(0).value, 0.01F);
++    assertEquals("bar", results.get(1).key.toString());
++    assertEquals(10, results.get(1).value, 0.01F);
++    assertEquals("barbara", results.get(2).key.toString());
++    assertEquals(6, results.get(2).value, 0.01F);
++  }
++  
++  // TODO: more tests
++  /**
++   * basic "standardanalyzer" test with stopword removal
++   */
++  public void testStandard() throws Exception {
++    TermFreq keys[] = new TermFreq[] {
++        new TermFreq("the ghost of christmas past", 50),
++    };
++    
++    Analyzer standard = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, true, MockTokenFilter.ENGLISH_STOPSET, false);
++    AnalyzingSuggester suggester = new AnalyzingSuggester(standard);
++    suggester.build(new TermFreqArrayIterator(keys));
++    
++    List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("the ghost of chris", random()), false, 1);
++    assertEquals(1, results.size());
++    assertEquals("the ghost of christmas past", results.get(0).key.toString());
++    assertEquals(50, results.get(0).value, 0.01F);
++
++    // omit the 'the' since its a stopword, its suggested anyway
++    results = suggester.lookup(_TestUtil.stringToCharSequence("ghost of chris", random()), false, 1);
++    assertEquals(1, results.size());
++    assertEquals("the ghost of christmas past", results.get(0).key.toString());
++    assertEquals(50, results.get(0).value, 0.01F);
++
++    // omit the 'the' and 'of' since they are stopwords, its suggested anyway
++    results = suggester.lookup(_TestUtil.stringToCharSequence("ghost chris", random()), false, 1);
++    assertEquals(1, results.size());
++    assertEquals("the ghost of christmas past", results.get(0).key.toString());
++    assertEquals(50, results.get(0).value, 0.01F);
++  }
++
++  public void testNoSeps() throws Exception {
++    TermFreq[] keys = new TermFreq[] {
++      new TermFreq("ab cd", 0),
++      new TermFreq("abcd", 1),
++    };
++
++    int options = 0;
++
++    Analyzer a = new MockAnalyzer(random());
++    AnalyzingSuggester suggester = new AnalyzingSuggester(a, a, options, 256, -1);
++    suggester.build(new TermFreqArrayIterator(keys));
++    // TODO: would be nice if "ab " would allow the test to
++    // pass, and more generally if the analyzer can know
++    // that the user's current query has ended at a word, 
++    // but, analyzers don't produce SEP tokens!
++    List<LookupResult> r = suggester.lookup(_TestUtil.stringToCharSequence("ab c", random()), false, 2);
++    assertEquals(2, r.size());
++
++    // With no PRESERVE_SEPS specified, "ab c" should also
++    // complete to "abcd", which has higher weight so should
++    // appear first:
++    assertEquals("abcd", r.get(0).key.toString());
++  }
++
++  public void testGraphDups() throws Exception {
++
++    final Analyzer analyzer = new Analyzer() {
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName, Reader reader) {
++        Tokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.SIMPLE, true);
++        
++        return new TokenStreamComponents(tokenizer) {
++          int tokenStreamCounter = 0;
++          final TokenStream[] tokenStreams = new TokenStream[] {
++            new CannedTokenStream(new Token[] {
++                token("wifi",1,1),
++                token("hotspot",0,2),
++                token("network",1,1),
++                token("is",1,1),
++                token("slow",1,1)
++              }),
++            new CannedTokenStream(new Token[] {
++                token("wi",1,1),
++                token("hotspot",0,3),
++                token("fi",1,1),
++                token("network",1,1),
++                token("is",1,1),
++                token("fast",1,1)
++
++              }),
++            new CannedTokenStream(new Token[] {
++                token("wifi",1,1),
++                token("hotspot",0,2),
++                token("network",1,1)
++              }),
++          };
++
++          @Override
++          public TokenStream getTokenStream() {
++            TokenStream result = tokenStreams[tokenStreamCounter];
++            tokenStreamCounter++;
++            return result;
++          }
++         
++          @Override
++          protected void setReader(final Reader reader) throws IOException {
++          }
++        };
++      }
++    };
++
++    TermFreq keys[] = new TermFreq[] {
++        new TermFreq("wifi network is slow", 50),
++        new TermFreq("wi fi network is fast", 10),
++    };
++    //AnalyzingSuggester suggester = new AnalyzingSuggester(analyzer, AnalyzingSuggester.EXACT_FIRST, 256, -1);
++    AnalyzingSuggester suggester = new AnalyzingSuggester(analyzer);
++    suggester.build(new TermFreqArrayIterator(keys));
++    List<LookupResult> results = suggester.lookup("wifi network", false, 10);
++    if (VERBOSE) {
++      System.out.println("Results: " + results);
++    }
++    assertEquals(2, results.size());
++    assertEquals("wifi network is slow", results.get(0).key);
++    assertEquals(50, results.get(0).value);
++    assertEquals("wi fi network is fast", results.get(1).key);
++    assertEquals(10, results.get(1).value);
++  }
++
++  public void testInputPathRequired() throws Exception {
++
++    //  SynonymMap.Builder b = new SynonymMap.Builder(false);
++    //  b.add(new CharsRef("ab"), new CharsRef("ba"), true);
++    //  final SynonymMap map = b.build();
++
++    //  The Analyzer below mimics the functionality of the SynonymAnalyzer
++    //  using the above map, so that the suggest module does not need a dependency on the 
++    //  synonym module 
++
++    final Analyzer analyzer = new Analyzer() {
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName, Reader reader) {
++        Tokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.SIMPLE, true);
++        
++        return new TokenStreamComponents(tokenizer) {
++          int tokenStreamCounter = 0;
++          final TokenStream[] tokenStreams = new TokenStream[] {
++            new CannedTokenStream(new Token[] {
++                token("ab",1,1),
++                token("ba",0,1),
++                token("xc",1,1)
++              }),
++            new CannedTokenStream(new Token[] {
++                token("ba",1,1),          
++                token("xd",1,1)
++              }),
++            new CannedTokenStream(new Token[] {
++                token("ab",1,1),
++                token("ba",0,1),
++                token("x",1,1)
++              })
++          };
++
++          @Override
++          public TokenStream getTokenStream() {
++            TokenStream result = tokenStreams[tokenStreamCounter];
++            tokenStreamCounter++;
++            return result;
++          }
++         
++          @Override
++          protected void setReader(final Reader reader) throws IOException {
++          }
++        };
++      }
++    };
++
++    TermFreq keys[] = new TermFreq[] {
++        new TermFreq("ab xc", 50),
++        new TermFreq("ba xd", 50),
++    };
++    AnalyzingSuggester suggester = new AnalyzingSuggester(analyzer);
++    suggester.build(new TermFreqArrayIterator(keys));
++    List<LookupResult> results = suggester.lookup("ab x", false, 1);
++    assertTrue(results.size() == 1);
++  }
++
++  private static Token token(String term, int posInc, int posLength) {
++    final Token t = new Token(term, 0, 0);
++    t.setPositionIncrement(posInc);
++    t.setPositionLength(posLength);
++    return t;
++  }
++
++  private static BinaryToken token(BytesRef term) {
++    return new BinaryToken(term);
++  }
++
++  /*
++  private void printTokens(final Analyzer analyzer, String input) throws IOException {
++    System.out.println("Tokens for " + input);
++    TokenStream ts = analyzer.tokenStream("", new StringReader(input));
++    ts.reset();
++    final TermToBytesRefAttribute termBytesAtt = ts.addAttribute(TermToBytesRefAttribute.class);
++    final PositionIncrementAttribute posIncAtt = ts.addAttribute(PositionIncrementAttribute.class);
++    final PositionLengthAttribute posLengthAtt = ts.addAttribute(PositionLengthAttribute.class);
++    
++    while(ts.incrementToken()) {
++      termBytesAtt.fillBytesRef();
++      System.out.println(String.format("%s,%s,%s", termBytesAtt.getBytesRef().utf8ToString(), posIncAtt.getPositionIncrement(), posLengthAtt.getPositionLength()));      
++    }
++    ts.end();
++    ts.close();
++  } 
++  */ 
++
++  private final Analyzer getUnusualAnalyzer() {
++    return new Analyzer() {
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName, Reader reader) {
++        Tokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.SIMPLE, true);
++        
++        return new TokenStreamComponents(tokenizer) {
++
++          int count;
++
++          @Override
++          public TokenStream getTokenStream() {
++            // 4th time we are called, return tokens a b,
++            // else just a:
++            if (count++ != 3) {
++              return new CannedTokenStream(new Token[] {
++                  token("a", 1, 1),
++                });
++            } else {
++              // After that "a b":
++              return new CannedTokenStream(new Token[] {
++                  token("a", 1, 1),
++                  token("b", 1, 1),
++                });
++            }
++          }
++         
++          @Override
++          protected void setReader(final Reader reader) throws IOException {
++          }
++        };
++      }
++    };
++  }
++
++  public void testExactFirst() throws Exception {
++
++    Analyzer a = getUnusualAnalyzer();
++    AnalyzingSuggester suggester = new AnalyzingSuggester(a, a, AnalyzingSuggester.EXACT_FIRST | AnalyzingSuggester.PRESERVE_SEP, 256, -1);
++    suggester.build(new TermFreqArrayIterator(new TermFreq[] {
++          new TermFreq("x y", 1),
++          new TermFreq("x y z", 3),
++          new TermFreq("x", 2),
++          new TermFreq("z z z", 20),
++        }));
++
++    //System.out.println("ALL: " + suggester.lookup("x y", false, 6));
++
++    for(int topN=1;topN<6;topN++) {
++      List<LookupResult> results = suggester.lookup("x y", false, topN);
++      //System.out.println("topN=" + topN + " " + results);
++
++      assertEquals(Math.min(topN, 4), results.size());
++
++      assertEquals("x y", results.get(0).key);
++      assertEquals(1, results.get(0).value);
++
++      if (topN > 1) {
++        assertEquals("z z z", results.get(1).key);
++        assertEquals(20, results.get(1).value);
++
++        if (topN > 2) {
++          assertEquals("x y z", results.get(2).key);
++          assertEquals(3, results.get(2).value);
++
++          if (topN > 3) {
++            assertEquals("x", results.get(3).key);
++            assertEquals(2, results.get(3).value);
++          }
++        }
++      }
++    }
++  }
++
++  public void testNonExactFirst() throws Exception {
++
++    Analyzer a = getUnusualAnalyzer();
++    AnalyzingSuggester suggester = new AnalyzingSuggester(a, a, AnalyzingSuggester.PRESERVE_SEP, 256, -1);
++
++    suggester.build(new TermFreqArrayIterator(new TermFreq[] {
++          new TermFreq("x y", 1),
++          new TermFreq("x y z", 3),
++          new TermFreq("x", 2),
++          new TermFreq("z z z", 20),
++        }));
++
++    for(int topN=1;topN<6;topN++) {
++      List<LookupResult> results = suggester.lookup("p", false, topN);
++
++      assertEquals(Math.min(topN, 4), results.size());
++
++      assertEquals("z z z", results.get(0).key);
++      assertEquals(20, results.get(0).value);
++
++      if (topN > 1) {
++        assertEquals("x y z", results.get(1).key);
++        assertEquals(3, results.get(1).value);
++
++        if (topN > 2) {
++          assertEquals("x", results.get(2).key);
++          assertEquals(2, results.get(2).value);
++          
++          if (topN > 3) {
++            assertEquals("x y", results.get(3).key);
++            assertEquals(1, results.get(3).value);
++          }
++        }
++      }
++    }
++  }
++  
++  // Holds surface form seperately:
++  private static class TermFreq2 implements Comparable<TermFreq2> {
++    public final String surfaceForm;
++    public final String analyzedForm;
++    public final long weight;
++
++    public TermFreq2(String surfaceForm, String analyzedForm, long weight) {
++      this.surfaceForm = surfaceForm;
++      this.analyzedForm = analyzedForm;
++      this.weight = weight;
++    }
++
++    @Override
++    public int compareTo(TermFreq2 other) {
++      int cmp = analyzedForm.compareTo(other.analyzedForm);
++      if (cmp != 0) {
++        return cmp;
++      } else if (weight > other.weight) {
++        return -1;
++      } else if (weight < other.weight) {
++        return 1;
++      } else {
++        assert false;
++        return 0;
++      }
++    }
++  }
++
++  static boolean isStopChar(char ch, int numStopChars) {
++    //System.out.println("IS? " + ch + ": " + (ch - 'a') + ": " + ((ch - 'a') < numStopChars));
++    return (ch - 'a') < numStopChars;
++  }
++
++  // Like StopFilter:
++  private static class TokenEater extends TokenFilter {
++    private final PositionIncrementAttribute posIncrAtt = addAttribute(PositionIncrementAttribute.class);
++    private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
++    private final int numStopChars;
++    private final boolean preserveHoles;
++    private boolean first;
++
++    public TokenEater(boolean preserveHoles, TokenStream in, int numStopChars) {
++      super(in);
++      this.preserveHoles = preserveHoles;
++      this.numStopChars = numStopChars;
++    }
++
++    @Override
++    public void reset() throws IOException {
++      super.reset();
++      first = true;
++    }
++
++    @Override
++    public final boolean incrementToken() throws IOException {
++      int skippedPositions = 0;
++      while (input.incrementToken()) {
++        if (termAtt.length() != 1 || !isStopChar(termAtt.charAt(0), numStopChars)) {
++          int posInc = posIncrAtt.getPositionIncrement() + skippedPositions;
++          if (first) {
++            if (posInc == 0) {
++              // first token having posinc=0 is illegal.
++              posInc = 1;
++            }
++            first = false;
++          }
++          posIncrAtt.setPositionIncrement(posInc);
++          //System.out.println("RETURN term=" + termAtt + " numStopChars=" + numStopChars);
++          return true;
++        }
++        if (preserveHoles) {
++          skippedPositions += posIncrAtt.getPositionIncrement();
++        }
++      }
++
++      return false;
++    }
++  }
++
++  private static class MockTokenEatingAnalyzer extends Analyzer {
++    private int numStopChars;
++    private boolean preserveHoles;
++
++    public MockTokenEatingAnalyzer(int numStopChars, boolean preserveHoles) {
++      this.preserveHoles = preserveHoles;
++      this.numStopChars = numStopChars;
++    }
++
++    @Override
++    public TokenStreamComponents createComponents(String fieldName, Reader reader) {
++      MockTokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.WHITESPACE, false, MockTokenizer.DEFAULT_MAX_TOKEN_LENGTH);
++      tokenizer.setEnableChecks(true);
++      TokenStream next;
++      if (numStopChars != 0) {
++        next = new TokenEater(preserveHoles, tokenizer, numStopChars);
++      } else {
++        next = tokenizer;
++      }
++      return new TokenStreamComponents(tokenizer, next);
++    }
++  }
++
++  public void testRandom() throws Exception {
++
++    int numQueries = atLeast(1000);
++    
++    final List<TermFreq2> slowCompletor = new ArrayList<TermFreq2>();
++    final TreeSet<String> allPrefixes = new TreeSet<String>();
++    final Set<String> seen = new HashSet<String>();
++    
++    TermFreq[] keys = new TermFreq[numQueries];
++
++    boolean preserveSep = random().nextBoolean();
++
++    final int numStopChars = random().nextInt(10);
++    final boolean preserveHoles = random().nextBoolean();
++
++    if (VERBOSE) {
++      System.out.println("TEST: " + numQueries + " words; preserveSep=" + preserveSep + " numStopChars=" + numStopChars + " preserveHoles=" + preserveHoles);
++    }
++    
++    for (int i = 0; i < numQueries; i++) {
++      int numTokens = _TestUtil.nextInt(random(), 1, 4);
++      String key;
++      String analyzedKey;
++      while(true) {
++        key = "";
++        analyzedKey = "";
++        for(int token=0;token < numTokens;token++) {
++          String s;
++          while (true) {
++            // TODO: would be nice to fix this slowCompletor/comparator to
++            // use full range, but we might lose some coverage too...
++            s = _TestUtil.randomSimpleString(random());
++            if (s.length() > 0) {
++              if (token > 0) {
++                key += " ";
++              }
++              if (preserveSep && analyzedKey.length() > 0 && analyzedKey.charAt(analyzedKey.length()-1) != ' ') {
++                analyzedKey += " ";
++              }
++              key += s;
++              if (s.length() == 1 && isStopChar(s.charAt(0), numStopChars)) {
++                if (preserveSep && preserveHoles) {
++                  analyzedKey += '\u0000';
++                }
++              } else {
++                analyzedKey += s;
++              }
++              break;
++            }
++          }
++        }
++
++        analyzedKey = analyzedKey.replaceAll("(^| )\u0000$", "");
++
++        // Don't add same surface form more than once:
++        if (!seen.contains(key)) {
++          seen.add(key);
++          break;
++        }
++      }
++
++      for (int j = 1; j < key.length(); j++) {
++        allPrefixes.add(key.substring(0, j));
++      }
++      // we can probably do Integer.MAX_VALUE here, but why worry.
++      int weight = random().nextInt(1<<24);
++      keys[i] = new TermFreq(key, weight);
++
++      slowCompletor.add(new TermFreq2(key, analyzedKey, weight));
++    }
++
++    if (VERBOSE) {
++      // Don't just sort original list, to avoid VERBOSE
++      // altering the test:
++      List<TermFreq2> sorted = new ArrayList<TermFreq2>(slowCompletor);
++      Collections.sort(sorted);
++      for(TermFreq2 ent : sorted) {
++        System.out.println("  surface='" + ent.surfaceForm + " analyzed='" + ent.analyzedForm + "' weight=" + ent.weight);
++      }
++    }
++
++    Analyzer a = new MockTokenEatingAnalyzer(numStopChars, preserveHoles);
++    AnalyzingSuggester suggester = new AnalyzingSuggester(a, a,
++                                                          preserveSep ? AnalyzingSuggester.PRESERVE_SEP : 0, 256, -1);
++    suggester.build(new TermFreqArrayIterator(keys));
++
++    for (String prefix : allPrefixes) {
++
++      if (VERBOSE) {
++        System.out.println("\nTEST: prefix=" + prefix);
++      }
++
++      final int topN = _TestUtil.nextInt(random(), 1, 10);
++      List<LookupResult> r = suggester.lookup(_TestUtil.stringToCharSequence(prefix, random()), false, topN);
++
++      // 2. go thru whole set to find suggestions:
++      List<LookupResult> matches = new ArrayList<LookupResult>();
++
++      // "Analyze" the key:
++      String[] tokens = prefix.split(" ");
++      StringBuilder builder = new StringBuilder();
++      for(int i=0;i<tokens.length;i++) {
++        String token = tokens[i];
++        if (preserveSep && builder.length() > 0 && !builder.toString().endsWith(" ")) {
++          builder.append(' ');
++        }
++
++        if (token.length() == 1 && isStopChar(token.charAt(0), numStopChars)) {
++          if (preserveSep && preserveHoles) {
++            builder.append("\u0000");
++          }
++        } else {
++          builder.append(token);
++        }
++      }
++
++      String analyzedKey = builder.toString();
++
++      // Remove trailing sep/holes (TokenStream.end() does
++      // not tell us any trailing holes, yet ... there is an
++      // issue open for this):
++      while (true) {
++        String s = analyzedKey.replaceAll("(^| )\u0000$", "");
++        s = s.replaceAll("\\s+$", "");
++        if (s.equals(analyzedKey)) {
++          break;
++        }
++        analyzedKey = s;
++      }
++
++      if (analyzedKey.length() == 0) {
++        // Currently suggester can't suggest from the empty
++        // string!  You get no results, not all results...
++        continue;
++      }
++
++      if (VERBOSE) {
++        System.out.println("  analyzed: " + analyzedKey);
++      }
++
++      // TODO: could be faster... but its slowCompletor for a reason
++      for (TermFreq2 e : slowCompletor) {
++        if (e.analyzedForm.startsWith(analyzedKey)) {
++          matches.add(new LookupResult(e.surfaceForm, e.weight));
++        }
++      }
++
++      assertTrue(numStopChars > 0 || matches.size() > 0);
++
++      if (matches.size() > 1) {
++        Collections.sort(matches, new Comparator<LookupResult>() {
++            public int compare(LookupResult left, LookupResult right) {
++              int cmp = Float.compare(right.value, left.value);
++              if (cmp == 0) {
++                return left.compareTo(right);
++              } else {
++                return cmp;
++              }
++            }
++          });
++      }
++
++      if (matches.size() > topN) {
++        matches = matches.subList(0, topN);
++      }
++
++      if (VERBOSE) {
++        System.out.println("  expected:");
++        for(LookupResult lr : matches) {
++          System.out.println("    key=" + lr.key + " weight=" + lr.value);
++        }
++
++        System.out.println("  actual:");
++        for(LookupResult lr : r) {
++          System.out.println("    key=" + lr.key + " weight=" + lr.value);
++        }
++      }
++
++      assertEquals(matches.size(), r.size());
++
++      for(int hit=0;hit<r.size();hit++) {
++        //System.out.println("  check hit " + hit);
++        assertEquals(matches.get(hit).key.toString(), r.get(hit).key.toString());
++        assertEquals(matches.get(hit).value, r.get(hit).value, 0f);
++      }
++    }
++  }
++
++  public void testStolenBytes() throws Exception {
++    
++    final Analyzer analyzer = new Analyzer() {
++      @Override
++      protected TokenStreamComponents createComponents(String fieldName, Reader reader) {
++        Tokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.SIMPLE, true);
++        
++        // TokenStream stream = new SynonymFilter(tokenizer, map, true);
++        // return new TokenStreamComponents(tokenizer, new RemoveDuplicatesTokenFilter(stream));
++        return new TokenStreamComponents(tokenizer) {
++          int tokenStreamCounter = 0;
++          final TokenStream[] tokenStreams = new TokenStream[] {
++            new CannedBinaryTokenStream(new BinaryToken[] {
++                token(new BytesRef(new byte[] {0x61, (byte) 0xff, 0x61})),
++              }),
++            new CannedTokenStream(new Token[] {
++                token("a",1,1),          
++                token("a",1,1)
++              }),
++            new CannedTokenStream(new Token[] {
++                token("a",1,1),
++                token("a",1,1)
++              }),
++            new CannedBinaryTokenStream(new BinaryToken[] {
++                token(new BytesRef(new byte[] {0x61, (byte) 0xff, 0x61})),
++              })
++          };
++
++          @Override
++          public TokenStream getTokenStream() {
++            TokenStream result = tokenStreams[tokenStreamCounter];
++            tokenStreamCounter++;
++            return result;
++          }
++         
++          @Override
++          protected void setReader(final Reader reader) throws IOException {
++          }
++        };
++      }
++    };
++
++    TermFreq keys[] = new TermFreq[] {
++      new TermFreq("a a", 50),
++      new TermFreq("a b", 50),
++    };
++
++    AnalyzingSuggester suggester = new AnalyzingSuggester(analyzer);
++    suggester.build(new TermFreqArrayIterator(keys));
++    List<LookupResult> results = suggester.lookup("a a", false, 5);
++    assertEquals(1, results.size());
++    assertEquals("a b", results.get(0).key);
++    assertEquals(50, results.get(0).value);
++
++    results = suggester.lookup("a a", false, 5);
++    assertEquals(1, results.size());
++    assertEquals("a a", results.get(0).key);
++    assertEquals(50, results.get(0).value);
++  }
++
++  public void testMaxSurfaceFormsPerAnalyzedForm() throws Exception {
++    Analyzer a = new MockAnalyzer(random());
++    AnalyzingSuggester suggester = new AnalyzingSuggester(a, a, 0, 2, -1);
++
++    List<TermFreq> keys = Arrays.asList(new TermFreq[] {
++        new TermFreq("a", 40),
++        new TermFreq("a ", 50),
++        new TermFreq(" a", 60),
++      });
++
++    Collections.shuffle(keys, random());
++    suggester.build(new TermFreqArrayIterator(keys));
++
++    List<LookupResult> results = suggester.lookup("a", false, 5);
++    assertEquals(2, results.size());
++    assertEquals(" a", results.get(0).key);
++    assertEquals(60, results.get(0).value);
++    assertEquals("a ", results.get(1).key);
++    assertEquals(50, results.get(1).value);
++  }
++}
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/fst/WFSTCompletionTest.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/fst/WFSTCompletionTest.java
+index ebae174..accceeb 100644
+--- a/lucene/suggest/src/test/org/apache/lucene/search/suggest/fst/WFSTCompletionTest.java
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/fst/WFSTCompletionTest.java
+@@ -44,7 +44,13 @@ public class WFSTCompletionTest extends LuceneTestCase {
+     assertEquals(1, results.size());
+     assertEquals("foo", results.get(0).key.toString());
+     assertEquals(50, results.get(0).value, 0.01F);
+-    
++
++    // make sure we don't get a dup exact suggestion:
++    results = suggester.lookup(_TestUtil.stringToCharSequence("foo", random), true, 2);
++    assertEquals(1, results.size());
++    assertEquals("foo", results.get(0).key.toString());
++    assertEquals(50, results.get(0).value, 0.01F);
++
+     // top N of 1 for 'bar': we return this even though barbar is higher
+     results = suggester.lookup(_TestUtil.stringToCharSequence("bar", random), false, 1);
+     assertEquals(1, results.size());
+@@ -69,6 +75,54 @@ public class WFSTCompletionTest extends LuceneTestCase {
+     assertEquals("barbara", results.get(2).key.toString());
+     assertEquals(6, results.get(2).value, 0.01F);
+   }
++
++  public void testExactFirst() throws Exception {
++
++    WFSTCompletionLookup suggester = new WFSTCompletionLookup(true);
++
++    suggester.build(new TermFreqArrayIterator(new TermFreq[] {
++          new TermFreq("x y", 20),
++          new TermFreq("x", 2),
++        }));
++
++    for(int topN=1;topN<4;topN++) {
++      List<LookupResult> results = suggester.lookup("x", false, topN);
++
++      assertEquals(Math.min(topN, 2), results.size());
++
++      assertEquals("x", results.get(0).key);
++      assertEquals(2, results.get(0).value);
++
++      if (topN > 1) {
++        assertEquals("x y", results.get(1).key);
++        assertEquals(20, results.get(1).value);
++      }
++    }
++  }
++
++  public void testNonExactFirst() throws Exception {
++
++    WFSTCompletionLookup suggester = new WFSTCompletionLookup(false);
++
++    suggester.build(new TermFreqArrayIterator(new TermFreq[] {
++          new TermFreq("x y", 20),
++          new TermFreq("x", 2),
++        }));
++
++    for(int topN=1;topN<4;topN++) {
++      List<LookupResult> results = suggester.lookup("x", false, topN);
++
++      assertEquals(Math.min(topN, 2), results.size());
++
++      assertEquals("x y", results.get(0).key);
++      assertEquals(20, results.get(0).value);
++
++      if (topN > 1) {
++        assertEquals("x", results.get(1).key);
++        assertEquals(2, results.get(1).value);
++      }
++    }
++  }
+   
+   public void testRandom() throws Exception {
+     int numWords = atLeast(1000);
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/analysis/CannedBinaryTokenStream.java b/lucene/test-framework/src/java/org/apache/lucene/analysis/CannedBinaryTokenStream.java
+new file mode 100644
+index 0000000..adf1bbe
+--- /dev/null
++++ b/lucene/test-framework/src/java/org/apache/lucene/analysis/CannedBinaryTokenStream.java
+@@ -0,0 +1,135 @@
++package org.apache.lucene.analysis;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute;
++import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
++import org.apache.lucene.util.AttributeImpl;
++import org.apache.lucene.util.BytesRef;
++
++/**
++ * TokenStream from a canned list of binary (BytesRef-based)
++ * tokens.
++ */
++public final class CannedBinaryTokenStream extends TokenStream {
++
++  /** Represents a binary token. */
++  public final static class BinaryToken {
++    BytesRef term;
++    int posInc;
++    int posLen;
++    int startOffset;
++    int endOffset;
++
++    public BinaryToken(BytesRef term) {
++      this.term = term;
++      this.posInc = 1;
++      this.posLen = 1;
++    }
++
++    public BinaryToken(BytesRef term, int posInc, int posLen) {
++      this.term = term;
++      this.posInc = posInc;
++      this.posLen = posLen;
++    }
++  }
++
++  private final BinaryToken[] tokens;
++  private int upto = 0;
++  private final BinaryTermAttribute termAtt = addAttribute(BinaryTermAttribute.class);
++  private final PositionIncrementAttribute posIncrAtt = addAttribute(PositionIncrementAttribute.class);
++  private final PositionLengthAttribute posLengthAtt = addAttribute(PositionLengthAttribute.class);
++  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
++
++  /** An attribute extending {@link
++   *  TermToBytesRefAttribute} but exposing {@link
++   *  #setBytesRef} method. */
++  public interface BinaryTermAttribute extends TermToBytesRefAttribute {
++
++    /** Set the current binary value. */
++    public void setBytesRef(BytesRef bytes);
++  }
++
++  /** Implementation for {@link BinaryTermAttribute}. */
++  public final static class BinaryTermAttributeImpl extends AttributeImpl implements BinaryTermAttribute, TermToBytesRefAttribute {
++    private final BytesRef bytes = new BytesRef();
++
++    @Override
++    public int fillBytesRef() {
++      return bytes.hashCode();
++    }
++      
++    @Override
++    public BytesRef getBytesRef() {
++      return bytes;
++    }
++
++    public void setBytesRef(BytesRef bytes) {
++      this.bytes.copyBytes(bytes);
++    }
++    
++    @Override
++    public void clear() {
++    }
++
++    @Override
++    public boolean equals(Object other) {
++      return other == this;
++    }
++
++    @Override
++    public int hashCode() {
++      return System.identityHashCode(this);
++    }
++    
++    @Override
++    public void copyTo(AttributeImpl target) {
++      BinaryTermAttributeImpl other = (BinaryTermAttributeImpl) target;
++      other.bytes.copyBytes(bytes);
++    }
++    
++    @Override
++    public BinaryTermAttributeImpl clone() {
++      throw new UnsupportedOperationException();
++    }
++  }
++
++  public CannedBinaryTokenStream(BinaryToken... tokens) {
++    super();
++    this.tokens = tokens;
++  }
++  
++  @Override
++  public boolean incrementToken() {
++    if (upto < tokens.length) {
++      final BinaryToken token = tokens[upto++];     
++      // TODO: can we just capture/restoreState so
++      // we get all attrs...?
++      clearAttributes();      
++      termAtt.setBytesRef(token.term);
++      posIncrAtt.setPositionIncrement(token.posInc);
++      posLengthAtt.setPositionLength(token.posLen);
++      offsetAtt.setOffset(token.startOffset, token.endOffset);
++      return true;
++    } else {
++      return false;
++    }
++  }
++}
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/util/RollingBuffer.java b/lucene/test-framework/src/java/org/apache/lucene/util/RollingBuffer.java
+deleted file mode 100644
+index 4450d36..0000000
+--- a/lucene/test-framework/src/java/org/apache/lucene/util/RollingBuffer.java
++++ /dev/null
+@@ -1,133 +0,0 @@
+-package org.apache.lucene.util;
+-
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-// TODO: probably move this to core at some point (eg,
+-// cutover kuromoji, synfilter, LookaheadTokenFilter)
+-
+-/** Acts like forever growing T[], but internally uses a
+- *  circular buffer to reuse instances of T.
+- * 
+- *  @lucene.internal */
+-public abstract class RollingBuffer<T extends RollingBuffer.Resettable> {
+-
+-  /**
+-   * Implement to reset an instance
+-   */
+-  public static interface Resettable {
+-    public void reset();
+-  }
+-
+-  @SuppressWarnings("unchecked") private T[] buffer = (T[]) new RollingBuffer.Resettable[8];
+-
+-  // Next array index to write to:
+-  private int nextWrite;
+-
+-  // Next position to write:
+-  private int nextPos;
+-
+-  // How many valid Position are held in the
+-  // array:
+-  private int count;
+-
+-  public RollingBuffer() {
+-    for(int idx=0;idx<buffer.length;idx++) {
+-      buffer[idx] = newInstance();
+-    }
+-  }
+-
+-  protected abstract T newInstance();
+-
+-  public void reset() {
+-    nextWrite--;
+-    while (count > 0) {
+-      if (nextWrite == -1) {
+-        nextWrite = buffer.length - 1;
+-      }
+-      buffer[nextWrite--].reset();
+-      count--;
+-    }
+-    nextWrite = 0;
+-    nextPos = 0;
+-    count = 0;
+-  }
+-
+-  // For assert:
+-  private boolean inBounds(int pos) {
+-    return pos < nextPos && pos >= nextPos - count;
+-  }
+-
+-  private int getIndex(int pos) {
+-    int index = nextWrite - (nextPos - pos);
+-    if (index < 0) {
+-      index += buffer.length;
+-    }
+-    return index;
+-  }
+-
+-  /** Get T instance for this absolute position;
+-   *  this is allowed to be arbitrarily far "in the
+-   *  future" but cannot be before the last freeBefore. */
+-  public T get(int pos) {
+-    //System.out.println("RA.get pos=" + pos + " nextPos=" + nextPos + " nextWrite=" + nextWrite + " count=" + count);
+-    while (pos >= nextPos) {
+-      if (count == buffer.length) {
+-        @SuppressWarnings("unchecked") T[] newBuffer = (T[]) new Resettable[ArrayUtil.oversize(1+count, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+-        //System.out.println("  grow length=" + newBuffer.length);
+-        System.arraycopy(buffer, nextWrite, newBuffer, 0, buffer.length-nextWrite);
+-        System.arraycopy(buffer, 0, newBuffer, buffer.length-nextWrite, nextWrite);
+-        for(int i=buffer.length;i<newBuffer.length;i++) {
+-          newBuffer[i] = newInstance();
+-        }
+-        nextWrite = buffer.length;
+-        buffer = newBuffer;
+-      }
+-      if (nextWrite == buffer.length) {
+-        nextWrite = 0;
+-      }
+-      // Should have already been reset:
+-      nextWrite++;
+-      nextPos++;
+-      count++;
+-    }
+-    assert inBounds(pos);
+-    final int index = getIndex(pos);
+-    //System.out.println("  pos=" + pos + " nextPos=" + nextPos + " -> index=" + index);
+-    //assert buffer[index].pos == pos;
+-    return buffer[index];
+-  }
+-
+-  public void freeBefore(int pos) {
+-    final int toFree = count - (nextPos - pos);
+-    assert toFree >= 0;
+-    assert toFree <= count: "toFree=" + toFree + " count=" + count;
+-    int index = nextWrite - count;
+-    if (index < 0) {
+-      index += buffer.length;
+-    }
+-    for(int i=0;i<toFree;i++) {
+-      if (index == buffer.length) {
+-        index = 0;
+-      }
+-      //System.out.println("  fb idx=" + index);
+-      buffer[index].reset();
+-      index++;
+-    }
+-    count -= toFree;
+-  }
+-}
+

@@ -1,0 +1,190 @@
+GitDiffStart: 5330bd6d2b196e77516ae64995cd038623fdf1d9 | Wed Sep 2 12:36:37 2015 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 407b64a..02ca50c 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -83,6 +83,9 @@ Optimizations
+ * LUCENE-6746: DisjunctionMaxQuery, BoostingQuery and BoostedQuery now create
+   sub weights through IndexSearcher so that they can be cached. (Adrien Grand)
+ 
++* LUCENE-6754: Optimized IndexSearcher.count for the cases when it can use
++  index statistics instead of collecting all matches. (Adrien Grand)
++
+ Bug Fixes
+ 
+ * LUCENE-6730: Hyper-parameter c is ignored in term frequency NormalizationH1.
+diff --git a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+index a72df69..197bab3 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -339,6 +339,29 @@ public class IndexSearcher {
+    * Count how many documents match the given query.
+    */
+   public int count(Query query) throws IOException {
++    query = rewrite(query);
++    while (true) {
++      // remove wrappers that don't matter for counts
++      if (query instanceof ConstantScoreQuery) {
++        query = ((ConstantScoreQuery) query).getQuery();
++      } else {
++        break;
++      }
++    }
++
++    // some counts can be computed in constant time
++    if (query instanceof MatchAllDocsQuery) {
++      return reader.numDocs();
++    } else if (query instanceof TermQuery && reader.hasDeletions() == false) {
++      Term term = ((TermQuery) query).getTerm();
++      int count = 0;
++      for (LeafReaderContext leaf : reader.leaves()) {
++        count += leaf.reader().docFreq(term);
++      }
++      return count;
++    }
++
++    // general case: create a collecor and count matches
+     final CollectorManager<TotalHitCountCollector, Integer> collectorManager = new CollectorManager<TotalHitCountCollector, Integer>() {
+ 
+       @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java b/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+index 7b703c6..ea2c53e 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestIndexSearcher.java
+@@ -18,6 +18,7 @@ package org.apache.lucene.search;
+  */
+ 
+ import java.io.IOException;
++import java.util.Arrays;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+@@ -31,6 +32,7 @@ import org.apache.lucene.document.StringField;
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause.Occur;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+@@ -42,7 +44,7 @@ import org.junit.Test;
+ public class TestIndexSearcher extends LuceneTestCase {
+   Directory dir;
+   IndexReader reader;
+-  
++
+   @Override
+   public void setUp() throws Exception {
+     super.setUp();
+@@ -58,20 +60,20 @@ public class TestIndexSearcher extends LuceneTestCase {
+     reader = iw.getReader();
+     iw.close();
+   }
+-  
++
+   @Override
+   public void tearDown() throws Exception {
+     super.tearDown();
+     reader.close();
+     dir.close();
+   }
+-  
++
+   // should not throw exception
+   public void testHugeN() throws Exception {
+     ExecutorService service = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
+                                    new LinkedBlockingQueue<Runnable>(),
+                                    new NamedThreadFactory("TestIndexSearcher"));
+-    
++
+     IndexSearcher searchers[] = new IndexSearcher[] {
+         new IndexSearcher(reader),
+         new IndexSearcher(reader, service)
+@@ -88,7 +90,7 @@ public class TestIndexSearcher extends LuceneTestCase {
+         null,
+         new FieldDoc(0, 0f, new Object[] { new BytesRef("boo!") })
+     };
+-    
++
+     for (IndexSearcher searcher : searchers) {
+       for (ScoreDoc after : afters) {
+         for (Query query : queries) {
+@@ -111,10 +113,10 @@ public class TestIndexSearcher extends LuceneTestCase {
+         }
+       }
+     }
+-    
++
+     TestUtil.shutdownExecutorService(service);
+   }
+-  
++
+   @Test
+   public void testSearchAfterPassedMaxDoc() throws Exception {
+     // LUCENE-5128: ensure we get a meaningful message if searchAfter exceeds maxDoc
+@@ -123,7 +125,7 @@ public class TestIndexSearcher extends LuceneTestCase {
+     w.addDocument(new Document());
+     IndexReader r = w.getReader();
+     w.close();
+-    
++
+     IndexSearcher s = new IndexSearcher(r);
+     try {
+       s.searchAfter(new ScoreDoc(r.maxDoc(), 0.54f), new MatchAllDocsQuery(), 10);
+@@ -144,15 +146,36 @@ public class TestIndexSearcher extends LuceneTestCase {
+       if (random().nextBoolean()) {
+         doc.add(new StringField("foo", "bar", Store.NO));
+       }
++      if (random().nextBoolean()) {
++        doc.add(new StringField("foo", "baz", Store.NO));
++      }
++      if (rarely()) {
++        doc.add(new StringField("delete", "yes", Store.NO));
++      }
+       w.addDocument(doc);
+     }
+-    w.commit();
+-    final IndexReader reader = w.getReader();
++    for (boolean delete : new boolean[] {false, true}) {
++      if (delete) {
++        w.deleteDocuments(new Term("delete", "yes"));
++      }
++      final IndexReader reader = w.getReader();
++      final IndexSearcher searcher = newSearcher(reader);
++      // Test multiple queries, some of them are optimized by IndexSearcher.count()
++      for (Query query : Arrays.asList(
++          new MatchAllDocsQuery(),
++          new MatchNoDocsQuery(),
++          new TermQuery(new Term("foo", "bar")),
++          new ConstantScoreQuery(new TermQuery(new Term("foo", "baz"))),
++          new BooleanQuery.Builder()
++            .add(new TermQuery(new Term("foo", "bar")), Occur.SHOULD)
++            .add(new TermQuery(new Term("foo", "baz")), Occur.SHOULD)
++            .build()
++          )) {
++        assertEquals(searcher.count(query), searcher.search(query, 1).totalHits);
++      }
++      reader.close();
++    }
+     w.close();
+-    final IndexSearcher searcher = newSearcher(reader);
+-    final Query query = new TermQuery(new Term("foo", "bar"));
+-    assertEquals(searcher.count(query), searcher.search(query, 1).totalHits);
+-    reader.close();
+     dir.close();
+   }
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/search/TestLRUQueryCache.java b/lucene/core/src/test/org/apache/lucene/search/TestLRUQueryCache.java
+index f058fb6..cb45f51 100644
+--- a/lucene/core/src/test/org/apache/lucene/search/TestLRUQueryCache.java
++++ b/lucene/core/src/test/org/apache/lucene/search/TestLRUQueryCache.java
+@@ -971,7 +971,7 @@ public class TestLRUQueryCache extends LuceneTestCase {
+     
+     try {
+       // trigger an eviction
+-      searcher.count(new MatchAllDocsQuery());
++      searcher.search(new MatchAllDocsQuery(), new TotalHitCountCollector());
+       fail();
+     } catch (ConcurrentModificationException e) {
+       // expected
+

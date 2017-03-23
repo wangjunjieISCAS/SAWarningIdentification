@@ -1,0 +1,393 @@
+GitDiffStart: 1d4ab6879680d35a212539a85ff942e081ef0579 | Mon Feb 11 20:34:49 2008 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 15243dc..76b1a45 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -49,6 +49,12 @@ API Changes
+     see the changes.  Deprecate IndexWriter.flush() in favor of
+     IndexWriter.commit().  (Mike McCandless)
+ 
++ 5. LUCENE-325: Added IndexWriter.expungeDeletes methods, which
++    consult the MergePolicy to find merges necessary to merge away all
++    deletes from the index.  This should be a somewhat lower cost
++    operation than optimize.  (John Wang via Mike McCandless)
++
++
+ Bug fixes
+     
+  1. LUCENE-1134: Fixed BooleanQuery.rewrite to only optimze a single 
+diff --git a/src/java/org/apache/lucene/index/IndexWriter.java b/src/java/org/apache/lucene/index/IndexWriter.java
+index 0bccc2a..1a7ada1 100644
+--- a/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -26,7 +26,6 @@ import org.apache.lucene.store.Lock;
+ import org.apache.lucene.store.LockObtainFailedException;
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.util.BitVector;
+-import org.apache.lucene.util.Parameter;
+ import org.apache.lucene.util.Constants;
+ 
+ import java.io.File;
+@@ -2163,6 +2162,7 @@ public class IndexWriter {
+           try {
+             wait();
+           } catch (InterruptedException ie) {
++            Thread.currentThread().interrupt();
+           }
+ 
+           if (mergeExceptions.size() > 0) {
+@@ -2205,6 +2205,87 @@ public class IndexWriter {
+     return false;
+   }
+ 
++  /** Just like {@link #expungeDeletes()}, except you can
++   *  specify whether the call should block until the
++   *  operation completes.  This is only meaningful with a
++   *  {@link MergeScheduler} that is able to run merges in
++   *  background threads. */
++  public void expungeDeletes(boolean doWait)
++    throws CorruptIndexException, IOException {
++    ensureOpen();
++
++    if (infoStream != null)
++      message("expungeDeletes: index now " + segString());
++
++    MergePolicy.MergeSpecification spec;
++
++    synchronized(this) {
++      spec = mergePolicy.findMergesToExpungeDeletes(segmentInfos, this);
++      if (spec != null) {
++        final int numMerges = spec.merges.size();
++        for(int i=0;i<numMerges;i++)
++          registerMerge((MergePolicy.OneMerge) spec.merges.get(i));
++      }
++    }
++
++    mergeScheduler.merge(this);
++
++    if (spec != null && doWait) {
++      final int numMerges = spec.merges.size();
++      synchronized(this) {
++        boolean running = true;
++        while(running) {
++
++          running = false;
++          for(int i=0;i<numMerges;i++) {
++            final MergePolicy.OneMerge merge = (MergePolicy.OneMerge) spec.merges.get(i);
++            if (pendingMerges.contains(merge) || runningMerges.contains(merge))
++              running = true;
++            Throwable t = merge.getException();
++            if (t != null) {
++              IOException ioe = new IOException("background merge hit exception: " + merge.segString(directory));
++              ioe.initCause(t);
++              throw ioe;
++            }
++          }
++
++          if (running) {
++            try {
++              wait();
++            } catch (InterruptedException ie) {
++              Thread.currentThread().interrupt();
++            }
++          }
++        }
++      }
++    }
++
++    // NOTE: in the ConcurrentMergeScheduler case, when
++    // doWait is false, we can return immediately while
++    // background threads accomplish the optimization
++  }
++
++
++  /** Expunges all deletes from the index.  When and index
++   *  has many document deletions (or updates to existing
++   *  documents), it's best to either call optimize or
++   *  expungeDeletes to remove all unusged data in the index
++   *  associated with the deleted documents.  To see how
++   *  many deletions you have pending in your index, call
++   *  {@link IndexReader#maxDoc - IndexReader#numDocs}.
++   *  This saves disk space and memory usage while
++   *  searching.  expungeDeletes should be somewhat faster
++   *  than optimize since it does not insist on reducing the
++   *  index to a single segment (though, this depends on the
++   *  {@link MergePolicy}; see {@link
++   *  MergePolicy#findMergesToExpungeDeletes}.). Note that
++   *  this call does not first commit any buffered
++   *  documents, so you must do so yourself if necessary.
++   *  See also {@link #expungeDeletes(boolean)}*/
++  public void expungeDeletes() throws CorruptIndexException, IOException {
++    expungeDeletes(true);
++  }
++
+   /**
+    * Expert: asks the mergePolicy whether any merges are
+    * necessary now and if so, runs the requested merges and
+diff --git a/src/java/org/apache/lucene/index/LogMergePolicy.java b/src/java/org/apache/lucene/index/LogMergePolicy.java
+index b12287d..b5c59b2 100644
+--- a/src/java/org/apache/lucene/index/LogMergePolicy.java
++++ b/src/java/org/apache/lucene/index/LogMergePolicy.java
+@@ -245,6 +245,54 @@ public abstract class LogMergePolicy extends MergePolicy {
+     return spec;
+   }
+ 
++  /**
++   * Finds merges necessary to expunge all deletes from the
++   * index.  We simply merge adjacent segments that have
++   * deletes, up to mergeFactor at a time.
++   */ 
++  public MergeSpecification findMergesToExpungeDeletes(SegmentInfos segmentInfos,
++                                                       IndexWriter writer)
++    throws CorruptIndexException, IOException
++  {
++    this.writer = writer;
++
++    final int numSegments = segmentInfos.size();
++
++    message("findMergesToExpungeDeletes: " + numSegments + " segments");
++
++    MergeSpecification spec = new MergeSpecification();
++    int firstSegmentWithDeletions = -1;
++    for(int i=0;i<numSegments;i++) {
++      final SegmentInfo info = segmentInfos.info(i);
++      if (info.hasDeletions()) {
++        message("  segment " + info.name + " has deletions");
++        if (firstSegmentWithDeletions == -1)
++          firstSegmentWithDeletions = i;
++        else if (i - firstSegmentWithDeletions == mergeFactor) {
++          // We've seen mergeFactor segments in a row with
++          // deletions, so force a merge now:
++          message("  add merge " + firstSegmentWithDeletions + " to " + (i-1) + " inclusive");
++          spec.add(new OneMerge(segmentInfos.range(firstSegmentWithDeletions, i), useCompoundFile));
++          firstSegmentWithDeletions = i;
++        }
++      } else if (firstSegmentWithDeletions != -1) {
++        // End of a sequence of segments with deletions, so,
++        // merge those past segments even if it's fewer than
++        // mergeFactor segments
++        message("  add merge " + firstSegmentWithDeletions + " to " + (i-1) + " inclusive");
++        spec.add(new OneMerge(segmentInfos.range(firstSegmentWithDeletions, i), useCompoundFile));
++        firstSegmentWithDeletions = -1;
++      }
++    }
++
++    if (firstSegmentWithDeletions != -1) {
++      message("  add merge " + firstSegmentWithDeletions + " to " + (numSegments-1) + " inclusive");
++      spec.add(new OneMerge(segmentInfos.range(firstSegmentWithDeletions, numSegments), useCompoundFile));
++    }
++
++    return spec;
++  }
++
+   /** Checks if any merges are now necessary and returns a
+    *  {@link MergePolicy.MergeSpecification} if so.  A merge
+    *  is necessary when there are more than {@link
+diff --git a/src/java/org/apache/lucene/index/MergePolicy.java b/src/java/org/apache/lucene/index/MergePolicy.java
+index 7b55b49..7393215 100644
+--- a/src/java/org/apache/lucene/index/MergePolicy.java
++++ b/src/java/org/apache/lucene/index/MergePolicy.java
+@@ -50,6 +50,8 @@ import java.util.Set;
+  * 
+  * <p>The default MergePolicy is {@link
+  * LogByteSizeMergePolicy}.</p>
++ * <p><b>NOTE:</b> This API is new and still experimental
++ * (subject to change suddenly in the next release)</p>
+  */
+ 
+ public abstract class MergePolicy {
+@@ -209,7 +211,7 @@ public abstract class MergePolicy {
+     throws CorruptIndexException, IOException;
+ 
+   /**
+-   * Determine what set of merge operations are necessary in
++   * Determine what set of merge operations is necessary in
+    * order to optimize the index.  The IndexWriter calls
+    * this when its optimize() method is called.  This call
+    * is always synchronized on the IndexWriter instance so
+@@ -230,6 +232,19 @@ public abstract class MergePolicy {
+     throws CorruptIndexException, IOException;
+ 
+   /**
++   * Determine what set of merge operations is necessary in
++   * order to expunge all deletes from the index.
++   * @param segmentInfos the total set of segments in the index
++   * @param writer IndexWriter instance
++   */
++  MergeSpecification findMergesToExpungeDeletes(SegmentInfos segmentInfos,
++                                                 IndexWriter writer)
++    throws CorruptIndexException, IOException
++  {
++    throw new RuntimeException("not implemented");
++  }
++
++  /**
+    * Release all resources for the policy.
+    */
+   abstract void close();
+diff --git a/src/java/org/apache/lucene/index/MergeScheduler.java b/src/java/org/apache/lucene/index/MergeScheduler.java
+index d1bef7c..f5ea104 100644
+--- a/src/java/org/apache/lucene/index/MergeScheduler.java
++++ b/src/java/org/apache/lucene/index/MergeScheduler.java
+@@ -19,10 +19,13 @@ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
+ 
+-/** Expert: {@link IndexWriter} uses an instance
++/** <p>Expert: {@link IndexWriter} uses an instance
+  *  implementing this interface to execute the merges
+  *  selected by a {@link MergePolicy}.  The default
+- *  MergeScheduler is {@link ConcurrentMergeScheduler}. */
++ *  MergeScheduler is {@link ConcurrentMergeScheduler}.</p>
++ * <p><b>NOTE:</b> This API is new and still experimental
++ * (subject to change suddenly in the next release)</p>
++*/
+ 
+ public abstract class MergeScheduler {
+ 
+diff --git a/src/test/org/apache/lucene/index/TestIndexWriter.java b/src/test/org/apache/lucene/index/TestIndexWriter.java
+index b16d7a4..2174c72 100644
+--- a/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -2977,4 +2977,140 @@ public class TestIndexWriter extends LuceneTestCase
+     reader.close();
+     dir.close();
+   }
++
++  // LUCENE-325: test expungeDeletes, when 2 singular merges
++  // are required
++  public void testExpungeDeletes() throws IOException {
++    Directory dir = new MockRAMDirectory();
++    IndexWriter writer = new IndexWriter(dir,
++                                         false, new StandardAnalyzer(),
++                                         IndexWriter.MaxFieldLength.LIMITED);
++    writer.setMaxBufferedDocs(2);
++    writer.setRAMBufferSizeMB(IndexWriter.DISABLE_AUTO_FLUSH);
++
++    Document document = new Document();
++
++    document = new Document();
++    Field storedField = new Field("stored", "stored", Field.Store.YES,
++                                  Field.Index.NO);
++    document.add(storedField);
++    Field termVectorField = new Field("termVector", "termVector",
++                                      Field.Store.NO, Field.Index.UN_TOKENIZED,
++                                      Field.TermVector.WITH_POSITIONS_OFFSETS);
++    document.add(termVectorField);
++    for(int i=0;i<10;i++)
++      writer.addDocument(document);
++    writer.close();
++
++    IndexReader ir = IndexReader.open(dir);
++    assertEquals(10, ir.maxDoc());
++    assertEquals(10, ir.numDocs());
++    ir.deleteDocument(0);
++    ir.deleteDocument(7);
++    assertEquals(8, ir.numDocs());
++    ir.close();
++
++    writer = new IndexWriter(dir,
++                             false, new StandardAnalyzer(),
++                             IndexWriter.MaxFieldLength.LIMITED);
++    writer.expungeDeletes();
++    writer.close();
++    ir = IndexReader.open(dir);
++    assertEquals(8, ir.maxDoc());
++    assertEquals(8, ir.numDocs());
++    ir.close();
++    dir.close();
++  }
++
++  // LUCENE-325: test expungeDeletes, when many adjacent merges are required
++  public void testExpungeDeletes2() throws IOException {
++    Directory dir = new MockRAMDirectory();
++    IndexWriter writer = new IndexWriter(dir,
++                                         false, new StandardAnalyzer(),
++                                         IndexWriter.MaxFieldLength.LIMITED);
++    writer.setMaxBufferedDocs(2);
++    writer.setMergeFactor(50);
++    writer.setRAMBufferSizeMB(IndexWriter.DISABLE_AUTO_FLUSH);
++
++    Document document = new Document();
++
++    document = new Document();
++    Field storedField = new Field("stored", "stored", Field.Store.YES,
++                                  Field.Index.NO);
++    document.add(storedField);
++    Field termVectorField = new Field("termVector", "termVector",
++                                      Field.Store.NO, Field.Index.UN_TOKENIZED,
++                                      Field.TermVector.WITH_POSITIONS_OFFSETS);
++    document.add(termVectorField);
++    for(int i=0;i<98;i++)
++      writer.addDocument(document);
++    writer.close();
++
++    IndexReader ir = IndexReader.open(dir);
++    assertEquals(98, ir.maxDoc());
++    assertEquals(98, ir.numDocs());
++    for(int i=0;i<98;i+=2)
++      ir.deleteDocument(i);
++    assertEquals(49, ir.numDocs());
++    ir.close();
++
++    writer = new IndexWriter(dir,
++                             false, new StandardAnalyzer(),
++                             IndexWriter.MaxFieldLength.LIMITED);
++    writer.setMergeFactor(3);
++    writer.expungeDeletes();
++    writer.close();
++    ir = IndexReader.open(dir);
++    assertEquals(49, ir.maxDoc());
++    assertEquals(49, ir.numDocs());
++    ir.close();
++    dir.close();
++  }
++
++  // LUCENE-325: test expungeDeletes without waiting, when
++  // many adjacent merges are required
++  public void testExpungeDeletes3() throws IOException {
++    Directory dir = new MockRAMDirectory();
++    IndexWriter writer = new IndexWriter(dir,
++                                         false, new StandardAnalyzer(),
++                                         IndexWriter.MaxFieldLength.LIMITED);
++    writer.setMaxBufferedDocs(2);
++    writer.setMergeFactor(50);
++    writer.setRAMBufferSizeMB(IndexWriter.DISABLE_AUTO_FLUSH);
++
++    Document document = new Document();
++
++    document = new Document();
++    Field storedField = new Field("stored", "stored", Field.Store.YES,
++                                  Field.Index.NO);
++    document.add(storedField);
++    Field termVectorField = new Field("termVector", "termVector",
++                                      Field.Store.NO, Field.Index.UN_TOKENIZED,
++                                      Field.TermVector.WITH_POSITIONS_OFFSETS);
++    document.add(termVectorField);
++    for(int i=0;i<98;i++)
++      writer.addDocument(document);
++    writer.close();
++
++    IndexReader ir = IndexReader.open(dir);
++    assertEquals(98, ir.maxDoc());
++    assertEquals(98, ir.numDocs());
++    for(int i=0;i<98;i+=2)
++      ir.deleteDocument(i);
++    assertEquals(49, ir.numDocs());
++    ir.close();
++
++    writer = new IndexWriter(dir,
++                             false, new StandardAnalyzer(),
++                             IndexWriter.MaxFieldLength.LIMITED);
++    // Force many merges to happen
++    writer.setMergeFactor(3);
++    writer.expungeDeletes(false);
++    writer.close();
++    ir = IndexReader.open(dir);
++    assertEquals(49, ir.maxDoc());
++    assertEquals(49, ir.numDocs());
++    ir.close();
++    dir.close();
++  }
+ }
+

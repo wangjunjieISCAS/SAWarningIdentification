@@ -1,0 +1,817 @@
+GitDiffStart: ecec5244df39705b00272f3a5c783c0f915a4c31 | Mon May 30 10:29:59 2016 +0200
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 9413d14..5dc8a2c 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -90,7 +90,10 @@ Optimizations
+   (which is used by TermsQuery, multi-term queries and several point queries).
+   (Adrien Grand, Jeff Wartes, David Smiley)
+ 
+-* LUCENE-7299: Speed up BytesRefHash.sort(). (Adrien Grand)
++* LUCENE-7299: Speed up BytesRefHash.sort() using radix sort. (Adrien Grand)
++
++* LUCENE-7306: Speed up points indexing and merging using radix sort.
++  (Adrien Grand)
+ 
+ Bug Fixes
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/BytesRefComparator.java b/lucene/core/src/java/org/apache/lucene/util/BytesRefComparator.java
+new file mode 100644
+index 0000000..821b8f2
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/BytesRefComparator.java
+@@ -0,0 +1,55 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++import java.util.Comparator;
++
++/** Specialized {@link BytesRef} comparator that
++ * {@link FixedLengthBytesRefArray#iterator(Comparator)} has optimizations
++ * for.
++ * @lucene.internal */
++public abstract class BytesRefComparator implements Comparator<BytesRef> {
++
++  final int comparedBytesCount;
++
++  /** Sole constructor.
++   * @param comparedBytesCount the maximum number of bytes to compare. */
++  protected BytesRefComparator(int comparedBytesCount) {
++    this.comparedBytesCount = comparedBytesCount;
++  }
++
++  /** Return the unsigned byte to use for comparison at index {@code i}, or
++   * {@code -1} if all bytes that are useful for comparisons are exhausted.
++   * This may only be called with a value of {@code i} between {@code 0}
++   * included and {@code comparedBytesCount} excluded. */
++  protected abstract int byteAt(BytesRef ref, int i);
++
++  @Override
++  public int compare(BytesRef o1, BytesRef o2) {
++    for (int i = 0; i < comparedBytesCount; ++i) {
++      final int b1 = byteAt(o1, i);
++      final int b2 = byteAt(o2, i);
++      if (b1 != b2) {
++        return b1 - b2;
++      } else if (b1 == -1) {
++        break;
++      }
++    }
++    return 0;
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/FixedLengthBytesRefArray.java b/lucene/core/src/java/org/apache/lucene/util/FixedLengthBytesRefArray.java
+index 346b908..4fc4108 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/FixedLengthBytesRefArray.java
++++ b/lucene/core/src/java/org/apache/lucene/util/FixedLengthBytesRefArray.java
+@@ -105,6 +105,35 @@ final class FixedLengthBytesRefArray implements SortableBytesRefArray {
+       orderedEntries[i] = i;
+     }
+ 
++    if (comp instanceof BytesRefComparator) {
++      BytesRefComparator bComp = (BytesRefComparator) comp;
++      new MSBRadixSorter(bComp.comparedBytesCount) {
++
++        BytesRef scratch;
++
++        {
++          scratch = new BytesRef();
++          scratch.length = valueLength;
++        }
++
++        @Override
++        protected void swap(int i, int j) {
++          int o = orderedEntries[i];
++          orderedEntries[i] = orderedEntries[j];
++          orderedEntries[j] = o;
++        }
++
++        @Override
++        protected int byteAt(int i, int k) {
++          int index1 = orderedEntries[i];
++          scratch.bytes = blocks[index1 / valuesPerBlock];
++          scratch.offset = (index1 % valuesPerBlock) * valueLength;
++          return bComp.byteAt(scratch, k);
++        }
++      }.sort(0, size());
++      return orderedEntries;
++    }
++
+     final BytesRef pivot = new BytesRef();
+     final BytesRef scratch1 = new BytesRef();
+     final BytesRef scratch2 = new BytesRef();
+diff --git a/lucene/core/src/java/org/apache/lucene/util/MSBRadixSorter.java b/lucene/core/src/java/org/apache/lucene/util/MSBRadixSorter.java
+new file mode 100644
+index 0000000..33f20b6
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/MSBRadixSorter.java
+@@ -0,0 +1,219 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++import java.util.Arrays;
++
++/** Radix sorter for variable-length strings. This class sorts based on the most
++ *  significant byte first and falls back to {@link IntroSorter} when the size
++ *  of the buckets to sort becomes small. It is <b>NOT</b> stable.
++ *  Worst-case memory usage is about {@code 2.3 KB}.
++ *  @lucene.internal */
++public abstract class MSBRadixSorter extends Sorter {
++
++  // after that many levels of recursion we fall back to introsort anyway
++  // this is used as a protection against the fact that radix sort performs
++  // worse when there are long common prefixes (probably because of cache
++  // locality)
++  private static final int LEVEL_THRESHOLD = 8;
++  // size of histograms: 256 + 1 to indicate that the string is finished
++  private static final int HISTOGRAM_SIZE = 257;
++  // buckets below this size will be sorted with introsort
++  private static final int LENGTH_THRESHOLD = 100;
++
++  // we store one histogram per recursion level
++  private final int[][] histograms = new int[LEVEL_THRESHOLD][];
++  private final int[] endOffsets = new int[HISTOGRAM_SIZE];
++
++  private final int maxLength;
++
++  /**
++   * Sole constructor.
++   * @param maxLength the maximum length of keys, pass {@link Integer#MAX_VALUE} if unknown.
++   */
++  protected MSBRadixSorter(int maxLength) {
++    this.maxLength = maxLength;
++  }
++
++  /** Return the k-th byte of the entry at index {@code i}, or {@code -1} if
++   * its length is less than or equal to {@code k}. This may only be called
++   * with a value of {@code i} between {@code 0} included and
++   * {@code maxLength} excluded. */
++  protected abstract int byteAt(int i, int k);
++
++  /** Get a fall-back sorter which may assume that the first k bytes of all compared strings are equal. */
++  protected Sorter getFallbackSorter(int k) {
++    return new IntroSorter() {
++      @Override
++      protected void swap(int i, int j) {
++        MSBRadixSorter.this.swap(i, j);
++      }
++
++      @Override
++      protected int compare(int i, int j) {
++        for (int o = k; o < maxLength; ++o) {
++          final int b1 = byteAt(i, o);
++          final int b2 = byteAt(j, o);
++          if (b1 != b2) {
++            return b1 - b2;
++          } else if (b1 == -1) {
++            break;
++          }
++        }
++        return 0;
++      }
++
++      @Override
++      protected void setPivot(int i) {
++        pivot.setLength(0);
++        for (int o = k; o < maxLength; ++o) {
++          final int b = byteAt(i, o);
++          if (b == -1) {
++            break;
++          }
++          pivot.append((byte) b);
++        }
++      }
++
++      @Override
++      protected int comparePivot(int j) {
++        for (int o = 0; o < pivot.length(); ++o) {
++          final int b1 = pivot.byteAt(o) & 0xff;
++          final int b2 = byteAt(j, k + o);
++          if (b1 != b2) {
++            return b1 - b2;
++          }
++        }
++        if (k + pivot.length() == maxLength) {
++          return 0;
++        }
++        return -1 - byteAt(j, k + pivot.length());
++      }
++
++      private final BytesRefBuilder pivot = new BytesRefBuilder();
++    };
++  }
++
++  @Override
++  protected final int compare(int i, int j) {
++    throw new UnsupportedOperationException("unused: not a comparison-based sort");
++  }
++
++  @Override
++  public void sort(int from, int to) {
++    checkRange(from, to);
++    sort(from, to, 0);
++  }
++
++  private void sort(int from, int to, int k) {
++    if (to - from <= LENGTH_THRESHOLD || k >= LEVEL_THRESHOLD) {
++      introSort(from, to, k);
++    } else {
++      radixSort(from, to, k);
++    }
++  }
++
++  private void introSort(int from, int to, int k) {
++    getFallbackSorter(k).sort(from, to);
++  }
++
++  private void radixSort(int from, int to, int k) {
++    int[] histogram = histograms[k];
++    if (histogram == null) {
++      histogram = histograms[k] = new int[HISTOGRAM_SIZE];
++    } else {
++      Arrays.fill(histogram, 0);
++    }
++
++    buildHistogram(from, to, k, histogram);
++
++    // short-circuit: if all keys have the same byte at offset k, then recurse directly
++    for (int i = 0; i < HISTOGRAM_SIZE; ++i) {
++      if (histogram[i] == to - from) {
++        // everything is in the same bucket, recurse
++        if (i > 0) {
++          sort(from, to, k + 1);
++        }
++        return;
++      } else if (histogram[i] != 0) {
++        break;
++      }
++    }
++
++    int[] startOffsets = histogram;
++    int[] endOffsets = this.endOffsets;
++    sumHistogram(histogram, endOffsets);
++    reorder(from, to, startOffsets, endOffsets, k);
++    endOffsets = startOffsets;
++
++    if (k + 1 < maxLength) {
++      // recurse on all but the first bucket since all keys are equals in this
++      // bucket (we already compared all bytes)
++      for (int prev = endOffsets[0], i = 1; i < HISTOGRAM_SIZE; ++i) {
++        int h = endOffsets[i];
++        final int bucketLen = h - prev;
++        if (bucketLen > 1) {
++          sort(from + prev, from + h, k + 1);
++        }
++        prev = h;
++      }
++    }
++  }
++
++  /** Return a number for the k-th character between 0 and {@link #HISTOGRAM_SIZE}. */
++  private int getBucket(int i, int k) {
++    return byteAt(i, k) + 1;
++  }
++
++  /** Build a histogram of the number of values per {@link #getBucket(int, int) bucket}. */
++  private int[] buildHistogram(int from, int to, int k, int[] histogram) {
++    for (int i = from; i < to; ++i) {
++      histogram[getBucket(i, k)]++;
++    }
++    return histogram;
++  }
++
++  /** Accumulate values of the histogram so that it does not store counts but
++   *  start offsets. {@code endOffsets} will store the end offsets. */
++  private static void sumHistogram(int[] histogram, int[] endOffsets) {
++    int accum = 0;
++    for (int i = 0; i < HISTOGRAM_SIZE; ++i) {
++      final int count = histogram[i];
++      histogram[i] = accum;
++      accum += count;
++      endOffsets[i] = accum;
++    }
++  }
++
++  /**
++   * Reorder based on start/end offsets for each bucket. When this method
++   * returns, startOffsets and endOffsets are equal.
++   * @param startOffsets start offsets per bucket
++   * @param endOffsets end offsets per bucket
++   */
++  private void reorder(int from, int to, int[] startOffsets, int[] endOffsets, int k) {
++    // reorder in place, like the dutch flag problem
++    for (int i = 0; i < HISTOGRAM_SIZE; ++i) {
++      final int limit = endOffsets[i];
++      for (int h1 = startOffsets[i]; h1 < limit; h1 = startOffsets[i]) {
++        final int b = getBucket(from + h1, k);
++        final int h2 = startOffsets[b]++;
++        swap(from + h1, from + h2);
++      }
++    }
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/StringMSBRadixSorter.java b/lucene/core/src/java/org/apache/lucene/util/StringMSBRadixSorter.java
+index 84bd074..67cba2b 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/StringMSBRadixSorter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/StringMSBRadixSorter.java
+@@ -16,61 +16,36 @@
+  */
+ package org.apache.lucene.util;
+ 
+-import java.util.Arrays;
++abstract class StringMSBRadixSorter extends MSBRadixSorter {
+ 
+-/** Radix sorter for variable-length strings. This class sorts based on the most
+- *  significant byte first and falls back to {@link IntroSorter} when the size
+- *  of the buckets to sort becomes small. It is <b>NOT</b> stable.
+- *  Worst-case memory usage is about {@code 2.3 KB}. */
+-abstract class StringMSBRadixSorter extends Sorter {
+-
+-  // after that many levels of recursion we fall back to introsort anyway
+-  // this is used as a protection against the fact that radix sort performs
+-  // worse when there are long common prefixes (probably because of cache
+-  // locality)
+-  private static final int LEVEL_THRESHOLD = 8;
+-  // size of histograms: 256 + 1 to indicate that the string is finished
+-  private static final int HISTOGRAM_SIZE = 257;
+-  // buckets below this size will be sorted with introsort
+-  private static final int LENGTH_THRESHOLD = 100;
+-
+-  // we store one histogram per recursion level
+-  private final int[][] histograms = new int[LEVEL_THRESHOLD][];
+-  private final int[] endOffsets = new int[HISTOGRAM_SIZE];
++  StringMSBRadixSorter() {
++    super(Integer.MAX_VALUE);
++  }
+ 
+   /** Get a {@link BytesRef} for the given index. */
+   protected abstract BytesRef get(int i);
+ 
+-  /** Store bytes for the given index into {@code dest}, without the first k bytes. */
+-  private void get(int i, int k, BytesRef dest) {
+-    BytesRef ref = get(i);
+-    assert ref.length >= k;
+-    dest.bytes = ref.bytes;
+-    dest.offset = ref.offset + k;
+-    dest.length = ref.length - k;
+-  }
+-
+   @Override
+-  protected final int compare(int i, int j) {
+-    throw new UnsupportedOperationException("unused: not a comparison-based sort");
++  protected int byteAt(int i, int k) {
++    BytesRef ref = get(i);
++    if (ref.length <= k) {
++      return -1;
++    }
++    return ref.bytes[ref.offset + k] & 0xff;
+   }
+ 
+   @Override
+-  public void sort(int from, int to) {
+-    checkRange(from, to);
+-    sort(from, to, 0);
+-  }
+-
+-  private void sort(int from, int to, int k) {
+-    if (to - from <= LENGTH_THRESHOLD || k >= LEVEL_THRESHOLD) {
+-      introSort(from, to, k);
+-    } else {
+-      radixSort(from, to, k);
+-    }
+-  }
++  protected Sorter getFallbackSorter(int k) {
++    return new IntroSorter() {
++
++      private void get(int i, int k, BytesRef scratch) {
++        BytesRef ref = StringMSBRadixSorter.this.get(i);
++        assert ref.length >= k;
++        scratch.bytes = ref.bytes;
++        scratch.offset = ref.offset + k;
++        scratch.length = ref.length - k;
++      }
+ 
+-  private void introSort(int from, int to, int k) {
+-    new IntroSorter() {
+       @Override
+       protected void swap(int i, int j) {
+         StringMSBRadixSorter.this.swap(i, j);
+@@ -95,96 +70,7 @@ abstract class StringMSBRadixSorter extends Sorter {
+       }
+ 
+       private final BytesRef pivot = new BytesRef(),
+-        scratch1 = new BytesRef(), scratch2 = new BytesRef();
+-    }.sort(from, to);
+-  }
+-
+-  private void radixSort(int from, int to, int k) {
+-    int[] histogram = histograms[k];
+-    if (histogram == null) {
+-      histogram = histograms[k] = new int[HISTOGRAM_SIZE];
+-    } else {
+-      Arrays.fill(histogram, 0);
+-    }
+-
+-    buildHistogram(from, to, k, histogram);
+-
+-    // short-circuit: if all keys have the same byte at offset k, then recurse directly
+-    for (int i = 0; i < HISTOGRAM_SIZE; ++i) {
+-      if (histogram[i] == to - from) {
+-        // everything is in the same bucket, recurse
+-        if (i > 0) {
+-          sort(from, to, k + 1);
+-        }
+-        return;
+-      } else if (histogram[i] != 0) {
+-        break;
+-      }
+-    }
+-
+-    int[] startOffsets = histogram;
+-    int[] endOffsets = this.endOffsets;
+-    sumHistogram(histogram, endOffsets);
+-    reorder(from, to, startOffsets, endOffsets, k);
+-    endOffsets = startOffsets;
+-
+-    // recurse on all but the first bucket since all keys are equals in this
+-    // bucket (we already compared all bytes)
+-    for (int prev = endOffsets[0], i = 1; i < HISTOGRAM_SIZE; ++i) {
+-      int h = endOffsets[i];
+-      final int bucketLen = h - prev;
+-      if (bucketLen > 1) {
+-        sort(from + prev, from + h, k + 1);
+-      }
+-      prev = h;
+-    }
+-  }
+-
+-  /** Return a number for the k-th character between 0 and {@link #HISTOGRAM_SIZE}. */
+-  private int getBucket(int id, int k) {
+-    BytesRef ref = get(id);
+-    if (ref.length <= k) {
+-      return 0;
+-    }
+-    final int b = ref.bytes[ref.offset + k] & 0xff;
+-    return b + 1;
+-  }
+-
+-  /** Build a histogram of the number of values per {@link #getBucket(int, int) bucket}. */
+-  private int[] buildHistogram(int from, int to, int k, int[] histogram) {
+-    for (int i = from; i < to; ++i) {
+-      histogram[getBucket(i, k)]++;
+-    }
+-    return histogram;
+-  }
+-
+-  /** Accumulate values of the histogram so that it does not store counts but
+-   *  start offsets. {@code endOffsets} will store the end offsets. */
+-  private static void sumHistogram(int[] histogram, int[] endOffsets) {
+-    int accum = 0;
+-    for (int i = 0; i < HISTOGRAM_SIZE; ++i) {
+-      final int count = histogram[i];
+-      histogram[i] = accum;
+-      accum += count;
+-      endOffsets[i] = accum;
+-    }
+-  }
+-
+-  /**
+-   * Reorder based on start/end offsets for each bucket. When this method
+-   * returns, startOffsets and endOffsets are equal.
+-   * @param startOffsets start offsets per bucket
+-   * @param endOffsets end offsets per bucket
+-   */
+-  private void reorder(int from, int to, int[] startOffsets, int[] endOffsets, int k) {
+-    // reorder in place, like the dutch flag problem
+-    for (int i = 0; i < HISTOGRAM_SIZE; ++i) {
+-      final int limit = endOffsets[i];
+-      for (int h1 = startOffsets[i]; h1 < limit; h1 = startOffsets[i]) {
+-        final int b = getBucket(from + h1, k);
+-        final int h2 = startOffsets[b]++;
+-        swap(from + h1, from + h2);
+-      }
+-    }
++          scratch1 = new BytesRef(), scratch2 = new BytesRef();
++    };
+   }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
+index 09eef26..ad9dd5d 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
+@@ -25,7 +25,6 @@ import java.util.List;
+ 
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.index.MergeState;
+-import org.apache.lucene.store.ByteArrayDataInput;
+ import org.apache.lucene.store.ChecksumIndexInput;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+@@ -33,10 +32,11 @@ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.TrackingDirectoryWrapper;
+ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.BytesRefComparator;
+ import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+-import org.apache.lucene.util.IntroSorter;
+ import org.apache.lucene.util.LongBitSet;
++import org.apache.lucene.util.MSBRadixSorter;
+ import org.apache.lucene.util.NumericUtils;
+ import org.apache.lucene.util.OfflineSorter;
+ import org.apache.lucene.util.PriorityQueue;
+@@ -598,39 +598,26 @@ public class BKDWriter implements Closeable {
+ 
+   /** Sort the heap writer by the specified dim */
+   private void sortHeapPointWriter(final HeapPointWriter writer, int dim) {
++    final int pointCount = Math.toIntExact(this.pointCount);
++    // Tie-break by docID:
+ 
+-    assert pointCount < Integer.MAX_VALUE;
+-    //int[] swapCount = new int[1];
+-    //int[] cmpCount = new int[1];
+-
+-    // System.out.println("SORT length=" + length);
+-
+-    // All buffered points are still in heap; just do in-place sort:
+-    new IntroSorter() {
+-      private final byte[] pivotPackedValue = new byte[bytesPerDim];
+-      private int pivotDocID;
++    // No need to tie break on ord, for the case where the same doc has the same value in a given dimension indexed more than once: it
++    // can't matter at search time since we don't write ords into the index:
++    new MSBRadixSorter(bytesPerDim + Integer.BYTES) {
+ 
+       @Override
+-      protected void setPivot(int i) {
+-        pivotDocID = writer.docIDs[i];
+-        int block = i / writer.valuesPerBlock;
+-        int index = i % writer.valuesPerBlock;
+-        System.arraycopy(writer.blocks.get(block), index*packedBytesLength+dim*bytesPerDim, pivotPackedValue, 0, bytesPerDim);
+-      }
+-
+-      @Override
+-      protected int comparePivot(int j) {
+-        //cmpCount[0]++;
+-        int block = j / writer.valuesPerBlock;
+-        int index = j % writer.valuesPerBlock;
+-        assert index >= 0: "index=" + index + " j=" + j;
+-        int cmp = StringHelper.compare(bytesPerDim, pivotPackedValue, 0, writer.blocks.get(block), bytesPerDim*(index*numDims+dim));
+-        if (cmp != 0) {
+-          return cmp;
++      protected int byteAt(int i, int k) {
++        assert k >= 0;
++        if (k < bytesPerDim) {
++          // dim bytes
++          int block = i / writer.valuesPerBlock;
++          int index = i % writer.valuesPerBlock;
++          return writer.blocks.get(block)[index * packedBytesLength + dim * bytesPerDim + k] & 0xff;
++        } else {
++          // doc id
++          int s = 3 - (k - bytesPerDim);
++          return (writer.docIDs[i] >>> (s * 8)) & 0xff;
+         }
+-
+-        // Tie-break
+-        return Integer.compare(pivotDocID, writer.docIDs[j]);
+       }
+ 
+       @Override
+@@ -664,26 +651,7 @@ public class BKDWriter implements Closeable {
+         System.arraycopy(scratch1, 0, blockJ, indexJ, packedBytesLength);
+       }
+ 
+-      @Override
+-      protected int compare(int i, int j) {
+-        //cmpCount[0]++;
+-        int blockI = i / writer.valuesPerBlock;
+-        int dimI = i % writer.valuesPerBlock;
+-        int blockJ = j / writer.valuesPerBlock;
+-        int dimJ = j % writer.valuesPerBlock;
+-        int cmp = StringHelper.compare(bytesPerDim, writer.blocks.get(blockI), bytesPerDim*(dimI*numDims+dim), writer.blocks.get(blockJ), bytesPerDim*(dimJ*numDims+dim));
+-        if (cmp != 0) {
+-          return cmp;
+-        }
+-
+-        // Tie-break by docID:
+-
+-        // No need to tie break on ord, for the case where the same doc has the same value in a given dimension indexed more than once: it
+-        // can't matter at search time since we don't write ords into the index:
+-        return Integer.compare(writer.docIDs[i], writer.docIDs[j]);
+-      }
+-    }.sort(0, Math.toIntExact(pointCount));
+-    //System.out.println("LEN=" + length + " SWAP=" + swapCount[0] + " CMP=" + cmpCount[0]);
++    }.sort(0, pointCount);
+   }
+ 
+   private PointWriter sort(int dim) throws IOException {
+@@ -718,28 +686,28 @@ public class BKDWriter implements Closeable {
+ 
+       final int offset = bytesPerDim * dim;
+ 
+-      Comparator<BytesRef> cmp = new Comparator<BytesRef>() {
+- 
+-        final ByteArrayDataInput reader = new ByteArrayDataInput();
+-
+-        @Override
+-        public int compare(BytesRef a, BytesRef b) {
+-          // First compare by the requested dimension we are sorting by:
+-          int cmp = StringHelper.compare(bytesPerDim, a.bytes, a.offset + offset, b.bytes, b.offset + offset);
+-
+-          if (cmp != 0) {
+-            return cmp;
++      Comparator<BytesRef> cmp;
++      if (dim == numDims - 1) {
++        // in that case the bytes for the dimension and for the doc id are contiguous,
++        // so we don't need a branch
++        cmp = new BytesRefComparator(bytesPerDim + Integer.BYTES) {
++          @Override
++          protected int byteAt(BytesRef ref, int i) {
++            return ref.bytes[ref.offset + offset + i] & 0xff;
+           }
+-
+-          // Tie-break by docID ... no need to tie break on ord, for the case where the same doc has
+-          // the same value in a given dimension indexed more than once: it can't matter at search
+-          // time since we don't write ords into the index:
+-
+-          return StringHelper.compare(Integer.BYTES,
+-                                      a.bytes, a.offset + packedBytesLength,
+-                                      b.bytes, b.offset + packedBytesLength);
+-        }
+-      };
++        };
++      } else {
++        cmp = new BytesRefComparator(bytesPerDim + Integer.BYTES) {
++          @Override
++          protected int byteAt(BytesRef ref, int i) {
++            if (i < bytesPerDim) {
++              return ref.bytes[ref.offset + offset + i] & 0xff;
++            } else {
++              return ref.bytes[ref.offset + packedBytesLength + i - bytesPerDim] & 0xff;
++            }
++          }
++        };
++      }
+ 
+       OfflineSorter sorter = new OfflineSorter(tempDir, tempFileNamePrefix + "_bkd" + dim, cmp, offlineSorterBufferMB, offlineSorterMaxTempFiles, bytesPerDoc) {
+ 
+@@ -1266,4 +1234,5 @@ public class BKDWriter implements Closeable {
+       return new OfflinePointWriter(tempDir, tempFileNamePrefix, packedBytesLength, longOrds, desc, count, singleValuePerDoc);
+     }
+   }
++
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestMSBRadixSorter.java b/lucene/core/src/test/org/apache/lucene/util/TestMSBRadixSorter.java
+new file mode 100644
+index 0000000..bc5af7f
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/TestMSBRadixSorter.java
+@@ -0,0 +1,117 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++import java.util.Arrays;
++
++public class TestMSBRadixSorter extends LuceneTestCase {
++
++  private void test(BytesRef[] refs, int len) {
++    BytesRef[] expected = Arrays.copyOf(refs, len);
++    Arrays.sort(expected);
++
++    int maxLength = 0;
++    for (int i = 0; i < len; ++i) {
++      BytesRef ref = refs[i];
++      maxLength = Math.max(maxLength, ref.length);
++    }
++    switch (random().nextInt(3)) {
++      case 0:
++        maxLength += TestUtil.nextInt(random(), 1, 5);
++        break;
++      case 1:
++        maxLength = Integer.MAX_VALUE;
++        break;
++      default:
++        // leave unchanged
++        break;
++    }
++
++    new MSBRadixSorter(maxLength) {
++
++      protected int byteAt(int i, int k) {
++        BytesRef ref = refs[i];
++        if (ref.length <= k) {
++          return -1;
++        }
++        return ref.bytes[ref.offset + k] & 0xff;
++      }
++
++      @Override
++      protected void swap(int i, int j) {
++        BytesRef tmp = refs[i];
++        refs[i] = refs[j];
++        refs[j] = tmp;
++      }
++    }.sort(0, len);
++    BytesRef[] actual = Arrays.copyOf(refs, len);
++    assertArrayEquals(expected, actual);
++  }
++
++  public void testEmpty() {
++    test(new BytesRef[random().nextInt(5)], 0);
++  }
++
++  public void testOneValue() {
++    BytesRef bytes = new BytesRef(TestUtil.randomSimpleString(random()));
++    test(new BytesRef[] { bytes }, 1);
++  }
++
++  public void testTwoValues() {
++    BytesRef bytes1 = new BytesRef(TestUtil.randomSimpleString(random()));
++    BytesRef bytes2 = new BytesRef(TestUtil.randomSimpleString(random()));
++    test(new BytesRef[] { bytes1, bytes2 }, 2);
++  }
++
++  private void testRandom(int commonPrefixLen, int maxLen) {
++    byte[] commonPrefix = new byte[commonPrefixLen];
++    random().nextBytes(commonPrefix);
++    final int len = random().nextInt(100000);
++    BytesRef[] bytes = new BytesRef[len + random().nextInt(50)];
++    for (int i = 0; i < len; ++i) {
++      byte[] b = new byte[commonPrefixLen + random().nextInt(maxLen)];
++      random().nextBytes(b);
++      System.arraycopy(commonPrefix, 0, b, 0, commonPrefixLen);
++      bytes[i] = new BytesRef(b);
++    }
++    test(bytes, len);
++  }
++
++  public void testRandom() {
++    for (int iter = 0; iter < 10; ++iter) {
++      testRandom(0, 10);
++    }
++  }
++
++  public void testRandomWithLotsOfDuplicates() {
++    for (int iter = 0; iter < 10; ++iter) {
++      testRandom(0, 2);
++    }
++  }
++
++  public void testRandomWithSharedPrefix() {
++    for (int iter = 0; iter < 10; ++iter) {
++      testRandom(TestUtil.nextInt(random(), 1, 30), 10);
++    }
++  }
++
++  public void testRandomWithSharedPrefixAndLotsOfDuplicates() {
++    for (int iter = 0; iter < 10; ++iter) {
++      testRandom(TestUtil.nextInt(random(), 1, 30), 2);
++    }
++  }
++}
+

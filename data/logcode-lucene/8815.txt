@@ -1,0 +1,1360 @@
+GitDiffStart: ad6b4ea88b811b5a35ff2cb67a580840a4226386 | Tue Apr 23 13:38:57 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 2b5f851..e5e408a 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -51,6 +51,11 @@ Optimizations
+ * LUCENE-4938: Don't use an unnecessarily large priority queue in IndexSearcher
+   methods that take top-N.  (Uwe Schindler, Mike McCandless, Robert Muir)
+ 
++* LUCENE-4936: Improve numeric doc values compression in case all values share
++  a common divisor. In particular, this improves the compression ratio of dates
++  without time when they are encoded as milliseconds since Epoch. Also support
++  TABLE compressed numerics in the Disk codec.  (Robert Muir, Adrien Grand)
++
+ ======================= Lucene 4.3.0 =======================
+ 
+ Changes in backwards compatibility policy
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesConsumer.java b/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesConsumer.java
+index d020ad4..05263d3 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesConsumer.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesConsumer.java
+@@ -18,6 +18,8 @@ package org.apache.lucene.codecs.diskdv;
+  */
+ 
+ import java.io.IOException;
++import java.util.HashMap;
++import java.util.HashSet;
+ 
+ import org.apache.lucene.codecs.CodecUtil;
+ import org.apache.lucene.codecs.DocValuesConsumer;
+@@ -27,6 +29,7 @@ import org.apache.lucene.index.SegmentWriteState;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.MathUtil;
+ import org.apache.lucene.util.packed.BlockPackedWriter;
+ import org.apache.lucene.util.packed.MonotonicBlockPackedWriter;
+ import org.apache.lucene.util.packed.PackedInts;
+@@ -36,6 +39,13 @@ public class DiskDocValuesConsumer extends DocValuesConsumer {
+ 
+   static final int BLOCK_SIZE = 16384;
+ 
++  /** Compressed using packed blocks of ints. */
++  public static final int DELTA_COMPRESSED = 0;
++  /** Compressed by computing the GCD. */
++  public static final int GCD_COMPRESSED = 1;
++  /** Compressed by giving IDs to unique values. */
++  public static final int TABLE_COMPRESSED = 2;
++
+   final IndexOutput data, meta;
+   final int maxDoc;
+   
+@@ -59,23 +69,107 @@ public class DiskDocValuesConsumer extends DocValuesConsumer {
+   
+   @Override
+   public void addNumericField(FieldInfo field, Iterable<Number> values) throws IOException {
++    addNumericField(field, values, true);
++  }
++
++  void addNumericField(FieldInfo field, Iterable<Number> values, boolean optimizeStorage) throws IOException {
+     long count = 0;
+-    for (@SuppressWarnings("unused") Number nv : values) {
+-      ++count;
++    long minValue = Long.MAX_VALUE;
++    long maxValue = Long.MIN_VALUE;
++    long gcd = 0;
++    // TODO: more efficient?
++    HashSet<Long> uniqueValues = null;
++    if (optimizeStorage) {
++      uniqueValues = new HashSet<>();
++
++      for (Number nv : values) {
++        final long v = nv.longValue();
++
++        if (gcd != 1) {
++          if (v < Long.MIN_VALUE / 2 || v > Long.MAX_VALUE / 2) {
++            // in that case v - minValue might overflow and make the GCD computation return
++            // wrong results. Since these extreme values are unlikely, we just discard
++            // GCD computation for them
++            gcd = 1;
++          } else if (count != 0) { // minValue needs to be set first
++            gcd = MathUtil.gcd(gcd, v - minValue);
++          }
++        }
++
++        minValue = Math.min(minValue, v);
++        maxValue = Math.max(maxValue, v);
++
++        if (uniqueValues != null) {
++          if (uniqueValues.add(v)) {
++            if (uniqueValues.size() > 256) {
++              uniqueValues = null;
++            }
++          }
++        }
++
++        ++count;
++      }
++    } else {
++      for (@SuppressWarnings("unused") Number nv : values) {
++        ++count;
++      }
+     }
++    
++    final long delta = maxValue - minValue;
+ 
++    final int format;
++    if (uniqueValues != null
++        && (delta < 0L || PackedInts.bitsRequired(uniqueValues.size() - 1) < PackedInts.bitsRequired(delta))
++        && count <= Integer.MAX_VALUE) {
++      format = TABLE_COMPRESSED;
++    } else if (gcd != 0 && gcd != 1) {
++      format = GCD_COMPRESSED;
++    } else {
++      format = DELTA_COMPRESSED;
++    }
+     meta.writeVInt(field.number);
+     meta.writeByte(DiskDocValuesFormat.NUMERIC);
++    meta.writeVInt(format);
+     meta.writeVInt(PackedInts.VERSION_CURRENT);
+     meta.writeLong(data.getFilePointer());
+     meta.writeVLong(count);
+     meta.writeVInt(BLOCK_SIZE);
+ 
+-    final BlockPackedWriter writer = new BlockPackedWriter(data, BLOCK_SIZE);
+-    for (Number nv : values) {
+-      writer.add(nv.longValue());
++    switch (format) {
++      case GCD_COMPRESSED:
++        meta.writeLong(minValue);
++        meta.writeLong(gcd);
++        final BlockPackedWriter quotientWriter = new BlockPackedWriter(data, BLOCK_SIZE);
++        for (Number nv : values) {
++          quotientWriter.add((nv.longValue() - minValue) / gcd);
++        }
++        quotientWriter.finish();
++        break;
++      case DELTA_COMPRESSED:
++        final BlockPackedWriter writer = new BlockPackedWriter(data, BLOCK_SIZE);
++        for (Number nv : values) {
++          writer.add(nv.longValue());
++        }
++        writer.finish();
++        break;
++      case TABLE_COMPRESSED:
++        final Long[] decode = uniqueValues.toArray(new Long[uniqueValues.size()]);
++        final HashMap<Long,Integer> encode = new HashMap<Long,Integer>();
++        meta.writeVInt(decode.length);
++        for (int i = 0; i < decode.length; i++) {
++          meta.writeLong(decode[i]);
++          encode.put(decode[i], i);
++        }
++        final int bitsRequired = PackedInts.bitsRequired(uniqueValues.size() - 1);
++        final PackedInts.Writer ordsWriter = PackedInts.getWriterNoHeader(data, PackedInts.Format.PACKED, (int) count, bitsRequired, PackedInts.DEFAULT_BUFFER_SIZE);
++        for (Number nv : values) {
++          ordsWriter.add(encode.get(nv.longValue()));
++        }
++        ordsWriter.finish();
++        break;
++      default:
++        throw new AssertionError();
+     }
+-    writer.finish();
+   }
+ 
+   @Override
+@@ -120,7 +214,7 @@ public class DiskDocValuesConsumer extends DocValuesConsumer {
+     meta.writeVInt(field.number);
+     meta.writeByte(DiskDocValuesFormat.SORTED);
+     addBinaryField(field, values);
+-    addNumericField(field, docToOrd);
++    addNumericField(field, docToOrd, false);
+   }
+   
+   @Override
+@@ -131,11 +225,12 @@ public class DiskDocValuesConsumer extends DocValuesConsumer {
+     addBinaryField(field, values);
+     // write the stream of ords as a numeric field
+     // NOTE: we could return an iterator that delta-encodes these within a doc
+-    addNumericField(field, ords);
++    addNumericField(field, ords, false);
+     
+     // write the doc -> ord count as a absolute index to the stream
+     meta.writeVInt(field.number);
+     meta.writeByte(DiskDocValuesFormat.NUMERIC);
++    meta.writeVInt(DELTA_COMPRESSED);
+     meta.writeVInt(PackedInts.VERSION_CURRENT);
+     meta.writeLong(data.getFilePointer());
+     meta.writeVLong(maxDoc);
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesProducer.java b/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesProducer.java
+index 0ab8056..d8b6bad 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesProducer.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/diskdv/DiskDocValuesProducer.java
+@@ -17,6 +17,10 @@ package org.apache.lucene.codecs.diskdv;
+  * limitations under the License.
+  */
+ 
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.DELTA_COMPRESSED;
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.GCD_COMPRESSED;
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.TABLE_COMPRESSED;
++
+ import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.Map;
+@@ -37,6 +41,7 @@ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.packed.BlockPackedReader;
+ import org.apache.lucene.util.packed.MonotonicBlockPackedReader;
++import org.apache.lucene.util.packed.PackedInts;
+ 
+ class DiskDocValuesProducer extends DocValuesProducer {
+   private final Map<Integer,NumericEntry> numerics;
+@@ -55,15 +60,17 @@ class DiskDocValuesProducer extends DocValuesProducer {
+     // read in the entries from the metadata file.
+     IndexInput in = state.directory.openInput(metaName, state.context);
+     boolean success = false;
++    final int version;
+     try {
+-      CodecUtil.checkHeader(in, metaCodec, 
+-                                DiskDocValuesFormat.VERSION_START,
+-                                DiskDocValuesFormat.VERSION_START);
++      version = CodecUtil.checkHeader(in, metaCodec, 
++                                      DiskDocValuesFormat.VERSION_START,
++                                      DiskDocValuesFormat.VERSION_CURRENT);
+       numerics = new HashMap<Integer,NumericEntry>();
+       ords = new HashMap<Integer,NumericEntry>();
+       ordIndexes = new HashMap<Integer,NumericEntry>();
+       binaries = new HashMap<Integer,BinaryEntry>();
+       readFields(in, state.fieldInfos);
++
+       success = true;
+     } finally {
+       if (success) {
+@@ -72,12 +79,24 @@ class DiskDocValuesProducer extends DocValuesProducer {
+         IOUtils.closeWhileHandlingException(in);
+       }
+     }
+-    
+-    String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
+-    data = state.directory.openInput(dataName, state.context);
+-    CodecUtil.checkHeader(data, dataCodec, 
+-                                DiskDocValuesFormat.VERSION_START,
+-                                DiskDocValuesFormat.VERSION_START);
++
++    success = false;
++    try {
++      String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
++      data = state.directory.openInput(dataName, state.context);
++      final int version2 = CodecUtil.checkHeader(data, dataCodec, 
++                                                 DiskDocValuesFormat.VERSION_START,
++                                                 DiskDocValuesFormat.VERSION_CURRENT);
++      if (version != version2) {
++        throw new CorruptIndexException("Format versions mismatch");
++      }
++
++      success = true;
++    } finally {
++      if (!success) {
++        IOUtils.closeWhileHandlingException(this.data);
++      }
++    }
+   }
+   
+   private void readFields(IndexInput meta, FieldInfos infos) throws IOException {
+@@ -145,10 +164,34 @@ class DiskDocValuesProducer extends DocValuesProducer {
+   
+   static NumericEntry readNumericEntry(IndexInput meta) throws IOException {
+     NumericEntry entry = new NumericEntry();
++    entry.format = meta.readVInt();
+     entry.packedIntsVersion = meta.readVInt();
+     entry.offset = meta.readLong();
+     entry.count = meta.readVLong();
+     entry.blockSize = meta.readVInt();
++    switch(entry.format) {
++      case GCD_COMPRESSED:
++        entry.minValue = meta.readLong();
++        entry.gcd = meta.readLong();
++        break;
++      case TABLE_COMPRESSED:
++        if (entry.count > Integer.MAX_VALUE) {
++          throw new CorruptIndexException("Cannot use TABLE_COMPRESSED with more than MAX_VALUE values, input=" + meta);
++        }
++        final int uniqueValues = meta.readVInt();
++        if (uniqueValues > 256) {
++          throw new CorruptIndexException("TABLE_COMPRESSED cannot have more than 256 distinct values, input=" + meta);
++        }
++        entry.table = new long[uniqueValues];
++        for (int i = 0; i < uniqueValues; ++i) {
++          entry.table[i] = meta.readLong();
++        }
++        break;
++      case DELTA_COMPRESSED:
++        break;
++      default:
++        throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
++    }
+     return entry;
+   }
+   
+@@ -176,13 +219,38 @@ class DiskDocValuesProducer extends DocValuesProducer {
+     final IndexInput data = this.data.clone();
+     data.seek(entry.offset);
+ 
+-    final BlockPackedReader reader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
+-    return new LongNumericDocValues() {
+-      @Override
+-      public long get(long id) {
+-        return reader.get(id);
+-      }
+-    };
++    switch (entry.format) {
++      case DELTA_COMPRESSED:
++        final BlockPackedReader reader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
++        return new LongNumericDocValues() {
++          @Override
++          public long get(long id) {
++            return reader.get(id);
++          }
++        };
++      case GCD_COMPRESSED:
++        final long min = entry.minValue;
++        final long mult = entry.gcd;
++        final BlockPackedReader quotientReader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
++        return new LongNumericDocValues() {
++          @Override
++          public long get(long id) {
++            return min + mult * quotientReader.get(id);
++          }
++        };
++      case TABLE_COMPRESSED:
++        final long table[] = entry.table;
++        final int bitsRequired = PackedInts.bitsRequired(table.length - 1);
++        final PackedInts.Reader ords = PackedInts.getDirectReaderNoHeader(data, PackedInts.Format.PACKED, entry.packedIntsVersion, (int) entry.count, bitsRequired);
++        return new LongNumericDocValues() {
++          @Override
++          public long get(long id) {
++            return table[(int) ords.get((int) id)];
++          }
++        };
++      default:
++        throw new AssertionError();
++    }
+   }
+ 
+   @Override
+@@ -350,9 +418,14 @@ class DiskDocValuesProducer extends DocValuesProducer {
+   static class NumericEntry {
+     long offset;
+ 
++    int format;
+     int packedIntsVersion;
+     long count;
+     int blockSize;
++    
++    long minValue;
++    long gcd;
++    long table[];
+   }
+   
+   static class BinaryEntry {
+diff --git a/lucene/codecs/src/test/org/apache/lucene/codecs/diskdv/TestCheapBastardDocValuesFormat.java b/lucene/codecs/src/test/org/apache/lucene/codecs/diskdv/TestCheapBastardDocValuesFormat.java
+new file mode 100644
+index 0000000..4cd40c5
+--- /dev/null
++++ b/lucene/codecs/src/test/org/apache/lucene/codecs/diskdv/TestCheapBastardDocValuesFormat.java
+@@ -0,0 +1,35 @@
++package org.apache.lucene.codecs.diskdv;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.codecs.Codec;
++import org.apache.lucene.codecs.cheapbastard.CheapBastardDocValuesFormat;
++import org.apache.lucene.index.BaseCompressingDocValuesFormatTestCase;
++import org.apache.lucene.util._TestUtil;
++
++/**
++ * Tests CheapBastardDocValuesFormat
++ */
++public class TestCheapBastardDocValuesFormat extends BaseCompressingDocValuesFormatTestCase {
++  private final Codec codec = _TestUtil.alwaysDocValuesFormat(new CheapBastardDocValuesFormat());
++
++  @Override
++  protected Codec getCodec() {
++    return codec;
++  }
++}
+diff --git a/lucene/codecs/src/test/org/apache/lucene/codecs/diskdv/TestDiskDocValuesFormat.java b/lucene/codecs/src/test/org/apache/lucene/codecs/diskdv/TestDiskDocValuesFormat.java
+index 89a2b5a..1761e4f 100644
+--- a/lucene/codecs/src/test/org/apache/lucene/codecs/diskdv/TestDiskDocValuesFormat.java
++++ b/lucene/codecs/src/test/org/apache/lucene/codecs/diskdv/TestDiskDocValuesFormat.java
+@@ -18,13 +18,13 @@ package org.apache.lucene.codecs.diskdv;
+  */
+ 
+ import org.apache.lucene.codecs.Codec;
+-import org.apache.lucene.index.BaseDocValuesFormatTestCase;
++import org.apache.lucene.index.BaseCompressingDocValuesFormatTestCase;
+ import org.apache.lucene.util._TestUtil;
+ 
+ /**
+  * Tests DiskDocValuesFormat
+  */
+-public class TestDiskDocValuesFormat extends BaseDocValuesFormatTestCase {
++public class TestDiskDocValuesFormat extends BaseCompressingDocValuesFormatTestCase {
+   private final Codec codec = _TestUtil.alwaysDocValuesFormat(new DiskDocValuesFormat());
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesConsumer.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesConsumer.java
+index 4b33a39..aced6ce 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesConsumer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesConsumer.java
+@@ -34,6 +34,7 @@ import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.IntsRef;
++import org.apache.lucene.util.MathUtil;
+ import org.apache.lucene.util.fst.Builder;
+ import org.apache.lucene.util.fst.FST;
+ import org.apache.lucene.util.fst.FST.INPUT_TYPE;
+@@ -49,7 +50,8 @@ import org.apache.lucene.util.packed.PackedInts.FormatAndBits;
+  */
+ class Lucene42DocValuesConsumer extends DocValuesConsumer {
+   static final int VERSION_START = 0;
+-  static final int VERSION_CURRENT = VERSION_START;
++  static final int VERSION_GCD_COMPRESSION = 1;
++  static final int VERSION_CURRENT = VERSION_GCD_COMPRESSION;
+   
+   static final byte NUMBER = 0;
+   static final byte BYTES = 1;
+@@ -60,6 +62,7 @@ class Lucene42DocValuesConsumer extends DocValuesConsumer {
+   static final byte DELTA_COMPRESSED = 0;
+   static final byte TABLE_COMPRESSED = 1;
+   static final byte UNCOMPRESSED = 2;
++  static final byte GCD_COMPRESSED = 3;
+ 
+   final IndexOutput data, meta;
+   final int maxDoc;
+@@ -83,27 +86,53 @@ class Lucene42DocValuesConsumer extends DocValuesConsumer {
+       }
+     }
+   }
+-  
++
+   @Override
+   public void addNumericField(FieldInfo field, Iterable<Number> values) throws IOException {
++    addNumericField(field, values, true);
++  }
++
++  void addNumericField(FieldInfo field, Iterable<Number> values, boolean optimizeStorage) throws IOException {
+     meta.writeVInt(field.number);
+     meta.writeByte(NUMBER);
+     meta.writeLong(data.getFilePointer());
+     long minValue = Long.MAX_VALUE;
+     long maxValue = Long.MIN_VALUE;
++    long gcd = 0;
+     // TODO: more efficient?
+-    HashSet<Long> uniqueValues = new HashSet<Long>();
+-    for(Number nv : values) {
+-      long v = nv.longValue();
+-      minValue = Math.min(minValue, v);
+-      maxValue = Math.max(maxValue, v);
+-      if (uniqueValues != null) {
+-        if (uniqueValues.add(v)) {
+-          if (uniqueValues.size() > 256) {
+-            uniqueValues = null;
++    HashSet<Long> uniqueValues = null;
++    if (optimizeStorage) {
++      uniqueValues = new HashSet<>();
++
++      long count = 0;
++      for (Number nv : values) {
++        final long v = nv.longValue();
++
++        if (gcd != 1) {
++          if (v < Long.MIN_VALUE / 2 || v > Long.MAX_VALUE / 2) {
++            // in that case v - minValue might overflow and make the GCD computation return
++            // wrong results. Since these extreme values are unlikely, we just discard
++            // GCD computation for them
++            gcd = 1;
++          } else if (count != 0) { // minValue needs to be set first
++            gcd = MathUtil.gcd(gcd, v - minValue);
+           }
+         }
++
++        minValue = Math.min(minValue, v);
++        maxValue = Math.max(maxValue, v);
++
++        if (uniqueValues != null) {
++          if (uniqueValues.add(v)) {
++            if (uniqueValues.size() > 256) {
++              uniqueValues = null;
++            }
++          }
++        }
++
++        ++count;
+       }
++      assert count == maxDoc;
+     }
+ 
+     if (uniqueValues != null) {
+@@ -135,6 +164,18 @@ class Lucene42DocValuesConsumer extends DocValuesConsumer {
+         }
+         writer.finish();
+       }
++    } else if (gcd != 0 && gcd != 1) {
++      meta.writeByte(GCD_COMPRESSED);
++      meta.writeVInt(PackedInts.VERSION_CURRENT);
++      data.writeLong(minValue);
++      data.writeLong(gcd);
++      data.writeVInt(BLOCK_SIZE);
++
++      final BlockPackedWriter writer = new BlockPackedWriter(data, BLOCK_SIZE);
++      for (Number nv : values) {
++        writer.add((nv.longValue() - minValue) / gcd);
++      }
++      writer.finish();
+     } else {
+       meta.writeByte(DELTA_COMPRESSED); // delta-compressed
+ 
+@@ -222,7 +263,7 @@ class Lucene42DocValuesConsumer extends DocValuesConsumer {
+   @Override
+   public void addSortedField(FieldInfo field, Iterable<BytesRef> values, Iterable<Number> docToOrd) throws IOException {
+     // write the ordinals as numerics
+-    addNumericField(field, docToOrd);
++    addNumericField(field, docToOrd, false);
+     
+     // write the values as FST
+     writeFST(field, values);
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesFormat.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesFormat.java
+index 1cef435..bb384c7 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesFormat.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesFormat.java
+@@ -44,6 +44,8 @@ import org.apache.lucene.util.packed.BlockPackedWriter;
+  *    <li>Uncompressed Numerics: when all values would fit into a single byte, and the 
+  *        <code>acceptableOverheadRatio</code> would pack values into 8 bits per value anyway, they
+  *        are written as absolute values (with no indirection or packing) for performance.
++ *    <li>GCD-compressed Numerics: when all numbers share a common divisor, such as dates, the greatest
++ *        common denominator (GCD) is computed, and quotients are stored using Delta-compressed Numerics.
+  *    <li>Fixed-width Binary: one large concatenated byte[] is written, along with the fixed length.
+  *        Each document's value can be addressed by maxDoc*length. 
+  *    <li>Variable-width Binary: one large concatenated byte[] is written, along with end addresses 
+@@ -93,6 +95,8 @@ import org.apache.lucene.util.packed.BlockPackedWriter;
+  *         <li>2 --&gt; uncompressed. When the <code>acceptableOverheadRatio</code> parameter would upgrade the number
+  *             of bits required to 8, and all values fit in a byte, these are written as absolute binary values
+  *             for performance.
++ *         <li>3 --&gt, gcd-compressed. When all integers share a common divisor, only quotients are stored
++ *             using blocks of delta-encoded ints.
+  *      </ul>
+  *   <p>MinLength and MaxLength represent the min and max byte[] value lengths for Binary values.
+  *      If they are equal, then all values are of a fixed size, and can be addressed as DataOffset + (docID * length).
+@@ -103,7 +107,7 @@ import org.apache.lucene.util.packed.BlockPackedWriter;
+  *   <p>For DocValues field, this stores the actual per-document data (the heavy-lifting)</p>
+  *   <p>DocValues data (.dvd) --&gt; Header,&lt;NumericData | BinaryData | SortedData&gt;<sup>NumFields</sup></p>
+  *   <ul>
+- *     <li>NumericData --&gt; DeltaCompressedNumerics | TableCompressedNumerics | UncompressedNumerics</li>
++ *     <li>NumericData --&gt; DeltaCompressedNumerics | TableCompressedNumerics | UncompressedNumerics | GCDCompressedNumerics</li>
+  *     <li>BinaryData --&gt;  {@link DataOutput#writeByte Byte}<sup>DataLength</sup>,Addresses</li>
+  *     <li>SortedData --&gt; {@link FST FST&lt;Int64&gt;}</li>
+  *     <li>DeltaCompressedNumerics --&gt; {@link BlockPackedWriter BlockPackedInts(blockSize=4096)}</li>
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesProducer.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesProducer.java
+index 6b13ab4..30aad0f 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesProducer.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene42/Lucene42DocValuesProducer.java
+@@ -17,6 +17,11 @@ package org.apache.lucene.codecs.lucene42;
+  * limitations under the License.
+  */
+ 
++import static org.apache.lucene.codecs.lucene42.Lucene42DocValuesConsumer.DELTA_COMPRESSED;
++import static org.apache.lucene.codecs.lucene42.Lucene42DocValuesConsumer.GCD_COMPRESSED;
++import static org.apache.lucene.codecs.lucene42.Lucene42DocValuesConsumer.TABLE_COMPRESSED;
++import static org.apache.lucene.codecs.lucene42.Lucene42DocValuesConsumer.UNCOMPRESSED;
++
+ import java.io.IOException;
+ import java.util.Comparator;
+ import java.util.HashMap;
+@@ -80,14 +85,16 @@ class Lucene42DocValuesProducer extends DocValuesProducer {
+     // read in the entries from the metadata file.
+     IndexInput in = state.directory.openInput(metaName, state.context);
+     boolean success = false;
++    final int version;
+     try {
+-      CodecUtil.checkHeader(in, metaCodec, 
+-                                Lucene42DocValuesConsumer.VERSION_START,
+-                                Lucene42DocValuesConsumer.VERSION_START);
++      version = CodecUtil.checkHeader(in, metaCodec, 
++                                      Lucene42DocValuesConsumer.VERSION_START,
++                                      Lucene42DocValuesConsumer.VERSION_CURRENT);
+       numerics = new HashMap<Integer,NumericEntry>();
+       binaries = new HashMap<Integer,BinaryEntry>();
+       fsts = new HashMap<Integer,FSTEntry>();
+       readFields(in, state.fieldInfos);
++
+       success = true;
+     } finally {
+       if (success) {
+@@ -96,12 +103,24 @@ class Lucene42DocValuesProducer extends DocValuesProducer {
+         IOUtils.closeWhileHandlingException(in);
+       }
+     }
+-    
+-    String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
+-    data = state.directory.openInput(dataName, state.context);
+-    CodecUtil.checkHeader(data, dataCodec, 
+-                                Lucene42DocValuesConsumer.VERSION_START,
+-                                Lucene42DocValuesConsumer.VERSION_START);
++
++    success = false;
++    try {
++      String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
++      data = state.directory.openInput(dataName, state.context);
++      final int version2 = CodecUtil.checkHeader(data, dataCodec, 
++                                                 Lucene42DocValuesConsumer.VERSION_START,
++                                                 Lucene42DocValuesConsumer.VERSION_CURRENT);
++      if (version != version2) {
++        throw new CorruptIndexException("Format versions mismatch");
++      }
++
++      success = true;
++    } finally {
++      if (!success) {
++        IOUtils.closeWhileHandlingException(this.data);
++      }
++    }
+   }
+   
+   private void readFields(IndexInput meta, FieldInfos infos) throws IOException {
+@@ -112,6 +131,15 @@ class Lucene42DocValuesProducer extends DocValuesProducer {
+         NumericEntry entry = new NumericEntry();
+         entry.offset = meta.readLong();
+         entry.format = meta.readByte();
++        switch(entry.format) {
++          case DELTA_COMPRESSED:
++          case TABLE_COMPRESSED:
++          case GCD_COMPRESSED:
++          case UNCOMPRESSED:
++               break;
++          default:
++               throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
++        }
+         if (entry.format != Lucene42DocValuesConsumer.UNCOMPRESSED) {
+           entry.packedIntsVersion = meta.readVInt();
+         }
+@@ -152,41 +180,56 @@ class Lucene42DocValuesProducer extends DocValuesProducer {
+   private NumericDocValues loadNumeric(FieldInfo field) throws IOException {
+     NumericEntry entry = numerics.get(field.number);
+     data.seek(entry.offset);
+-    if (entry.format == Lucene42DocValuesConsumer.TABLE_COMPRESSED) {
+-      int size = data.readVInt();
+-      final long decode[] = new long[size];
+-      for (int i = 0; i < decode.length; i++) {
+-        decode[i] = data.readLong();
+-      }
+-      final int formatID = data.readVInt();
+-      final int bitsPerValue = data.readVInt();
+-      final PackedInts.Reader reader = PackedInts.getReaderNoHeader(data, PackedInts.Format.byId(formatID), entry.packedIntsVersion, maxDoc, bitsPerValue);
+-      return new NumericDocValues() {
+-        @Override
+-        public long get(int docID) {
+-          return decode[(int)reader.get(docID)];
+-        }
+-      };
+-    } else if (entry.format == Lucene42DocValuesConsumer.DELTA_COMPRESSED) {
+-      final int blockSize = data.readVInt();
+-      final BlockPackedReader reader = new BlockPackedReader(data, entry.packedIntsVersion, blockSize, maxDoc, false);
+-      return new NumericDocValues() {
+-        @Override
+-        public long get(int docID) {
+-          return reader.get(docID);
++    switch (entry.format) {
++      case TABLE_COMPRESSED:
++        int size = data.readVInt();
++        if (size > 256) {
++          throw new CorruptIndexException("TABLE_COMPRESSED cannot have more than 256 distinct values, input=" + data);
+         }
+-      };
+-    } else if (entry.format == Lucene42DocValuesConsumer.UNCOMPRESSED) {
+-      final byte bytes[] = new byte[maxDoc];
+-      data.readBytes(bytes, 0, bytes.length);
+-      return new NumericDocValues() {
+-        @Override
+-        public long get(int docID) {
+-          return bytes[docID];
++        final long decode[] = new long[size];
++        for (int i = 0; i < decode.length; i++) {
++          decode[i] = data.readLong();
+         }
+-      };
+-    } else {
+-      throw new IllegalStateException();
++        final int formatID = data.readVInt();
++        final int bitsPerValue = data.readVInt();
++        final PackedInts.Reader ordsReader = PackedInts.getReaderNoHeader(data, PackedInts.Format.byId(formatID), entry.packedIntsVersion, maxDoc, bitsPerValue);
++        return new NumericDocValues() {
++          @Override
++          public long get(int docID) {
++            return decode[(int)ordsReader.get(docID)];
++          }
++        };
++      case DELTA_COMPRESSED:
++        final int blockSize = data.readVInt();
++        final BlockPackedReader reader = new BlockPackedReader(data, entry.packedIntsVersion, blockSize, maxDoc, false);
++        return new NumericDocValues() {
++          @Override
++          public long get(int docID) {
++            return reader.get(docID);
++          }
++        };
++      case UNCOMPRESSED:
++        final byte bytes[] = new byte[maxDoc];
++        data.readBytes(bytes, 0, bytes.length);
++        return new NumericDocValues() {
++          @Override
++          public long get(int docID) {
++            return bytes[docID];
++          }
++        };
++      case GCD_COMPRESSED:
++        final long min = data.readLong();
++        final long mult = data.readLong();
++        final int quotientBlockSize = data.readVInt();
++        final BlockPackedReader quotientReader = new BlockPackedReader(data, entry.packedIntsVersion, quotientBlockSize, maxDoc, false);
++        return new NumericDocValues() {
++          @Override
++          public long get(int docID) {
++            return min + mult * quotientReader.get(docID);
++          }
++        };
++      default:
++        throw new AssertionError();
+     }
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/MathUtil.java b/lucene/core/src/java/org/apache/lucene/util/MathUtil.java
+index 9c86099..9d40f4f 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/MathUtil.java
++++ b/lucene/core/src/java/org/apache/lucene/util/MathUtil.java
+@@ -17,10 +17,11 @@ package org.apache.lucene.util;
+  * limitations under the License.
+  */
+ 
++import java.math.BigInteger;
++
+ /**
+  * Math static utility methods.
+  */
+-
+ public final class MathUtil {
+ 
+   // No instance:
+@@ -42,4 +43,39 @@ public final class MathUtil {
+     }
+     return ret;
+   }
++
++  /** Return the greatest common divisor of <code>a</code> and <code>b</code>,
++   *  consistently with {@link BigInteger#gcd(BigInteger)}.
++   *  <p><b>NOTE</b>: A greatest common divisor must be positive, but
++   *  <code>2^64</code> cannot be expressed as a long although it
++   *  is the GCD of {@link Long#MIN_VALUE} and <code>0</code> and the GCD of
++   *  {@link Long#MIN_VALUE} and {@link Long#MIN_VALUE}. So in these 2 cases,
++   *  and only them, this method will return {@link Long#MIN_VALUE}. */
++  // see http://en.wikipedia.org/wiki/Binary_GCD_algorithm#Iterative_version_in_C.2B.2B_using_ctz_.28count_trailing_zeros.29
++  public static long gcd(long a, long b) {
++    a = Math.abs(a);
++    b = Math.abs(b);
++    if (a == 0) {
++      return b;
++    } else if (b == 0) {
++      return a;
++    }
++    final int commonTrailingZeros = Long.numberOfTrailingZeros(a | b);
++    a >>>= Long.numberOfTrailingZeros(a);
++    while (true) {
++      b >>>= Long.numberOfTrailingZeros(b);
++      if (a == b) {
++        break;
++      } else if (a > b || a == Long.MIN_VALUE) { // MIN_VALUE is treated as 2^64
++        final long tmp = a;
++        a = b;
++        b = tmp;
++      }
++      if (a == 1) {
++        break;
++      }
++      b -= a;
++    }
++    return a << commonTrailingZeros;
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/lucene42/TestLucene42DocValuesFormat.java b/lucene/core/src/test/org/apache/lucene/codecs/lucene42/TestLucene42DocValuesFormat.java
+index 59d5f7c..27be9f2 100644
+--- a/lucene/core/src/test/org/apache/lucene/codecs/lucene42/TestLucene42DocValuesFormat.java
++++ b/lucene/core/src/test/org/apache/lucene/codecs/lucene42/TestLucene42DocValuesFormat.java
+@@ -18,12 +18,12 @@ package org.apache.lucene.codecs.lucene42;
+  */
+ 
+ import org.apache.lucene.codecs.Codec;
+-import org.apache.lucene.index.BaseDocValuesFormatTestCase;
++import org.apache.lucene.index.BaseCompressingDocValuesFormatTestCase;
+ 
+ /**
+  * Tests Lucene42DocValuesFormat
+  */
+-public class TestLucene42DocValuesFormat extends BaseDocValuesFormatTestCase {
++public class TestLucene42DocValuesFormat extends BaseCompressingDocValuesFormatTestCase {
+   private final Codec codec = new Lucene42Codec();
+ 
+   @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestMathUtil.java b/lucene/core/src/test/org/apache/lucene/util/TestMathUtil.java
+new file mode 100644
+index 0000000..ec1e2b9
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/TestMathUtil.java
+@@ -0,0 +1,105 @@
++package org.apache.lucene.util;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.math.BigInteger;
++import java.util.Arrays;
++
++import com.carrotsearch.randomizedtesting.generators.RandomPicks;
++
++public class TestMathUtil extends LuceneTestCase {
++
++  static long[] PRIMES = new long[] {2, 3, 5, 7, 11, 13, 17, 19, 23, 29};
++
++  static long randomLong() {
++    if (random().nextBoolean()) {
++      long l = 1;
++      if (random().nextBoolean()) {
++        l *= -1;
++      }
++      for (long i : PRIMES) {
++        final int m = random().nextInt(3);
++        for (int j = 0; j < m; ++j) {
++          l *= i;
++        }
++      }
++      return l;
++    } else if (random().nextBoolean()) {
++      return random().nextLong();
++    } else {
++      return RandomPicks.randomFrom(random(), Arrays.asList(Long.MIN_VALUE, Long.MAX_VALUE, 0L, -1L, 1L));
++    }
++  }
++
++  // slow version used for testing
++  static long gcd(long l1, long l2) {
++    final BigInteger gcd = BigInteger.valueOf(l1).gcd(BigInteger.valueOf(l2));
++    assert gcd.bitCount() <= 64;
++    return gcd.longValue();
++  }
++
++  public void testGCD() {
++    final int iters = atLeast(100);
++    for (int i = 0; i < iters; ++i) {
++      final long l1 = randomLong();
++      final long l2 = randomLong();
++      final long gcd = MathUtil.gcd(l1, l2);
++      final long actualGcd = gcd(l1, l2);
++      assertEquals(actualGcd, gcd);
++      if (gcd != 0) {
++        assertEquals(l1, (l1 / gcd) * gcd);
++        assertEquals(l2, (l2 / gcd) * gcd);
++      }
++    }
++  }
++  
++  // ported test from commons-math
++  public void testGCD2() {
++    long a = 30;
++    long b = 50;
++    long c = 77;
++    
++    assertEquals(0, MathUtil.gcd(0, 0));
++    assertEquals(b, MathUtil.gcd(0, b));
++    assertEquals(a, MathUtil.gcd(a, 0));
++    assertEquals(b, MathUtil.gcd(0, -b));
++    assertEquals(a, MathUtil.gcd(-a, 0));
++    
++    assertEquals(10, MathUtil.gcd(a, b));
++    assertEquals(10, MathUtil.gcd(-a, b));
++    assertEquals(10, MathUtil.gcd(a, -b));
++    assertEquals(10, MathUtil.gcd(-a, -b));
++    
++    assertEquals(1, MathUtil.gcd(a, c));
++    assertEquals(1, MathUtil.gcd(-a, c));
++    assertEquals(1, MathUtil.gcd(a, -c));
++    assertEquals(1, MathUtil.gcd(-a, -c));
++    
++    assertEquals(3L * (1L<<45), MathUtil.gcd(3L * (1L<<50), 9L * (1L<<45)));
++    assertEquals(1L<<45, MathUtil.gcd(1L<<45, Long.MIN_VALUE));
++    
++    assertEquals(Long.MAX_VALUE, MathUtil.gcd(Long.MAX_VALUE, 0L));
++    assertEquals(Long.MAX_VALUE, MathUtil.gcd(-Long.MAX_VALUE, 0L));
++    assertEquals(1, MathUtil.gcd(60247241209L, 153092023L));
++    
++    assertEquals(Long.MIN_VALUE, MathUtil.gcd(Long.MIN_VALUE, 0));
++    assertEquals(Long.MIN_VALUE, MathUtil.gcd(0, Long.MIN_VALUE));
++    assertEquals(Long.MIN_VALUE, MathUtil.gcd(Long.MIN_VALUE, Long.MIN_VALUE));
++  }
++
++}
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/codecs/cheapbastard/CheapBastardDocValuesProducer.java b/lucene/test-framework/src/java/org/apache/lucene/codecs/cheapbastard/CheapBastardDocValuesProducer.java
+index a38def6..aab4acc 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/codecs/cheapbastard/CheapBastardDocValuesProducer.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/codecs/cheapbastard/CheapBastardDocValuesProducer.java
+@@ -17,6 +17,10 @@ package org.apache.lucene.codecs.cheapbastard;
+  * limitations under the License.
+  */
+ 
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.DELTA_COMPRESSED;
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.GCD_COMPRESSED;
++import static org.apache.lucene.codecs.diskdv.DiskDocValuesConsumer.TABLE_COMPRESSED;
++
+ import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.Map;
+@@ -37,6 +41,7 @@ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.packed.BlockPackedReader;
+ import org.apache.lucene.util.packed.MonotonicBlockPackedReader;
++import org.apache.lucene.util.packed.PackedInts;
+ 
+ class CheapBastardDocValuesProducer extends DocValuesProducer {
+   private final Map<Integer,NumericEntry> numerics;
+@@ -50,15 +55,17 @@ class CheapBastardDocValuesProducer extends DocValuesProducer {
+     // read in the entries from the metadata file.
+     IndexInput in = state.directory.openInput(metaName, state.context);
+     boolean success = false;
++    final int version;
+     try {
+-      CodecUtil.checkHeader(in, metaCodec, 
+-                                DiskDocValuesFormat.VERSION_START,
+-                                DiskDocValuesFormat.VERSION_START);
++      version = CodecUtil.checkHeader(in, metaCodec, 
++                                      DiskDocValuesFormat.VERSION_START,
++                                      DiskDocValuesFormat.VERSION_CURRENT);
+       numerics = new HashMap<Integer,NumericEntry>();
+       ords = new HashMap<Integer,NumericEntry>();
+       ordIndexes = new HashMap<Integer,NumericEntry>();
+       binaries = new HashMap<Integer,BinaryEntry>();
+       readFields(in);
++
+       success = true;
+     } finally {
+       if (success) {
+@@ -67,12 +74,25 @@ class CheapBastardDocValuesProducer extends DocValuesProducer {
+         IOUtils.closeWhileHandlingException(in);
+       }
+     }
+-    
+-    String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
+-    data = state.directory.openInput(dataName, state.context);
+-    CodecUtil.checkHeader(data, dataCodec, 
+-                                DiskDocValuesFormat.VERSION_START,
+-                                DiskDocValuesFormat.VERSION_START);
++
++    success = false;
++    try {
++      String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
++      data = state.directory.openInput(dataName, state.context);
++      final int version2 = CodecUtil.checkHeader(data, dataCodec, 
++                                                 DiskDocValuesFormat.VERSION_START,
++                                                 DiskDocValuesFormat.VERSION_CURRENT);
++      if (version != version2) {
++        throw new CorruptIndexException("Versions mismatch");
++      }
++
++      success = true;
++    } finally {
++      if (!success) {
++        IOUtils.closeWhileHandlingException(this.data);
++      }
++    }
++
+   }
+   
+   private void readFields(IndexInput meta) throws IOException {
+@@ -140,10 +160,34 @@ class CheapBastardDocValuesProducer extends DocValuesProducer {
+   
+   static NumericEntry readNumericEntry(IndexInput meta) throws IOException {
+     NumericEntry entry = new NumericEntry();
++    entry.format = meta.readVInt();
+     entry.packedIntsVersion = meta.readVInt();
+     entry.offset = meta.readLong();
+     entry.count = meta.readVLong();
+     entry.blockSize = meta.readVInt();
++    switch(entry.format) {
++      case GCD_COMPRESSED:
++        entry.minValue = meta.readLong();
++        entry.gcd = meta.readLong();
++        break;
++      case TABLE_COMPRESSED:
++        if (entry.count > Integer.MAX_VALUE) {
++          throw new CorruptIndexException("Cannot use TABLE_COMPRESSED with more than MAX_VALUE values, input=" + meta);
++        }
++        final int uniqueValues = meta.readVInt();
++        if (uniqueValues > 256) {
++          throw new CorruptIndexException("TABLE_COMPRESSED cannot have more than 256 distinct values, input=" + meta);
++        }
++        entry.table = new long[uniqueValues];
++        for (int i = 0; i < uniqueValues; ++i) {
++          entry.table[i] = meta.readLong();
++        }
++        break;
++      case DELTA_COMPRESSED:
++        break;
++      default:
++        throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
++    }
+     return entry;
+   }
+   
+@@ -171,13 +215,38 @@ class CheapBastardDocValuesProducer extends DocValuesProducer {
+     final IndexInput data = this.data.clone();
+     data.seek(entry.offset);
+ 
+-    final BlockPackedReader reader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
+-    return new LongNumericDocValues() {
+-      @Override
+-      public long get(long id) {
+-        return reader.get(id);
+-      }
+-    };
++    switch (entry.format) {
++      case DELTA_COMPRESSED:
++        final BlockPackedReader reader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
++        return new LongNumericDocValues() {
++          @Override
++          public long get(long id) {
++            return reader.get(id);
++          }
++        };
++      case GCD_COMPRESSED:
++        final long min = entry.minValue;
++        final long mult = entry.gcd;
++        final BlockPackedReader quotientReader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
++        return new LongNumericDocValues() {
++          @Override
++          public long get(long id) {
++            return min + mult * quotientReader.get(id);
++          }
++        };
++      case TABLE_COMPRESSED:
++        final long[] table = entry.table;
++        final int bitsRequired = PackedInts.bitsRequired(table.length - 1);
++        final PackedInts.Reader ords = PackedInts.getDirectReaderNoHeader(data, PackedInts.Format.PACKED, entry.packedIntsVersion, (int) entry.count, bitsRequired);
++        return new LongNumericDocValues() {
++          @Override
++          long get(long id) {
++            return table[(int) ords.get((int) id)];
++          }
++        };
++      default:
++        throw new AssertionError();
++    }
+   }
+ 
+   @Override
+@@ -315,9 +384,14 @@ class CheapBastardDocValuesProducer extends DocValuesProducer {
+   static class NumericEntry {
+     long offset;
+ 
++    int format;
+     int packedIntsVersion;
+     long count;
+     int blockSize;
++    
++    long minValue;
++    long gcd;
++    long table[];
+   }
+   
+   static class BinaryEntry {
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/index/BaseCompressingDocValuesFormatTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/index/BaseCompressingDocValuesFormatTestCase.java
+new file mode 100644
+index 0000000..381606f
+--- /dev/null
++++ b/lucene/test-framework/src/java/org/apache/lucene/index/BaseCompressingDocValuesFormatTestCase.java
+@@ -0,0 +1,128 @@
++package org.apache.lucene.index;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.RAMDirectory;
++import org.apache.lucene.util._TestUtil;
++import org.apache.lucene.util.packed.PackedInts;
++
++import com.carrotsearch.randomizedtesting.generators.RandomPicks;
++
++/** Extends {@link BaseDocValuesFormatTestCase} to add compression checks. */
++public abstract class BaseCompressingDocValuesFormatTestCase extends BaseDocValuesFormatTestCase {
++
++  static long dirSize(Directory d) throws IOException {
++    long size = 0;
++    for (String file : d.listAll()) {
++      size += d.fileLength(file);
++    }
++    return size;
++  }
++
++  public void testUniqueValuesCompression() throws IOException {
++    final Directory dir = new RAMDirectory();
++    final IndexWriterConfig iwc = new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    final IndexWriter iwriter = new IndexWriter(dir, iwc);
++
++    final int uniqueValueCount = _TestUtil.nextInt(random(), 1, 256);
++    final List<Long> values = new ArrayList<Long>();
++
++    final Document doc = new Document();
++    final NumericDocValuesField dvf = new NumericDocValuesField("dv", 0);
++    doc.add(dvf);
++    for (int i = 0; i < 300; ++i) {
++      final long value;
++      if (values.size() < uniqueValueCount) {
++        value = random().nextLong();
++        values.add(value);
++      } else {
++        value = RandomPicks.randomFrom(random(), values);
++      }
++      dvf.setLongValue(value);
++      iwriter.addDocument(doc);
++    }
++    iwriter.forceMerge(1);
++    final long size1 = dirSize(dir);
++    for (int i = 0; i < 20; ++i) {
++      dvf.setLongValue(RandomPicks.randomFrom(random(), values));
++      iwriter.addDocument(doc);
++    }
++    iwriter.forceMerge(1);
++    final long size2 = dirSize(dir);
++    // make sure the new longs did not cost 8 bytes each
++    assertTrue(size2 < size1 + 8 * 20);
++  }
++
++  public void testDateCompression() throws IOException {
++    final Directory dir = new RAMDirectory();
++    final IndexWriterConfig iwc = new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    final IndexWriter iwriter = new IndexWriter(dir, iwc);
++
++    final long base = 13; // prime
++    final long day = 1000L * 60 * 60 * 24;
++
++    final Document doc = new Document();
++    final NumericDocValuesField dvf = new NumericDocValuesField("dv", 0);
++    doc.add(dvf);
++    for (int i = 0; i < 300; ++i) {
++      dvf.setLongValue(base + random().nextInt(1000) * day);
++      iwriter.addDocument(doc);
++    }
++    iwriter.forceMerge(1);
++    final long size1 = dirSize(dir);
++    for (int i = 0; i < 50; ++i) {
++      dvf.setLongValue(base + random().nextInt(1000) * day);
++      iwriter.addDocument(doc);
++    }
++    iwriter.forceMerge(1);
++    final long size2 = dirSize(dir);
++    // make sure the new longs costed less than if they had only been packed
++    assertTrue(size2 < size1 + (PackedInts.bitsRequired(day) * 50) / 8);
++  }
++
++  public void testSingleBigValueCompression() throws IOException {
++    final Directory dir = new RAMDirectory();
++    final IndexWriterConfig iwc = new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    final IndexWriter iwriter = new IndexWriter(dir, iwc);
++
++    final Document doc = new Document();
++    final NumericDocValuesField dvf = new NumericDocValuesField("dv", 0);
++    doc.add(dvf);
++    for (int i = 0; i < 20000; ++i) {
++      dvf.setLongValue(i & 1023);
++      iwriter.addDocument(doc);
++    }
++    iwriter.forceMerge(1);
++    final long size1 = dirSize(dir);
++    dvf.setLongValue(Long.MAX_VALUE);
++    iwriter.addDocument(doc);
++    iwriter.forceMerge(1);
++    final long size2 = dirSize(dir);
++    // make sure the new value did not grow the bpv for every other value
++    assertTrue(size2 < size1 + (20000 * (63 - 10)) / 8);
++  }
++
++}
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/index/BaseDocValuesFormatTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/index/BaseDocValuesFormatTestCase.java
+index c2f7cd9..a6eb50e 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/index/BaseDocValuesFormatTestCase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/index/BaseDocValuesFormatTestCase.java
+@@ -25,15 +25,13 @@ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Map.Entry;
+ import java.util.Set;
+ import java.util.TreeSet;
+-import java.util.Map.Entry;
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.codecs.Codec;
+-import org.apache.lucene.codecs.DocValuesFormat;
+-import org.apache.lucene.codecs.lucene42.Lucene42Codec;
+ import org.apache.lucene.document.BinaryDocValuesField;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+@@ -44,7 +42,6 @@ import org.apache.lucene.document.SortedSetDocValuesField;
+ import org.apache.lucene.document.StoredField;
+ import org.apache.lucene.document.StringField;
+ import org.apache.lucene.document.TextField;
+-import org.apache.lucene.index.FieldInfo.DocValuesType;
+ import org.apache.lucene.index.TermsEnum.SeekStatus;
+ import org.apache.lucene.search.BooleanClause;
+ import org.apache.lucene.search.BooleanQuery;
+@@ -1122,8 +1119,21 @@ public abstract class BaseDocValuesFormatTestCase extends LuceneTestCase {
+     w.close();
+     dir.close();
+   }
+-  
+-  private void doTestNumericsVsStoredFields(long minValue, long maxValue) throws Exception {
++
++  static abstract class LongProducer {
++    abstract long next();
++  }
++
++  private void doTestNumericsVsStoredFields(final long minValue, final long maxValue) throws Exception {
++    doTestNumericsVsStoredFields(new LongProducer() {
++      @Override
++      long next() {
++        return _TestUtil.nextLong(random(), minValue, maxValue);
++      }
++    });
++  }
++
++  private void doTestNumericsVsStoredFields(LongProducer longs) throws Exception {
+     Directory dir = newDirectory();
+     IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
+     RandomIndexWriter writer = new RandomIndexWriter(random(), dir, conf);
+@@ -1137,9 +1147,12 @@ public abstract class BaseDocValuesFormatTestCase extends LuceneTestCase {
+     
+     // index some docs
+     int numDocs = atLeast(300);
++    // numDocs should be always > 256 so that in case of a codec that optimizes
++    // for numbers of values <= 256, all storage layouts are tested
++    assert numDocs > 256;
+     for (int i = 0; i < numDocs; i++) {
+       idField.setStringValue(Integer.toString(i));
+-      long value = _TestUtil.nextLong(random(), minValue, maxValue);
++      long value = longs.next();
+       storedField.setStringValue(Long.toString(value));
+       dvField.setLongValue(value);
+       writer.addDocument(doc);
+@@ -1154,6 +1167,11 @@ public abstract class BaseDocValuesFormatTestCase extends LuceneTestCase {
+       int id = random().nextInt(numDocs);
+       writer.deleteDocuments(new Term("id", Integer.toString(id)));
+     }
++
++    // merge some segments and ensure that at least one of them has more than
++    // 256 values
++    writer.forceMerge(numDocs / 256);
++
+     writer.close();
+     
+     // compare
+@@ -2007,4 +2025,39 @@ public abstract class BaseDocValuesFormatTestCase extends LuceneTestCase {
+       doTestSortedSetVsUninvertedField(1, 10);
+     }
+   }
++
++  public void testGCDCompression() throws Exception {
++    int numIterations = atLeast(1);
++    for (int i = 0; i < numIterations; i++) {
++      final long min = - (((long) random().nextInt(1 << 30)) << 32);
++      final long mul = random().nextInt() & 0xFFFFFFFFL;
++      final LongProducer longs = new LongProducer() {
++        @Override
++        long next() {
++          return min + mul * random().nextInt(1 << 20);
++        }
++      };
++      doTestNumericsVsStoredFields(longs);
++    }
++  }
++
++  public void testZeros() throws Exception {
++    doTestNumericsVsStoredFields(0, 0);
++  }
++
++  public void testZeroOrMin() throws Exception {
++    // try to make GCD compression fail if the format did not anticipate that
++    // the GCD of 0 and MIN_VALUE is negative
++    int numIterations = atLeast(1);
++    for (int i = 0; i < numIterations; i++) {
++      final LongProducer longs = new LongProducer() {
++        @Override
++        long next() {
++          return random().nextBoolean() ? 0 : Long.MIN_VALUE;
++        }
++      };
++      doTestNumericsVsStoredFields(longs);
++    }
++  }
++
+ }
+

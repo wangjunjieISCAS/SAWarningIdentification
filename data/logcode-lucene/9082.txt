@@ -1,0 +1,598 @@
+GitDiffStart: ad81236c7d52fac6f681b670055a22d3e13ab3ee | Wed Mar 20 15:33:55 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index fafce11..cec0cf2 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -146,6 +146,9 @@ Bug Fixes
+ * LUCENE-4828: BooleanQuery no longer extracts terms from its MUST_NOT
+   clauses.  (Mike McCandless)
+ 
++* SOLR-4589: Fixed CPU spikes and poor performance in lazy field loading 
++  of multivalued fields. (hossman)
++
+ Optimizations
+ 
+ * LUCENE-4819: Added Sorted[Set]DocValues.termsEnum(), and optimized the
+diff --git a/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java b/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java
+index b99c1bd..fc34460 100644
+--- a/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java
++++ b/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java
+@@ -15,11 +15,14 @@ package org.apache.lucene.document;
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ import java.io.IOException;
+ import java.io.Reader;
++import java.util.List;
++import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.HashSet;
++import java.util.Set;
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.TokenStream;
+@@ -32,53 +35,125 @@ import org.apache.lucene.util.BytesRef;
+ 
+ /** Defers actually loading a field's value until you ask
+  *  for it.  You must not use the returned Field instances
+- *  after the provided reader has been closed. */
+-
++ *  after the provided reader has been closed. 
++ * @see #getField
++ */
+ public class LazyDocument {
+-  private IndexReader reader;
++  private final IndexReader reader;
+   private final int docID;
+ 
+   // null until first field is loaded
+   private StoredDocument doc;
+ 
+-  private Map<Integer,Integer> fields = new HashMap<Integer,Integer>();
++  private Map<Integer,List<LazyField>> fields = new HashMap<Integer,List<LazyField>>();
++  private Set<String> fieldNames = new HashSet<String>();
+ 
+   public LazyDocument(IndexReader reader, int docID) {
+     this.reader = reader;
+     this.docID = docID;
+   }
+ 
++  /**
++   * Creates a StorableField whose value will be lazy loaded if and 
++   * when it is used. 
++   * <p>
++   * <b>NOTE:</b> This method must be called once for each value of the field 
++   * name specified in sequence that the values exist.  This method may not be 
++   * used to generate multiple, lazy, StorableField instances refering to 
++   * the same underlying StorableField instance.
++   * </p>
++   * <p>
++   * The lazy loading of field values from all instances of StorableField 
++   * objects returned by this method are all backed by a single StoredDocument 
++   * per LazyDocument instance.
++   * </p>
++   */
+   public StorableField getField(FieldInfo fieldInfo) {  
+-    Integer num = fields.get(fieldInfo.number);
+-    if (num == null) {
+-      num = 0;
+-    } else {
+-      num++;
+-    }
+-    fields.put(fieldInfo.number, num);
+ 
+-    return new LazyField(fieldInfo.name, num);
++    fieldNames.add(fieldInfo.name);
++    List<LazyField> values = fields.get(fieldInfo.number);
++    if (null == values) {
++      values = new ArrayList<LazyField>();
++      fields.put(fieldInfo.number, values);
++    } 
++
++    LazyField value = new LazyField(fieldInfo.name, fieldInfo.number);
++    values.add(value);
++
++    synchronized (this) {
++      // edge case: if someone asks this LazyDoc for more LazyFields
++      // after other LazyFields from the same LazyDoc have been
++      // actuallized, we need to force the doc to be re-fetched
++      // so the new LazyFields are also populated.
++      doc = null;
++    }
++    return value;
+   }
+ 
+-  private synchronized StoredDocument getDocument() {
++  /** 
++   * non-private for test only access
++   * @lucene.internal 
++   */
++  synchronized StoredDocument getDocument() {
+     if (doc == null) {
+       try {
+-        doc = reader.document(docID);
++        doc = reader.document(docID, fieldNames);
+       } catch (IOException ioe) {
+         throw new IllegalStateException("unable to load document", ioe);
+       }
+-      reader = null;
+     }
+     return doc;
+   }
+ 
+-  private class LazyField implements StorableField {
+-    private String name;
+-    private int num;
++  // :TODO: synchronize to prevent redundent copying? (sync per field name?)
++  private void fetchRealValues(String name, int fieldNum) {
++    StoredDocument d = getDocument();
++
++    List<LazyField> lazyValues = fields.get(fieldNum);
++    StorableField[] realValues = d.getFields(name);
+     
+-    public LazyField(String name, int num) {
++    assert realValues.length <= lazyValues.size() 
++      : "More lazy values then real values for field: " + name;
++    
++    for (int i = 0; i < lazyValues.size(); i++) {
++      LazyField f = lazyValues.get(i);
++      if (null != f) {
++        f.realValue = realValues[i];
++      }
++    }
++  }
++
++
++  /** 
++   * @lucene.internal 
++   */
++  public class LazyField implements StorableField {
++    private String name;
++    private int fieldNum;
++    volatile StorableField realValue = null;
++
++    private LazyField(String name, int fieldNum) {
+       this.name = name;
+-      this.num = num;
++      this.fieldNum = fieldNum;
++    }
++
++    /** 
++     * non-private for test only access
++     * @lucene.internal 
++     */
++    public boolean hasBeenLoaded() {
++      return null != realValue;
++    }
++
++    private StorableField getRealValue() {
++      if (null == realValue) {
++        fetchRealValues(name, fieldNum);
++      }
++      assert hasBeenLoaded() : "field value was not lazy loaded";
++      assert realValue.name().equals(name()) : 
++        "realvalue name != name: " + realValue.name() + " != " + name();
++
++      return realValue;
+     }
+ 
+     @Override
+@@ -88,47 +163,27 @@ public class LazyDocument {
+ 
+     @Override
+     public BytesRef binaryValue() {
+-      if (num == 0) {
+-        return getDocument().getField(name).binaryValue();
+-      } else {
+-        return getDocument().getFields(name)[num].binaryValue();
+-      }
++      return getRealValue().binaryValue();
+     }
+ 
+     @Override
+     public String stringValue() {
+-      if (num == 0) {
+-        return getDocument().getField(name).stringValue();
+-      } else {
+-        return getDocument().getFields(name)[num].stringValue();
+-      }
++      return getRealValue().stringValue();
+     }
+ 
+     @Override
+     public Reader readerValue() {
+-      if (num == 0) {
+-        return getDocument().getField(name).readerValue();
+-      } else {
+-        return getDocument().getFields(name)[num].readerValue();
+-      }
++      return getRealValue().readerValue();
+     }
+ 
+     @Override
+     public Number numericValue() {
+-      if (num == 0) {
+-        return getDocument().getField(name).numericValue();
+-      } else {
+-        return getDocument().getFields(name)[num].numericValue();
+-      }
++      return getRealValue().numericValue();
+     }
+ 
+     @Override
+     public IndexableFieldType fieldType() {
+-      if (num == 0) {
+-        return getDocument().getField(name).fieldType();
+-      } else {
+-        return getDocument().getFields(name)[num].fieldType();
+-      }
++      return getRealValue().fieldType();
+     }
+   }
+ }
+diff --git a/lucene/misc/src/test/org/apache/lucene/document/TestLazyDocument.java b/lucene/misc/src/test/org/apache/lucene/document/TestLazyDocument.java
+new file mode 100644
+index 0000000..be96c1e
+--- /dev/null
++++ b/lucene/misc/src/test/org/apache/lucene/document/TestLazyDocument.java
+@@ -0,0 +1,226 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.document;
++
++import java.util.Arrays;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.HashMap;
++import java.io.IOException;
++
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.store.*;
++import org.apache.lucene.document.*;
++import org.apache.lucene.analysis.*;
++import org.apache.lucene.index.*;
++import org.apache.lucene.search.*;
++
++import org.junit.After;
++import org.junit.Before;
++
++public class TestLazyDocument extends LuceneTestCase {
++
++  public final int NUM_DOCS = atLeast(10);
++  public final String[] FIELDS = new String[] 
++    { "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k" };
++  public final int NUM_VALUES = atLeast(100);
++
++  public Directory dir = newDirectory();
++  
++  @After
++  public void removeIndex() {
++    if (null != dir) {
++      try { 
++        dir.close(); 
++        dir = null;
++      } catch (Exception e) { /* NOOP */ }
++    }
++  }
++
++  @Before
++  public void createIndex() throws Exception {
++
++    Analyzer analyzer = new MockAnalyzer(random());
++    IndexWriter writer = new IndexWriter
++      (dir, newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer));
++    try {
++      for (int docid = 0; docid < NUM_DOCS; docid++) {
++        Document d = new Document();
++        d.add(newStringField("docid", ""+docid, Field.Store.YES));
++        d.add(newStringField("never_load", "fail", Field.Store.YES));
++        for (String f : FIELDS) {
++          for (int val = 0; val < NUM_VALUES; val++) {
++            d.add(newStringField(f, docid+"_"+f+"_"+val, Field.Store.YES));
++          }
++        }
++        d.add(newStringField("load_later", "yes", Field.Store.YES));
++        writer.addDocument(d);
++      }
++    } finally {
++      writer.close();
++    }
++  }
++
++  public void testLazy() throws Exception {
++    final int id = random().nextInt(NUM_DOCS);
++    IndexReader reader = DirectoryReader.open(dir);
++    try {
++      Query q = new TermQuery(new Term("docid", ""+id));
++      IndexSearcher searcher = new IndexSearcher(reader);
++      ScoreDoc[] hits = searcher.search(q, 100).scoreDocs;
++      assertEquals("Too many docs", 1, hits.length);
++      LazyTestingStoredFieldVisitor visitor 
++        = new LazyTestingStoredFieldVisitor(new LazyDocument(reader, hits[0].doc),
++                                            FIELDS);
++      reader.document(hits[0].doc, visitor);
++      StoredDocument d = visitor.doc;
++
++      int numFieldValues = 0;
++      Map<String,Integer> fieldValueCounts = new HashMap<String,Integer>();
++
++      // at this point, all FIELDS should be Lazy and unrealized
++      for (StorableField f : d) {
++        numFieldValues++;   
++        if (f.name().equals("never_load")) {
++          fail("never_load was loaded");
++        }
++        if (f.name().equals("load_later")) {
++          fail("load_later was loaded on first pass");
++        }
++        if (f.name().equals("docid")) {
++          assertFalse(f.name(), f instanceof LazyDocument.LazyField);
++        } else {
++          int count = fieldValueCounts.containsKey(f.name()) ?
++            fieldValueCounts.get(f.name()) : 0;
++          count++;
++          fieldValueCounts.put(f.name(), count);
++          assertTrue(f.name() + " is " + f.getClass(),
++                     f instanceof LazyDocument.LazyField);
++          LazyDocument.LazyField lf = (LazyDocument.LazyField) f;
++          assertFalse(f.name() + " is loaded", lf.hasBeenLoaded());
++        }
++      }
++      System.out.println("numFieldValues == " + numFieldValues);
++      assertEquals("numFieldValues", 1 + (NUM_VALUES * FIELDS.length), 
++                   numFieldValues);
++        
++      for (String fieldName : fieldValueCounts.keySet()) {
++        assertEquals("fieldName count: " + fieldName, 
++                     NUM_VALUES, (int)fieldValueCounts.get(fieldName));
++      }
++
++      // pick a single field name to load a single value
++      final String fieldName = FIELDS[random().nextInt(FIELDS.length)];
++      final StorableField[] fieldValues = d.getFields(fieldName);
++      assertEquals("#vals in field: " + fieldName, 
++                   NUM_VALUES, fieldValues.length);
++      final int valNum = random().nextInt(fieldValues.length);
++      assertEquals(id + "_" + fieldName + "_" + valNum,
++                   fieldValues[valNum].stringValue());
++      
++      // now every value of fieldName should be loaded
++      for (StorableField f : d) {
++        if (f.name().equals("never_load")) {
++          fail("never_load was loaded");
++        }
++        if (f.name().equals("load_later")) {
++          fail("load_later was loaded too soon");
++        }
++        if (f.name().equals("docid")) {
++          assertFalse(f.name(), f instanceof LazyDocument.LazyField);
++        } else {
++          assertTrue(f.name() + " is " + f.getClass(),
++                     f instanceof LazyDocument.LazyField);
++          LazyDocument.LazyField lf = (LazyDocument.LazyField) f;
++          assertEquals(f.name() + " is loaded?", 
++                       lf.name().equals(fieldName), lf.hasBeenLoaded());
++        }
++      }
++
++      // use the same LazyDoc to ask for one more lazy field
++      visitor = new LazyTestingStoredFieldVisitor(new LazyDocument(reader, hits[0].doc),
++                                                  "load_later");
++      reader.document(hits[0].doc, visitor);
++      d = visitor.doc;
++      
++      // ensure we have all the values we expect now, and that
++      // adding one more lazy field didn't "unload" the existing LazyField's
++      // we already loaded.
++      for (StorableField f : d) {
++        if (f.name().equals("never_load")) {
++          fail("never_load was loaded");
++        }
++        if (f.name().equals("docid")) {
++          assertFalse(f.name(), f instanceof LazyDocument.LazyField);
++        } else {
++          assertTrue(f.name() + " is " + f.getClass(),
++                     f instanceof LazyDocument.LazyField);
++          LazyDocument.LazyField lf = (LazyDocument.LazyField) f;
++          assertEquals(f.name() + " is loaded?", 
++                       lf.name().equals(fieldName), lf.hasBeenLoaded());
++        }
++      }
++
++      // even the underlying doc shouldn't have never_load
++      assertNull("never_load was loaded in wrapped doc",
++                 visitor.lazyDoc.getDocument().getField("never_load"));
++
++    } finally {
++      reader.close();
++    }
++  }
++
++  private static class LazyTestingStoredFieldVisitor extends StoredFieldVisitor {
++    public final StoredDocument doc = new StoredDocument();
++    public final LazyDocument lazyDoc;
++    public final Set<String> lazyFieldNames;
++
++    LazyTestingStoredFieldVisitor(LazyDocument l, String... fields) {
++      lazyDoc = l;
++      lazyFieldNames = new HashSet<String>(Arrays.asList(fields));
++    }
++
++    @Override
++    public Status needsField(FieldInfo fieldInfo) {
++      if (fieldInfo.name.equals("docid")) {
++        return Status.YES;
++      } else if (fieldInfo.name.equals("never_load")) {
++        return Status.NO;
++      } else {
++        if (lazyFieldNames.contains(fieldInfo.name)) {
++          doc.add(lazyDoc.getField(fieldInfo));
++        }
++      }
++      return Status.NO;
++    }
++
++    @Override
++    public void stringField(FieldInfo fieldInfo, String value) throws IOException {
++      final FieldType ft = new FieldType(TextField.TYPE_STORED);
++      ft.setStoreTermVectors(fieldInfo.hasVectors());
++      ft.setIndexed(fieldInfo.isIndexed());
++      ft.setOmitNorms(fieldInfo.omitsNorms());
++      ft.setIndexOptions(fieldInfo.getIndexOptions());
++      doc.add(new Field(fieldInfo.name, value, ft));
++    }
++
++  }
++}
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 2b6db97..255ad1c 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -203,6 +203,9 @@ Bug Fixes
+   SolrCore through it's constructor rather than setting a field after.
+   (Mark Miller)
+     
++* SOLR-4589: Fixed CPU spikes and poor performance in lazy field loading 
++  of multivalued fields. (hossman)
++
+ Optimizations
+ ----------------------
+ 
+diff --git a/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java b/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java
+index bebf4a1..d65328e 100644
+--- a/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java
++++ b/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java
+@@ -29,6 +29,7 @@ import javax.xml.parsers.DocumentBuilder;
+ import javax.xml.parsers.DocumentBuilderFactory;
+ 
+ import org.apache.lucene.document.Field;
++import org.apache.lucene.document.LazyDocument;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.LogMergePolicy;
+ import org.apache.lucene.index.StorableField;
+@@ -720,21 +721,21 @@ public class BasicFunctionalityTest extends SolrTestCaseJ4 {
+ 
+   @Test
+   public void testNotLazyField() throws IOException {
+-    for(int i = 0; i < 10; i++) {
+-      assertU(adoc("id", new Integer(i).toString(), 
+-                   "title", "keyword",
+-                   "test_hlt", mkstr(20000)));
+-    }
++
++    assertU(adoc("id", "7777",
++                 "title", "keyword",
++                 "test_hlt", mkstr(20000)));
++
+     assertU(commit());
+     SolrCore core = h.getCore();
+    
+-    SolrQueryRequest req = req("q", "title:keyword", "fl", "id,title,test_hlt");
++    SolrQueryRequest req = req("q", "id:7777", "fl", "id,title,test_hlt");
+     SolrQueryResponse rsp = new SolrQueryResponse();
+     core.execute(core.getRequestHandler(req.getParams().get(CommonParams.QT)), req, rsp);
+ 
+     DocList dl = ((ResultContext) rsp.getValues().get("response")).docs;
+     StoredDocument d = req.getSearcher().doc(dl.iterator().nextDoc());
+-    // ensure field is not lazy, only works for Non-Numeric fields currently (if you change schema behind test, this may fail)
++    // ensure field in fl is not lazy
+     assertFalse( ((Field) d.getField("test_hlt")).getClass().getSimpleName().equals("LazyField"));
+     assertFalse( ((Field) d.getField("title")).getClass().getSimpleName().equals("LazyField"));
+     req.close();
+@@ -742,24 +743,65 @@ public class BasicFunctionalityTest extends SolrTestCaseJ4 {
+ 
+   @Test
+   public void testLazyField() throws IOException {
+-    for(int i = 0; i < 10; i++) {
+-      assertU(adoc("id", new Integer(i).toString(), 
+-                   "title", "keyword",
+-                   "test_hlt", mkstr(20000)));
+-    }
++    assertU(adoc("id", "7777",
++                 "title", "keyword",
++                 "test_hlt", mkstr(10000),
++                 "test_hlt", mkstr(20000),
++                 "test_hlt", mkstr(30000),
++                 "test_hlt", mkstr(40000)));
++
+     assertU(commit());
+     SolrCore core = h.getCore();
+     
+-    SolrQueryRequest req = req("q", "title:keyword", "fl", "id,title");
++    // initial request
++    SolrQueryRequest req = req("q", "id:7777", "fl", "id,title");
+     SolrQueryResponse rsp = new SolrQueryResponse();
+     core.execute(core.getRequestHandler(req.getParams().get(CommonParams.QT)), req, rsp);
+ 
+     DocList dl = ((ResultContext) rsp.getValues().get("response")).docs;
+     DocIterator di = dl.iterator();    
+-    StoredDocument d = req.getSearcher().doc(di.nextDoc());
+-    // ensure field is lazy
+-    assertTrue( (d.getField("test_hlt")).getClass().getSimpleName().equals("LazyField"));
+-    assertFalse( (d.getField("title")).getClass().getSimpleName().equals("LazyField"));
++    StoredDocument d1 = req.getSearcher().doc(di.nextDoc());
++    StorableField[] values1 = null;
++
++    // ensure fl field is non lazy, and non-fl field is lazy
++    assertFalse( d1.getField("title") instanceof LazyDocument.LazyField);
++    assertFalse( d1.getField("id") instanceof LazyDocument.LazyField);
++    values1 = d1.getFields("test_hlt");
++    assertEquals(4, values1.length);
++    for (int i = 0; i < values1.length; i++) {
++      assertTrue( values1[i] instanceof LazyDocument.LazyField );
++      LazyDocument.LazyField f = (LazyDocument.LazyField) values1[i];
++      assertFalse( f.hasBeenLoaded() );
++    }
++    req.close();
++
++    // followup request, different fl
++    req = req("q", "id:7777", "fl", "id,test_hlt");
++    rsp = new SolrQueryResponse();
++    core.execute(core.getRequestHandler(req.getParams().get(CommonParams.QT)), req, rsp);
++
++    dl = ((ResultContext) rsp.getValues().get("response")).docs;
++    di = dl.iterator();    
++    StoredDocument d2 = req.getSearcher().doc(di.nextDoc());
++    // ensure same doc, same lazy field now
++    assertTrue("Doc was not cached", d1 == d2);
++    StorableField[] values2 = d2.getFields("test_hlt");
++    assertEquals(values1.length, values2.length);
++    for (int i = 0; i < values1.length; i++) {
++      assertSame("LazyField wasn't reused", 
++                 values1[i], values2[i]);
++      LazyDocument.LazyField f = (LazyDocument.LazyField) values1[i];
++      // still not a real boy, no response writer in play
++      assertFalse(f.hasBeenLoaded()); 
++    }
++
++    assertNotNull(values2[0].stringValue()); // actuallize one value
++    for (int i = 0; i < values2.length; i++) {
++      // now all values for this field should be loaded & cached
++      LazyDocument.LazyField f = (LazyDocument.LazyField) values2[i];
++      assertTrue(f.hasBeenLoaded());
++    }
++
+     req.close();
+   } 
+             
+

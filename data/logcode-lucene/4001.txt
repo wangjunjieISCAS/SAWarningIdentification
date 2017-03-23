@@ -1,0 +1,168 @@
+GitDiffStart: 0a8dfe05dc10de5bd27390b2e50c2ee6fcbecafc | Sat Mar 21 19:08:53 2015 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 6a23bb6..54caa47 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -266,6 +266,9 @@ Bug Fixes
+ 
+ * SOLR-7109: Indexing threads stuck during network partition can put leader into down state.
+   (Mark Miller, Anshum Gupta, Ramkumar Aiyengar, yonik, shalin)
++  
++* SOLR-7092: Stop the HDFS lease recovery retries in HdfsTransactionLog on close and try
++  to avoid lease recovery on closed files. (Mark Miller)
+ 
+ Optimizations
+ ----------------------
+diff --git a/solr/core/src/java/org/apache/solr/update/HdfsTransactionLog.java b/solr/core/src/java/org/apache/solr/update/HdfsTransactionLog.java
+index 8b61b88..a09cc35 100644
+--- a/solr/core/src/java/org/apache/solr/update/HdfsTransactionLog.java
++++ b/solr/core/src/java/org/apache/solr/update/HdfsTransactionLog.java
+@@ -35,6 +35,7 @@ import org.apache.solr.common.util.FastOutputStream;
+ import org.apache.solr.common.util.JavaBinCodec;
+ import org.apache.solr.common.util.ObjectReleaseTracker;
+ import org.apache.solr.util.FSHDFSUtils;
++import org.apache.solr.util.FSHDFSUtils.CallerInfo;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -65,6 +66,8 @@ public class HdfsTransactionLog extends TransactionLog {
+   private FSDataOutputStream tlogOutStream;
+   private FileSystem fs;
+ 
++  private volatile boolean isClosed = false;
++
+   HdfsTransactionLog(FileSystem fs, Path tlogFile, Collection<String> globalStrings) {
+     this(fs, tlogFile, globalStrings, false);
+   }
+@@ -81,7 +84,12 @@ public class HdfsTransactionLog extends TransactionLog {
+       this.tlogFile = tlogFile;
+       
+       if (fs.exists(tlogFile) && openExisting) {
+-        FSHDFSUtils.recoverFileLease(fs, tlogFile, fs.getConf());
++        FSHDFSUtils.recoverFileLease(fs, tlogFile, fs.getConf(), new CallerInfo(){
++
++          @Override
++          public boolean isCallerClosed() {
++            return isClosed;
++          }});
+         
+         tlogOutStream = fs.append(tlogFile);
+       } else {
+@@ -310,6 +318,7 @@ public class HdfsTransactionLog extends TransactionLog {
+       log.error("Exception closing tlog.", e);
+       throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
+     } finally {
++      isClosed  = true;
+       assert ObjectReleaseTracker.release(this);
+       if (deleteOnClose) {
+         try {
+diff --git a/solr/core/src/java/org/apache/solr/util/FSHDFSUtils.java b/solr/core/src/java/org/apache/solr/util/FSHDFSUtils.java
+index 8b5fc0c..b21af29 100644
+--- a/solr/core/src/java/org/apache/solr/util/FSHDFSUtils.java
++++ b/solr/core/src/java/org/apache/solr/util/FSHDFSUtils.java
+@@ -39,14 +39,17 @@ import org.slf4j.LoggerFactory;
+ public class FSHDFSUtils {
+   public static Logger log = LoggerFactory.getLogger(FSHDFSUtils.class);
+ 
++  public interface CallerInfo {
++    boolean isCallerClosed();
++  }
+ 
+   /**
+    * Recover the lease from HDFS, retrying multiple times.
+    */
+-  public static void recoverFileLease(final FileSystem fs, final Path p, Configuration conf) throws IOException {
++  public static void recoverFileLease(final FileSystem fs, final Path p, Configuration conf, CallerInfo callerInfo) throws IOException {
+     // lease recovery not needed for local file system case.
+     if (!(fs instanceof DistributedFileSystem)) return;
+-    recoverDFSFileLease((DistributedFileSystem)fs, p, conf);
++    recoverDFSFileLease((DistributedFileSystem)fs, p, conf, callerInfo);
+   }
+ 
+   /*
+@@ -75,7 +78,7 @@ public class FSHDFSUtils {
+    *
+    * If HDFS-4525 is available, call it every second and we might be able to exit early.
+    */
+-  static boolean recoverDFSFileLease(final DistributedFileSystem dfs, final Path p, final Configuration conf)
++  static boolean recoverDFSFileLease(final DistributedFileSystem dfs, final Path p, final Configuration conf, CallerInfo callerInfo)
+   throws IOException {
+     log.info("Recovering lease on dfs file " + p);
+     long startWaiting = System.nanoTime();
+@@ -92,13 +95,24 @@ public class FSHDFSUtils {
+     
+     Method isFileClosedMeth = null;
+     // whether we need to look for isFileClosed method
+-    boolean findIsFileClosedMeth = true;
++    
++    try {
++      isFileClosedMeth = dfs.getClass().getMethod("isFileClosed",
++          new Class[] {Path.class});
++    } catch (NoSuchMethodException nsme) {
++      log.debug("isFileClosed not available");
++    }
++    
++    if (isFileClosedMeth != null && isFileClosed(dfs, isFileClosedMeth, p)) {
++      return true;
++    }
++    
+     boolean recovered = false;
+     // We break the loop if we succeed the lease recovery, timeout, or we throw an exception.
+     for (int nbAttempt = 0; !recovered; nbAttempt++) {
+       recovered = recoverLease(dfs, nbAttempt, p, startWaiting);
+       if (recovered) break;
+-      if (checkIfTimedout(conf, recoveryTimeout, nbAttempt, p, startWaiting)) break;
++      if (checkIfTimedout(conf, recoveryTimeout, nbAttempt, p, startWaiting) || callerInfo.isCallerClosed()) break;
+       try {
+         // On the first time through wait the short 'firstPause'.
+         if (nbAttempt == 0) {
+@@ -107,19 +121,9 @@ public class FSHDFSUtils {
+           // Cycle here until subsequentPause elapses.  While spinning, check isFileClosed if
+           // available (should be in hadoop 2.0.5... not in hadoop 1 though.
+           long localStartWaiting = System.nanoTime();
+-          while ((System.nanoTime() - localStartWaiting) <
+-              subsequentPause) {
++          while ((System.nanoTime() - localStartWaiting) < subsequentPause && !callerInfo.isCallerClosed()) {
+             Thread.sleep(conf.getInt("solr.hdfs.lease.recovery.pause", 1000));
+-            if (findIsFileClosedMeth) {
+-              try {
+-                isFileClosedMeth = dfs.getClass().getMethod("isFileClosed",
+-                  new Class[]{ Path.class });
+-              } catch (NoSuchMethodException nsme) {
+-                log.debug("isFileClosed not available");
+-              } finally {
+-                findIsFileClosedMeth = false;
+-              }
+-            }
++
+             if (isFileClosedMeth != null && isFileClosed(dfs, isFileClosedMeth, p)) {
+               recovered = true;
+               break;
+diff --git a/solr/core/src/test/org/apache/solr/cloud/hdfs/HdfsTestUtil.java b/solr/core/src/test/org/apache/solr/cloud/hdfs/HdfsTestUtil.java
+index 0c0025b..a63565d 100644
+--- a/solr/core/src/test/org/apache/solr/cloud/hdfs/HdfsTestUtil.java
++++ b/solr/core/src/test/org/apache/solr/cloud/hdfs/HdfsTestUtil.java
+@@ -108,6 +108,11 @@ public class HdfsTestUtil {
+   }
+   
+   public static void teardownClass(MiniDFSCluster dfsCluster) throws Exception {
++    
++    if (badTlogOutStream != null) {
++      IOUtils.closeQuietly(badTlogOutStream);
++    }
++    
+     SolrTestCaseJ4.resetFactory();
+     System.clearProperty("solr.lock.type");
+     System.clearProperty("test.build.data");
+@@ -119,10 +124,6 @@ public class HdfsTestUtil {
+       dfsCluster.shutdown();
+     }
+     
+-    if (badTlogOutStream != null) {
+-      IOUtils.closeQuietly(badTlogOutStream);
+-    }
+-    
+     // TODO: we HACK around HADOOP-9643
+     if (savedLocale != null) {
+       Locale.setDefault(savedLocale);
+

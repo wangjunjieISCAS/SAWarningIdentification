@@ -1,0 +1,162 @@
+GitDiffStart: 0155076b1f1b430f9d5e5eff3c0fef73dad48d5e | Tue Jul 28 03:32:20 2015 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index d405af4..c5ebcd6 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -245,6 +245,9 @@ Bug Fixes
+ * SOLR-7765: Hardened the behavior of TokenizerChain when null arguments are used in constructor.
+   This prevents NPEs in some code paths.  (Konstantin Gribov, hossman)
+ 
++* SOLR-7829: Fixed a bug in distributed pivot faceting that could result in a facet.missing=true count
++  which was lower then the correct count if facet.sort=index and facet.pivot.mincount > 1 (hossman)
++
+ Optimizations
+ ----------------------
+ 
+diff --git a/solr/core/src/java/org/apache/solr/handler/component/PivotFacetField.java b/solr/core/src/java/org/apache/solr/handler/component/PivotFacetField.java
+index a7afe0f..9de9c27 100644
+--- a/solr/core/src/java/org/apache/solr/handler/component/PivotFacetField.java
++++ b/solr/core/src/java/org/apache/solr/handler/component/PivotFacetField.java
+@@ -199,35 +199,46 @@ public class PivotFacetField {
+    */
+   public void queuePivotRefinementRequests(PivotFacet pf) {
+     
+-    if (needRefinementAtThisLevel && ! valueCollection.getExplicitValuesList().isEmpty()) {
++    if (needRefinementAtThisLevel) {
+ 
+-      if (FacetParams.FACET_SORT_COUNT.equals(facetFieldSort)) {
+-        // we only need to things that are currently in our limit,
+-        // or might be in our limit if we get increased counts from shards that
+-        // didn't include this value the first time
+-        final int indexOfCountThreshold 
+-          = Math.min(valueCollection.getExplicitValuesListSize(), 
+-                     facetFieldOffset + facetFieldLimit) - 1;
+-        final int countThreshold = valueCollection.getAt(indexOfCountThreshold).getCount();
+-        
+-        int positionInResults = 0;
+-        
+-        for (PivotFacetValue value : valueCollection.getExplicitValuesList()) {
+-          if (positionInResults <= indexOfCountThreshold) {
+-            // This element is within the top results, so we need to get information 
+-            // from all of the shards.
++      if (0 < facetFieldMinimumCount) {
++        // missing is always a candidate for refinement if at least one shard met the minimum
++        PivotFacetValue missing = valueCollection.getMissingValue();
++        if (null != missing) {
++          processDefiniteCandidateElement(pf, valueCollection.getMissingValue());
++        }
++      }
++
++      if (! valueCollection.getExplicitValuesList().isEmpty()) {
++
++        if (FacetParams.FACET_SORT_COUNT.equals(facetFieldSort)) {
++          // we only need to things that are currently in our limit,
++          // or might be in our limit if we get increased counts from shards that
++          // didn't include this value the first time
++          final int indexOfCountThreshold 
++            = Math.min(valueCollection.getExplicitValuesListSize(), 
++                       facetFieldOffset + facetFieldLimit) - 1;
++          final int countThreshold = valueCollection.getAt(indexOfCountThreshold).getCount();
++          
++          int positionInResults = 0;
++          
++          for (PivotFacetValue value : valueCollection.getExplicitValuesList()) {
++            if (positionInResults <= indexOfCountThreshold) {
++              // This element is within the top results, so we need to get information 
++              // from all of the shards.
++              processDefiniteCandidateElement(pf, value);
++            } else {
++              // This element is not within the top results, but may still need to be refined.
++              processPossibleCandidateElement(pf, value, countThreshold);
++            }
++            
++            positionInResults++;
++          }
++        } else { // FACET_SORT_INDEX
++          // everything needs refined to see what the per-shard mincount excluded
++          for (PivotFacetValue value : valueCollection.getExplicitValuesList()) {
+             processDefiniteCandidateElement(pf, value);
+-          } else {
+-            // This element is not within the top results, but may still need to be refined.
+-            processPossibleCandidateElement(pf, value, countThreshold);
+           }
+-          
+-          positionInResults++;
+-        }
+-      } else { // FACET_SORT_INDEX
+-        // everything needs refined to see what the per-shard mincount excluded
+-        for (PivotFacetValue value : valueCollection.getExplicitValuesList()) {
+-          processDefiniteCandidateElement(pf, value);
+         }
+       }
+ 
+@@ -258,10 +269,11 @@ public class PivotFacetField {
+         if ( // if we're doing index order, we need to refine anything  
+              // (mincount may have excluded from a shard)
+             FacetParams.FACET_SORT_INDEX.equals(facetFieldSort)
+-             // if we are doing count order, we need to refine if the limit was hit
+-             // (if not, the shard doesn't have the value or it would have returned already)
+-             || numberOfValuesContributedByShardWasLimitedByFacetFieldLimit(shard) ) {
+-
++            || (// 'missing' value isn't affected by limit, needs refined if shard didn't provide
++                null == value.getValue() ||
++                // if we are doing count order, we need to refine if the limit was hit
++                // (if not, the shard doesn't have the value or it would have returned already)
++                numberOfValuesContributedByShardWasLimitedByFacetFieldLimit(shard))) {
+           pf.addRefinement(shard, value);
+         }
+       }
+diff --git a/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotLargeTest.java b/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotLargeTest.java
+index b0e5ad2..0843bbf 100644
+--- a/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotLargeTest.java
++++ b/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotLargeTest.java
+@@ -202,6 +202,36 @@ public class DistributedFacetPivotLargeTest extends BaseDistributedSearchTestCas
+     //                      FacetParams.FACET_PIVOT_MINCOUNT,"0",
+     //                      "facet.pivot", "top_s,sub_s") );
+ 
++    // facet.missing=true + facet.sort=index + facet.pivot.mincount > 0 (SOLR-7829)
++    final int expectedNumDocsMissingBool = 111;
++    for (String facetSort : new String[] {"count", "index"}) {
++      for (int mincount : new int[] { 1, 20,
++                                      (expectedNumDocsMissingBool / 2) - 1,
++                                      (expectedNumDocsMissingBool / 2) + 1,
++                                      expectedNumDocsMissingBool }) {
++             
++        SolrParams p = params( "q", "*:*",
++                               "fq","-real_b:true", // simplify asserts by ruling out true counts
++                               "rows", "0",
++                               "facet","true",
++                               "facet.pivot", "real_b",
++                               "facet.missing", "true",
++                               "facet.pivot.mincount", ""+mincount,
++                               "facet.sort", facetSort);
++        
++        try {
++          rsp = query( p );
++          pivots = rsp.getFacetPivot().get("real_b");
++          assertEquals(2, pivots.size()); // false, missing - in that order, regardless of sort
++          assertPivot("real_b", false, 300, pivots.get(0)); 
++          assertPivot("real_b", null, expectedNumDocsMissingBool, pivots.get(1));
++          
++        } catch (AssertionFailedError ae) {
++          throw new AssertionError(ae.getMessage() + " <== " + p.toString(), ae);
++        }
++      }
++    }
++    
+     // basic check w/ limit & index sort
+     for (SolrParams facetParams : 
+            // results should be the same regardless of whether local params are used
+diff --git a/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotSmallTest.java b/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotSmallTest.java
+index 2a01c7b..4808dc4 100644
+--- a/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotSmallTest.java
++++ b/solr/core/src/test/org/apache/solr/handler/component/DistributedFacetPivotSmallTest.java
+@@ -218,6 +218,7 @@ public class DistributedFacetPivotSmallTest extends BaseDistributedSearchTestCas
+                                   "rows", "0",
+                                   "facet","true",
+                                   "facet.pivot","place_t,company_t",
++                                  "f.place_t.facet.mincount", "2",
+                                   // default facet.sort
+                                   FacetParams.FACET_MISSING, "true" );
+     SolrParams missingB = SolrParams.wrapDefaults(missingA, 
+

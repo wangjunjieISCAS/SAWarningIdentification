@@ -1,0 +1,158 @@
+GitDiffStart: a7ae18f08e02ea55ca3ef7ea6de54fa23a405220 | Wed Apr 9 08:52:28 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 920b225..3184f89 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -160,6 +160,9 @@ New Features
+   before merges by enabling IndexWriterConfig.setCheckIntegrityAtMerge.
+   (Robert Muir)
+ 
++* LUCENE-5580: Checksums are automatically verified on the default stored
++  fields format when performing a bulk merge. (Adrien Grand)
++
+ API Changes
+ 
+ * LUCENE-5454: Add RandomAccessOrds, an optional extension of SortedSetDocValues
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsReader.java b/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsReader.java
+index 42eeb18..b0b6b07 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsReader.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsReader.java
+@@ -48,6 +48,7 @@ import org.apache.lucene.index.IndexFileNames;
+ import org.apache.lucene.index.SegmentInfo;
+ import org.apache.lucene.index.StoredFieldVisitor;
+ import org.apache.lucene.store.AlreadyClosedException;
++import org.apache.lucene.store.BufferedChecksumIndexInput;
+ import org.apache.lucene.store.ByteArrayDataInput;
+ import org.apache.lucene.store.ChecksumIndexInput;
+ import org.apache.lucene.store.DataInput;
+@@ -393,25 +394,47 @@ public final class CompressingStoredFieldsReader extends StoredFieldsReader {
+ 
+   ChunkIterator chunkIterator(int startDocID) throws IOException {
+     ensureOpen();
+-    fieldsStream.seek(indexReader.getStartPointer(startDocID));
+-    return new ChunkIterator();
++    return new ChunkIterator(startDocID);
+   }
+ 
+   final class ChunkIterator {
+ 
+-    BytesRef spare;
+-    BytesRef bytes;
++    final ChecksumIndexInput fieldsStream;
++    final BytesRef spare;
++    final BytesRef bytes;
+     int docBase;
+     int chunkDocs;
+     int[] numStoredFields;
+     int[] lengths;
+ 
+-    private ChunkIterator() {
++    private ChunkIterator(int startDocId) throws IOException {
+       this.docBase = -1;
+       bytes = new BytesRef();
+       spare = new BytesRef();
+       numStoredFields = new int[1];
+       lengths = new int[1];
++
++      IndexInput in = CompressingStoredFieldsReader.this.fieldsStream;
++      in.seek(0);
++      fieldsStream = new BufferedChecksumIndexInput(in) {
++
++        final byte[] skipBuffer = new byte[256];
++
++        @Override
++        public void seek(long target) throws IOException {
++          final long skip = target - getFilePointer();
++          if (skip < 0) {
++            throw new IllegalStateException("Seeking backward on merge: " + skip);
++          }
++          for (long skipped = 0; skipped < skip; ) {
++            final int step = (int) Math.min(skipBuffer.length, skip - skipped);
++            readBytes(skipBuffer, 0, step);
++            skipped += step;
++          }
++        }
++
++      };
++      fieldsStream.seek(indexReader.getStartPointer(startDocId));
+     }
+ 
+     /**
+@@ -514,6 +537,16 @@ public final class CompressingStoredFieldsReader extends StoredFieldsReader {
+       out.copyBytes(fieldsStream, chunkEnd - fieldsStream.getFilePointer());
+     }
+ 
++    /**
++     * Check integrity of the data. The iterator is not usable after this method has been called.
++     */
++    void checkIntegrity() throws IOException {
++      if (version >= VERSION_CHECKSUM) {
++        fieldsStream.seek(fieldsStream.length() - CodecUtil.footerLength());
++        CodecUtil.checkFooter(fieldsStream);
++      }
++    }
++
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsWriter.java b/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsWriter.java
+index 7344d91..38911d6 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/compressing/CompressingStoredFieldsWriter.java
+@@ -399,6 +399,8 @@ public final class CompressingStoredFieldsWriter extends StoredFieldsWriter {
+               }
+             }
+           } while (docID < maxDoc);
++
++          it.checkIntegrity();
+         }
+       }
+     }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/ChecksumIndexInput.java b/lucene/core/src/java/org/apache/lucene/store/ChecksumIndexInput.java
+index 6c2cb8f..259f2c8 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/ChecksumIndexInput.java
++++ b/lucene/core/src/java/org/apache/lucene/store/ChecksumIndexInput.java
+@@ -36,7 +36,7 @@ public abstract class ChecksumIndexInput extends IndexInput {
+   public abstract long getChecksum() throws IOException;
+ 
+   @Override
+-  public void seek(long pos) {
++  public void seek(long pos) throws IOException {
+     throw new UnsupportedOperationException();
+   }
+ }
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/index/BaseStoredFieldsFormatTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/index/BaseStoredFieldsFormatTestCase.java
+index 79b9510..445e1db 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/index/BaseStoredFieldsFormatTestCase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/index/BaseStoredFieldsFormatTestCase.java
+@@ -648,4 +648,29 @@ public abstract class BaseStoredFieldsFormatTestCase extends BaseIndexFileFormat
+     dir.close();
+   }
+ 
++  public void testBulkMergeWithDeletes() throws IOException {
++    final int numDocs = atLeast(200);
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMergePolicy(NoMergePolicy.COMPOUND_FILES));
++    for (int i = 0; i < numDocs; ++i) {
++      Document doc = new Document();
++      doc.add(new StringField("id", Integer.toString(i), Store.YES));
++      doc.add(new StoredField("f", TestUtil.randomSimpleString(random())));
++      w.addDocument(doc);
++    }
++    final int deleteCount = TestUtil.nextInt(random(), 5, numDocs);
++    for (int i = 0; i < deleteCount; ++i) {
++      final int id = random().nextInt(numDocs);
++      w.deleteDocuments(new Term("id", Integer.toString(id)));
++    }
++    w.commit();
++    w.close();
++    w = new RandomIndexWriter(random(), dir);
++    w.forceMerge(TestUtil.nextInt(random(), 1, 3));
++    w.commit();
++    w.close();
++    TestUtil.checkIndex(dir);
++    dir.close();
++  }
++
+ }
+

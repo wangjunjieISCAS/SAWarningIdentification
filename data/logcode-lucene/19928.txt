@@ -1,0 +1,437 @@
+GitDiffStart: e49af570d1a3694752b2ba4aa0a75306aa87af3a | Thu Jul 9 12:53:28 2009 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index e710984..f142718 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -130,6 +130,11 @@ Changes in runtime behavior
+  9. LUCENE-1717: Fixed IndexWriter to account for RAM usage of
+     buffered deletions.  (Mike McCandless)
+ 
++10. LUCENE-1727: Ensure that fields are stored & retrieved in the
++    exact order in which they were added to the document.  This was
++    true in all Lucene releases before 2.3, but was broken in 2.3 and
++    2.4, and is now fixed in 2.9.  (Mike McCandless)
++
+ API Changes
+ 
+ 1. LUCENE-1419: Add expert API to set custom indexing chain. This API is 
+diff --git a/src/java/org/apache/lucene/index/DocFieldProcessor.java b/src/java/org/apache/lucene/index/DocFieldProcessor.java
+index dbbd125..ae88007 100644
+--- a/src/java/org/apache/lucene/index/DocFieldProcessor.java
++++ b/src/java/org/apache/lucene/index/DocFieldProcessor.java
+@@ -36,15 +36,18 @@ final class DocFieldProcessor extends DocConsumer {
+   final DocumentsWriter docWriter;
+   final FieldInfos fieldInfos = new FieldInfos();
+   final DocFieldConsumer consumer;
++  final StoredFieldsWriter fieldsWriter;
+ 
+   public DocFieldProcessor(DocumentsWriter docWriter, DocFieldConsumer consumer) {
+     this.docWriter = docWriter;
+     this.consumer = consumer;
+     consumer.setFieldInfos(fieldInfos);
++    fieldsWriter = new StoredFieldsWriter(docWriter, fieldInfos);
+   }
+ 
+   public void closeDocStore(SegmentWriteState state) throws IOException {
+     consumer.closeDocStore(state);
++    fieldsWriter.closeDocStore(state);
+   }
+ 
+   public void flush(Collection threads, SegmentWriteState state) throws IOException {
+@@ -56,7 +59,7 @@ final class DocFieldProcessor extends DocConsumer {
+       childThreadsAndFields.put(perThread.consumer, perThread.fields());
+       perThread.trimFields(state);
+     }
+-
++    fieldsWriter.flush(state);
+     consumer.flush(childThreadsAndFields, state);
+ 
+     // Important to save after asking consumer to flush so
+@@ -69,6 +72,7 @@ final class DocFieldProcessor extends DocConsumer {
+   }
+ 
+   public void abort() {
++    fieldsWriter.abort();
+     consumer.abort();
+   }
+ 
+diff --git a/src/java/org/apache/lucene/index/DocFieldProcessorPerThread.java b/src/java/org/apache/lucene/index/DocFieldProcessorPerThread.java
+index 85ccfe3..b10ac28 100644
+--- a/src/java/org/apache/lucene/index/DocFieldProcessorPerThread.java
++++ b/src/java/org/apache/lucene/index/DocFieldProcessorPerThread.java
+@@ -23,6 +23,7 @@ import java.util.List;
+ import java.io.IOException;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Fieldable;
++import org.apache.lucene.util.ArrayUtil;
+ 
+ /**
+  * Gathers all Fieldables for a document under the same
+@@ -50,13 +51,16 @@ final class DocFieldProcessorPerThread extends DocConsumerPerThread {
+   int hashMask = 1;
+   int totalFieldCount;
+ 
++  final StoredFieldsWriterPerThread fieldsWriter;
++
+   final DocumentsWriter.DocState docState;
+-  
++
+   public DocFieldProcessorPerThread(DocumentsWriterThreadState threadState, DocFieldProcessor docFieldProcessor) throws IOException {
+     this.docState = threadState.docState;
+     this.docFieldProcessor = docFieldProcessor;
+     this.fieldInfos = docFieldProcessor.fieldInfos;
+     this.consumer = docFieldProcessor.consumer.addThread(this);
++    fieldsWriter = docFieldProcessor.fieldsWriter.addThread(docState);
+   }
+ 
+   public void abort() {
+@@ -68,6 +72,7 @@ final class DocFieldProcessorPerThread extends DocConsumerPerThread {
+         field = next;
+       }
+     }
++    fieldsWriter.abort();
+     consumer.abort();
+   }
+ 
+@@ -148,6 +153,8 @@ final class DocFieldProcessorPerThread extends DocConsumerPerThread {
+   public DocumentsWriter.DocWriter processDocument() throws IOException {
+ 
+     consumer.startDocument();
++    fieldsWriter.startDocument();
++
+     final Document doc = docState.doc;
+ 
+     assert docFieldProcessor.docWriter.writer.testPoint("DocumentsWriter.ThreadState.init start");
+@@ -220,6 +227,9 @@ final class DocFieldProcessorPerThread extends DocConsumerPerThread {
+       }
+ 
+       fp.fields[fp.fieldCount++] = field;
++      if (field.isStored()) {
++        fieldsWriter.addField(field, fp.fieldInfo);
++      }
+     }
+ 
+     // If we are writing vectors then we must visit
+@@ -236,7 +246,21 @@ final class DocFieldProcessorPerThread extends DocConsumerPerThread {
+     if (docState.maxTermPrefix != null && docState.infoStream != null)
+       docState.infoStream.println("WARNING: document contains at least one immense term (longer than the max length " + DocumentsWriter.MAX_TERM_LENGTH + "), all of which were skipped.  Please correct the analyzer to not produce such terms.  The prefix of the first immense term is: '" + docState.maxTermPrefix + "...'"); 
+ 
+-    return consumer.finishDocument();
++    final DocumentsWriter.DocWriter one = fieldsWriter.finishDocument();
++    final DocumentsWriter.DocWriter two = consumer.finishDocument();
++    if (one == null) {
++      return two;
++    } else if (two == null) {
++      return one;
++    } else {
++      PerDoc both = getPerDoc();
++      both.docID = docState.docID;
++      assert one.docID == docState.docID;
++      assert two.docID == docState.docID;
++      both.one = one;
++      both.two = two;
++      return both;
++    }
+   }
+ 
+   void quickSort(DocFieldProcessorPerField[] array, int lo, int hi) {
+@@ -299,4 +323,62 @@ final class DocFieldProcessorPerThread extends DocConsumerPerThread {
+     quickSort(array, lo, left);
+     quickSort(array, left + 1, hi);
+   }
++
++  PerDoc[] docFreeList = new PerDoc[1];
++  int freeCount;
++  int allocCount;
++
++  synchronized PerDoc getPerDoc() {
++    if (freeCount == 0) {
++      allocCount++;
++      if (allocCount > docFreeList.length) {
++        // Grow our free list up front to make sure we have
++        // enough space to recycle all outstanding PerDoc
++        // instances
++        assert allocCount == 1+docFreeList.length;
++        docFreeList = new PerDoc[ArrayUtil.getNextSize(allocCount)];
++      }
++      return new PerDoc();
++    } else
++      return docFreeList[--freeCount];
++  }
++
++  synchronized void freePerDoc(PerDoc perDoc) {
++    assert freeCount < docFreeList.length;
++    docFreeList[freeCount++] = perDoc;
++  }
++
++  class PerDoc extends DocumentsWriter.DocWriter {
++
++    DocumentsWriter.DocWriter one;
++    DocumentsWriter.DocWriter two;
++
++    public long sizeInBytes() {
++      return one.sizeInBytes() + two.sizeInBytes();
++    }
++
++    public void finish() throws IOException {
++      try {
++        try {
++          one.finish();
++        } finally {
++          two.finish();
++        }
++      } finally {
++        freePerDoc(this);
++      }
++    }
++
++    public void abort() {
++      try {
++        try {
++          one.abort();
++        } finally {
++          two.abort();
++        }
++      } finally {
++        freePerDoc(this);
++      }
++    }
++  }
+ }
+diff --git a/src/java/org/apache/lucene/index/DocumentsWriter.java b/src/java/org/apache/lucene/index/DocumentsWriter.java
+index eb1c2f2..c5a70e1 100644
+--- a/src/java/org/apache/lucene/index/DocumentsWriter.java
++++ b/src/java/org/apache/lucene/index/DocumentsWriter.java
+@@ -214,9 +214,7 @@ final class DocumentsWriter {
+                                                            new TermsHash(documentsWriter, false, termVectorsWriter, null));
+       final NormsWriter normsWriter = new NormsWriter();
+       final DocInverter docInverter = new DocInverter(termsHash, normsWriter);
+-      final StoredFieldsWriter fieldsWriter = new StoredFieldsWriter(documentsWriter);
+-      final DocFieldConsumers docFieldConsumers = new DocFieldConsumers(docInverter, fieldsWriter);
+-      return new DocFieldProcessor(documentsWriter, docFieldConsumers);
++      return new DocFieldProcessor(documentsWriter, docInverter);
+     }
+   };
+ 
+diff --git a/src/java/org/apache/lucene/index/StoredFieldsWriter.java b/src/java/org/apache/lucene/index/StoredFieldsWriter.java
+index 6296aaa..a4e84ec 100644
+--- a/src/java/org/apache/lucene/index/StoredFieldsWriter.java
++++ b/src/java/org/apache/lucene/index/StoredFieldsWriter.java
+@@ -17,30 +17,31 @@ package org.apache.lucene.index;
+  * limitations under the License.
+  */
+ 
+-import java.util.Map;
+ import java.io.IOException;
+ import org.apache.lucene.store.RAMOutputStream;
+ import org.apache.lucene.util.ArrayUtil;
+ 
+ /** This is a DocFieldConsumer that writes stored fields. */
+-final class StoredFieldsWriter extends DocFieldConsumer {
++final class StoredFieldsWriter {
+ 
+   FieldsWriter fieldsWriter;
+   final DocumentsWriter docWriter;
++  final FieldInfos fieldInfos;
+   int lastDocID;
+ 
+   PerDoc[] docFreeList = new PerDoc[1];
+   int freeCount;
+ 
+-  public StoredFieldsWriter(DocumentsWriter docWriter) {
++  public StoredFieldsWriter(DocumentsWriter docWriter, FieldInfos fieldInfos) {
+     this.docWriter = docWriter;
++    this.fieldInfos = fieldInfos;
+   }
+ 
+-  public DocFieldConsumerPerThread addThread(DocFieldProcessorPerThread docFieldProcessorPerThread) throws IOException {
+-    return new StoredFieldsWriterPerThread(docFieldProcessorPerThread, this);
++  public StoredFieldsWriterPerThread addThread(DocumentsWriter.DocState docState) throws IOException {
++    return new StoredFieldsWriterPerThread(docState, this);
+   }
+ 
+-  synchronized public void flush(Map threadsAndFields, SegmentWriteState state) throws IOException {
++  synchronized public void flush(SegmentWriteState state) throws IOException {
+ 
+     if (state.numDocsInStore > 0) {
+       // It's possible that all documents seen in this segment
+diff --git a/src/java/org/apache/lucene/index/StoredFieldsWriterPerField.java b/src/java/org/apache/lucene/index/StoredFieldsWriterPerField.java
+deleted file mode 100644
+index 69a091f..0000000
+--- a/src/java/org/apache/lucene/index/StoredFieldsWriterPerField.java
++++ /dev/null
+@@ -1,66 +0,0 @@
+-package org.apache.lucene.index;
+-
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import java.io.IOException;
+-import org.apache.lucene.document.Fieldable;
+-
+-final class StoredFieldsWriterPerField extends DocFieldConsumerPerField {
+-
+-  final StoredFieldsWriterPerThread perThread;
+-  final FieldInfo fieldInfo;
+-  final DocumentsWriter.DocState docState;
+-
+-  public StoredFieldsWriterPerField(StoredFieldsWriterPerThread perThread, FieldInfo fieldInfo) {
+-    this.perThread = perThread;
+-    this.fieldInfo = fieldInfo;
+-    docState = perThread.docState;
+-  }
+-
+-  // Process all occurrences of a single field in one doc;
+-  // count is 1 if a given field occurs only once in the
+-  // Document, which is the "typical" case
+-  public void processFields(Fieldable[] fields, int count) throws IOException {
+-
+-    final StoredFieldsWriter.PerDoc doc;
+-    if (perThread.doc == null) {
+-      doc = perThread.doc = perThread.storedFieldsWriter.getPerDoc();
+-      doc.docID = docState.docID;
+-      perThread.localFieldsWriter.setFieldsStream(doc.fdt);
+-      assert doc.numStoredFields == 0: "doc.numStoredFields=" + doc.numStoredFields;
+-      assert 0 == doc.fdt.length();
+-      assert 0 == doc.fdt.getFilePointer();
+-    } else {
+-      doc = perThread.doc;
+-      assert doc.docID == docState.docID: "doc.docID=" + doc.docID + " docState.docID=" + docState.docID;
+-    }
+-
+-    for(int i=0;i<count;i++) {
+-      final Fieldable field = fields[i];
+-      if (field.isStored()) {
+-        perThread.localFieldsWriter.writeField(fieldInfo, field);
+-        assert docState.testPoint("StoredFieldsWriterPerField.processFields.writeField");
+-        doc.numStoredFields++;
+-      }
+-    }
+-  }
+-
+-  void abort() {
+-  }
+-}
+-
+diff --git a/src/java/org/apache/lucene/index/StoredFieldsWriterPerThread.java b/src/java/org/apache/lucene/index/StoredFieldsWriterPerThread.java
+index b2f98e6..a0e77ae 100644
+--- a/src/java/org/apache/lucene/index/StoredFieldsWriterPerThread.java
++++ b/src/java/org/apache/lucene/index/StoredFieldsWriterPerThread.java
+@@ -19,8 +19,9 @@ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
+ import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.document.Fieldable;
+ 
+-final class StoredFieldsWriterPerThread extends DocFieldConsumerPerThread {
++final class StoredFieldsWriterPerThread {
+ 
+   final FieldsWriter localFieldsWriter;
+   final StoredFieldsWriter storedFieldsWriter;
+@@ -28,9 +29,9 @@ final class StoredFieldsWriterPerThread extends DocFieldConsumerPerThread {
+ 
+   StoredFieldsWriter.PerDoc doc;
+ 
+-  public StoredFieldsWriterPerThread(DocFieldProcessorPerThread docFieldProcessorPerThread, StoredFieldsWriter storedFieldsWriter) throws IOException {
++  public StoredFieldsWriterPerThread(DocumentsWriter.DocState docState, StoredFieldsWriter storedFieldsWriter) throws IOException {
+     this.storedFieldsWriter = storedFieldsWriter;
+-    this.docState = docFieldProcessorPerThread.docState;
++    this.docState = docState;
+     localFieldsWriter = new FieldsWriter((IndexOutput) null, (IndexOutput) null, storedFieldsWriter.fieldInfos);
+   }
+ 
+@@ -44,6 +45,21 @@ final class StoredFieldsWriterPerThread extends DocFieldConsumerPerThread {
+     }
+   }
+ 
++  public void addField(Fieldable field, FieldInfo fieldInfo) throws IOException {
++    if (doc == null) {
++      doc = storedFieldsWriter.getPerDoc();
++      doc.docID = docState.docID;
++      localFieldsWriter.setFieldsStream(doc.fdt);
++      assert doc.numStoredFields == 0: "doc.numStoredFields=" + doc.numStoredFields;
++      assert 0 == doc.fdt.length();
++      assert 0 == doc.fdt.getFilePointer();
++    }
++
++    localFieldsWriter.writeField(fieldInfo, field);
++    assert docState.testPoint("StoredFieldsWriterPerThread.processFields.writeField");
++    doc.numStoredFields++;
++  }
++
+   public DocumentsWriter.DocWriter finishDocument() {
+     // If there were any stored fields in this doc, doc will
+     // be non-null; else it's null.
+@@ -60,8 +76,4 @@ final class StoredFieldsWriterPerThread extends DocFieldConsumerPerThread {
+       doc = null;
+     }
+   }
+-
+-  public DocFieldConsumerPerField addField(FieldInfo fieldInfo) {
+-    return new StoredFieldsWriterPerField(this, fieldInfo);
+-  }
+ }
+diff --git a/src/test/org/apache/lucene/index/TestIndexWriter.java b/src/test/org/apache/lucene/index/TestIndexWriter.java
+index 3538fcb..2e7e8de 100644
+--- a/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -24,6 +24,7 @@ import java.util.List;
+ import java.util.Random;
+ import java.util.Map;
+ import java.util.HashMap;
++import java.util.Iterator;
+ 
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.SinkTokenizer;
+@@ -4408,4 +4409,36 @@ public class TestIndexWriter extends LuceneTestCase
+     dir.close();
+ 
+   }
++
++  // LUCENE-1727: make sure doc fields are stored in order
++  public void testStoredFieldsOrder() throws Throwable {
++    Directory d = new MockRAMDirectory();
++    IndexWriter w = new IndexWriter(d, new WhitespaceAnalyzer(), IndexWriter.MaxFieldLength.UNLIMITED);
++    Document doc = new Document();
++    doc.add(new Field("zzz", "a b c", Field.Store.YES, Field.Index.NO));
++    doc.add(new Field("aaa", "a b c", Field.Store.YES, Field.Index.NO));
++    doc.add(new Field("zzz", "1 2 3", Field.Store.YES, Field.Index.NO));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    doc = r.document(0);
++    Iterator it = doc.getFields().iterator();
++    assertTrue(it.hasNext());
++    Field f = (Field) it.next();
++    assertEquals(f.name(), "zzz");
++    assertEquals(f.stringValue(), "a b c");
++
++    assertTrue(it.hasNext());
++    f = (Field) it.next();
++    assertEquals(f.name(), "aaa");
++    assertEquals(f.stringValue(), "a b c");
++
++    assertTrue(it.hasNext());
++    f = (Field) it.next();
++    assertEquals(f.name(), "zzz");
++    assertEquals(f.stringValue(), "1 2 3");
++    assertFalse(it.hasNext());
++    r.close();
++    w.close();
++    d.close();
++  }
+ }
+

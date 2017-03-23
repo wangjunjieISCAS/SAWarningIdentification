@@ -1,0 +1,1304 @@
+GitDiffStart: 60eb65bbcc4d246e17ee3be50d73bce65c7043e1 | Tue Jun 14 15:54:35 2011 +0000
+diff --git a/lucene/contrib/CHANGES.txt b/lucene/contrib/CHANGES.txt
+index 9ea9823..b072e86 100644
+--- a/lucene/contrib/CHANGES.txt
++++ b/lucene/contrib/CHANGES.txt
+@@ -70,6 +70,11 @@ New Features
+    document sharing the same group was indexed as a doc block
+    (IndexWriter.add/updateDocuments).  (Mike McCandless)
+ 
++ * LUCENE-2955: Added NRTManager and NRTManagerReopenThread, to
++   simplify handling NRT reopen with multiple search threads, and to
++   allow an app to control which indexing changes must be visible to
++   which search requests.  (Mike McCandless)
++
+ API Changes
+ 
+  * LUCENE-3141: add getter method to access fragInfos in FieldFragList.
+diff --git a/lucene/contrib/misc/src/java/org/apache/lucene/index/NRTManager.java b/lucene/contrib/misc/src/java/org/apache/lucene/index/NRTManager.java
+new file mode 100644
+index 0000000..ed944f0
+--- /dev/null
++++ b/lucene/contrib/misc/src/java/org/apache/lucene/index/NRTManager.java
+@@ -0,0 +1,358 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.Closeable;
++import java.io.IOException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.List;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.index.IndexReader;       // javadocs
++import org.apache.lucene.document.Document;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.util.ThreadInterruptedException;
++
++// TODO
++//   - we could make this work also w/ "normal" reopen/commit?
++
++/**
++ * Utility class to manage sharing near-real-time searchers
++ * across multiple searching threads.
++ *
++ * <p>NOTE: to use this class, you must call reopen
++ * periodically.  The {@link NRTManagerReopenThread} is a
++ * simple class to do this on a periodic basis.  If you
++ * implement your own reopener, be sure to call {@link
++ * #addWaitingListener} so your reopener is notified when a
++ * caller is waiting for a specific generation searcher. </p>
++ *
++ * @lucene.experimental
++*/
++
++public class NRTManager implements Closeable {
++  private final IndexWriter writer;
++  private final ExecutorService es;
++  private final AtomicLong indexingGen;
++  private final AtomicLong searchingGen;
++  private final AtomicLong noDeletesSearchingGen;
++  private final List<WaitingListener> waitingListeners = new CopyOnWriteArrayList<WaitingListener>();
++
++  private volatile IndexSearcher currentSearcher;
++  private volatile IndexSearcher noDeletesCurrentSearcher;
++
++  /**
++   * Create new NRTManager.  Note that this installs a
++   * merged segment warmer on the provided IndexWriter's
++   * config.
++   * 
++   *  @param writer IndexWriter to open near-real-time
++   *         readers
++  */
++  public NRTManager(IndexWriter writer) throws IOException {
++    this(writer, null);
++  }
++
++  /**
++   * Create new NRTManager.  Note that this installs a
++   * merged segment warmer on the provided IndexWriter's
++   * config.
++   * 
++   *  @param writer IndexWriter to open near-real-time
++   *         readers
++   *  @param es ExecutorService to pass to the IndexSearcher
++  */
++  public NRTManager(IndexWriter writer, ExecutorService es) throws IOException {
++
++    this.writer = writer;
++    this.es = es;
++    indexingGen = new AtomicLong(1);
++    searchingGen = new AtomicLong(-1);
++    noDeletesSearchingGen = new AtomicLong(-1);
++
++    // Create initial reader:
++    swapSearcher(new IndexSearcher(IndexReader.open(writer, true), es), 0, true);
++
++    writer.getConfig().setMergedSegmentWarmer(
++         new IndexWriter.IndexReaderWarmer() {
++           @Override
++           public void warm(IndexReader reader) throws IOException {
++             NRTManager.this.warm(reader);
++           }
++         });
++  }
++
++  /** NRTManager invokes this interface to notify it when a
++   *  caller is waiting for a specific generation searcher
++   *  to be visible. */
++  public static interface WaitingListener {
++    public void waiting(boolean requiresDeletes, long targetGen);
++  }
++
++  /** Adds a listener, to be notified when a caller is
++   *  waiting for a specific generation searcher to be
++   *  visible. */
++  public void addWaitingListener(WaitingListener l) {
++    waitingListeners.add(l);
++  }
++
++  /** Remove a listener added with {@link
++   *  #addWaitingListener}. */
++  public void removeWaitingListener(WaitingListener l) {
++    waitingListeners.remove(l);
++  }
++
++  public long updateDocument(Term t, Document d, Analyzer a) throws IOException {
++    writer.updateDocument(t, d, a);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long updateDocument(Term t, Document d) throws IOException {
++    writer.updateDocument(t, d);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long updateDocuments(Term t, Iterable<Document> docs, Analyzer a) throws IOException {
++    writer.updateDocuments(t, docs, a);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long updateDocuments(Term t, Iterable<Document> docs) throws IOException {
++    writer.updateDocuments(t, docs);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long deleteDocuments(Term t) throws IOException {
++    writer.deleteDocuments(t);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long deleteDocuments(Query q) throws IOException {
++    writer.deleteDocuments(q);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long addDocument(Document d, Analyzer a) throws IOException {
++    writer.addDocument(d, a);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long addDocuments(Iterable<Document> docs, Analyzer a) throws IOException {
++    writer.addDocuments(docs, a);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long addDocument(Document d) throws IOException {
++    writer.addDocument(d);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  public long addDocuments(Iterable<Document> docs) throws IOException {
++    writer.addDocuments(docs);
++    // Return gen as of when indexing finished:
++    return indexingGen.get();
++  }
++
++  /** Returns the most current searcher.  If you require a
++   *  certain indexing generation be visible in the returned
++   *  searcher, call {@link #get(long)}
++   *  instead.
++   */
++  public synchronized IndexSearcher get() {
++    return get(true);
++  }
++
++  /** Just like {@link #get}, but by passing <code>false</code> for
++   *  requireDeletes, you can get faster reopen time, but
++   *  the returned reader is allowed to not reflect all
++   *  deletions.  See {@link IndexReader#open(IndexWriter,boolean)}  */
++  public synchronized IndexSearcher get(boolean requireDeletes) {
++    final IndexSearcher s;
++    if (requireDeletes) {
++      s = currentSearcher;
++    } else if (noDeletesSearchingGen.get() > searchingGen.get()) {
++      s = noDeletesCurrentSearcher;
++    } else {
++      s = currentSearcher;
++    }
++    s.getIndexReader().incRef();
++    return s;
++  }
++
++  /** Call this if you require a searcher reflecting all
++   *  changes as of the target generation.
++   *
++   * @param targetGen Returned searcher must reflect changes
++   * as of this generation
++   */
++  public synchronized IndexSearcher get(long targetGen) {
++    return get(targetGen, true);
++  }
++
++  /** Call this if you require a searcher reflecting all
++   *  changes as of the target generation, and you don't
++   *  require deletions to be reflected.  Note that the
++   *  returned searcher may still reflect some or all
++   *  deletions.
++   *
++   * @param targetGen Returned searcher must reflect changes
++   * as of this generation
++   *
++   * @param requireDeletes If true, the returned searcher must
++   * reflect all deletions.  This can be substantially more
++   * costly than not applying deletes.  Note that if you
++   * pass false, it's still possible that some or all
++   * deletes may have been applied.
++   **/
++  public synchronized IndexSearcher get(long targetGen, boolean requireDeletes) {
++
++    assert noDeletesSearchingGen.get() >= searchingGen.get();
++
++    if (targetGen > getCurrentSearchingGen(requireDeletes)) {
++      // Must wait
++      //final long t0 = System.nanoTime();
++      for(WaitingListener listener : waitingListeners) {
++        listener.waiting(requireDeletes, targetGen);
++      }
++      while (targetGen > getCurrentSearchingGen(requireDeletes)) {
++        //System.out.println(Thread.currentThread().getName() + ": wait fresh searcher targetGen=" + targetGen + " vs searchingGen=" + getCurrentSearchingGen(requireDeletes) + " requireDeletes=" + requireDeletes);
++        try {
++          wait();
++        } catch (InterruptedException ie) {
++          throw new ThreadInterruptedException(ie);
++        }
++      }
++      //final long waitNS = System.nanoTime()-t0;
++      //System.out.println(Thread.currentThread().getName() + ": done wait fresh searcher targetGen=" + targetGen + " vs searchingGen=" + getCurrentSearchingGen(requireDeletes) + " requireDeletes=" + requireDeletes + " WAIT msec=" + (waitNS/1000000.0));
++    }
++
++    return get(requireDeletes);
++  }
++
++  /** Returns generation of current searcher. */
++  public long getCurrentSearchingGen(boolean requiresDeletes) {
++    return requiresDeletes ? searchingGen.get() : noDeletesSearchingGen.get();
++  }
++
++  /** Release the searcher obtained from {@link
++   *  #get()} or {@link #get(long)}. */
++  public void release(IndexSearcher s) throws IOException {
++    s.getIndexReader().decRef();
++  }
++
++  /** Call this when you need the NRT reader to reopen.
++   *
++   * @param applyDeletes If true, the newly opened reader
++   *        will reflect all deletes
++   */
++  public boolean reopen(boolean applyDeletes) throws IOException {
++
++    // Mark gen as of when reopen started:
++    final long newSearcherGen = indexingGen.getAndIncrement();
++
++    if (applyDeletes && currentSearcher.getIndexReader().isCurrent()) {
++      //System.out.println("reopen: skip: isCurrent both force gen=" + newSearcherGen + " vs current gen=" + searchingGen);
++      searchingGen.set(newSearcherGen);
++      noDeletesSearchingGen.set(newSearcherGen);
++      synchronized(this) {
++        notifyAll();
++      }
++      //System.out.println("reopen: skip: return");
++      return false;
++    } else if (!applyDeletes && noDeletesCurrentSearcher.getIndexReader().isCurrent()) {
++      //System.out.println("reopen: skip: isCurrent force gen=" + newSearcherGen + " vs current gen=" + noDeletesSearchingGen);
++      noDeletesSearchingGen.set(newSearcherGen);
++      synchronized(this) {
++        notifyAll();
++      }
++      //System.out.println("reopen: skip: return");
++      return false;
++    }
++
++    //System.out.println("indexingGen now " + indexingGen);
++
++    // .reopen() returns a new reference:
++
++    // Start from whichever searcher is most current:
++    final IndexSearcher startSearcher = noDeletesSearchingGen.get() > searchingGen.get() ? noDeletesCurrentSearcher : currentSearcher;
++    final IndexReader nextReader = startSearcher.getIndexReader().reopen(writer, applyDeletes);
++
++    warm(nextReader);
++
++    // Transfer reference to swapSearcher:
++    swapSearcher(new IndexSearcher(nextReader, es),
++                 newSearcherGen,
++                 applyDeletes);
++
++    return true;
++  }
++
++  /** Override this to warm the newly opened reader before
++   *  it's swapped in.  Note that this is called both for
++   *  newly merged segments and for new top-level readers
++   *  opened by #reopen. */
++  protected void warm(IndexReader reader) throws IOException {
++  }
++
++  // Steals a reference from newSearcher:
++  private synchronized void swapSearcher(IndexSearcher newSearcher, long newSearchingGen, boolean applyDeletes) throws IOException {
++    //System.out.println(Thread.currentThread().getName() + ": swap searcher gen=" + newSearchingGen + " applyDeletes=" + applyDeletes);
++    
++    // Always replace noDeletesCurrentSearcher:
++    if (noDeletesCurrentSearcher != null) {
++      noDeletesCurrentSearcher.getIndexReader().decRef();
++    }
++    noDeletesCurrentSearcher = newSearcher;
++    assert newSearchingGen > noDeletesSearchingGen.get(): "newSearchingGen=" + newSearchingGen + " noDeletesSearchingGen=" + noDeletesSearchingGen;
++    noDeletesSearchingGen.set(newSearchingGen);
++
++    if (applyDeletes) {
++      // Deletes were applied, so we also update currentSearcher:
++      if (currentSearcher != null) {
++        currentSearcher.getIndexReader().decRef();
++      }
++      currentSearcher = newSearcher;
++      if (newSearcher != null) {
++        newSearcher.getIndexReader().incRef();
++      }
++      assert newSearchingGen > searchingGen.get(): "newSearchingGen=" + newSearchingGen + " searchingGen=" + searchingGen;
++      searchingGen.set(newSearchingGen);
++    }
++
++    notifyAll();
++    //System.out.println(Thread.currentThread().getName() + ": done");
++  }
++
++  /** NOTE: caller must separately close the writer. */
++  // @Override -- not until Java 1.6
++  public void close() throws IOException {
++    swapSearcher(null, indexingGen.getAndIncrement(), true);
++  }
++}
+diff --git a/lucene/contrib/misc/src/java/org/apache/lucene/index/NRTManagerReopenThread.java b/lucene/contrib/misc/src/java/org/apache/lucene/index/NRTManagerReopenThread.java
+new file mode 100644
+index 0000000..b9222f5
+--- /dev/null
++++ b/lucene/contrib/misc/src/java/org/apache/lucene/index/NRTManagerReopenThread.java
+@@ -0,0 +1,202 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.Closeable;
++import java.io.IOException;
++
++import org.apache.lucene.util.ThreadInterruptedException;
++
++/**
++ * Utility class that runs a reopen thread to periodically
++ * reopen the NRT searchers in the provided {@link
++ * NRTManager}.
++ *
++ * <p> Typical usage looks like this:
++ *
++ * <pre>
++ *   ... open your own writer ...
++ * 
++ *   NRTManager manager = new NRTManager(writer);
++ *
++ *   // Refreshes searcher every 5 seconds when nobody is waiting, and up to 100 msec delay
++ *   // when somebody is waiting:
++ *   NRTManagerReopenThread reopenThread = new NRTManagerReopenThread(manager, 5.0, 0.1);
++ *   reopenThread.setName("NRT Reopen Thread");
++ *   reopenThread.setPriority(Math.min(Thread.currentThread().getPriority()+2, Thread.MAX_PRIORITY));
++ *   reopenThread.setDaemon(true);
++ *   reopenThread.start();
++ * </pre>
++ *
++ * Then, for each incoming query, do this:
++ *
++ * <pre>
++ *   // For each incoming query:
++ *   IndexSearcher searcher = manager.get();
++ *   try {
++ *     // Use searcher to search...
++ *   } finally {
++ *     manager.release(searcher);
++ *   }
++ * </pre>
++ *
++ * You should make changes using the <code>NRTManager</code>; if you later need to obtain
++ * a searcher reflecting those changes:
++ *
++ * <pre>
++ *   // ... or updateDocument, deleteDocuments, etc:
++ *   long gen = manager.addDocument(...);
++ *   
++ *   // Returned searcher is guaranteed to reflect the just added document
++ *   IndexSearcher searcher = manager.get(gen);
++ *   try {
++ *     // Use searcher to search...
++ *   } finally {
++ *     manager.release(searcher);
++ *   }
++ * </pre>
++ *
++ *
++ * When you are done be sure to close both the manager and the reopen thrad:
++ * <pre> 
++ *   reopenThread.close();       
++ *   manager.close();
++ * </pre>
++ */
++
++public class NRTManagerReopenThread extends Thread implements NRTManager.WaitingListener, Closeable {
++  private final NRTManager manager;
++  private final long targetMaxStaleNS;
++  private final long targetMinStaleNS;
++  private boolean finish;
++  private boolean waitingNeedsDeletes;
++  private long waitingGen;
++
++  /**
++   * Create NRTManagerReopenThread, to periodically reopen the NRT searcher.
++   *
++   * @param targetMaxStaleSec Maximum time until a new
++   *        reader must be opened; this sets the upper bound
++   *        on how slowly reopens may occur
++   *
++   * @param targetMinStaleSec Mininum time until a new
++   *        reader can be opened; this sets the lower bound
++   *        on how quickly reopens may occur, when a caller
++   *        is waiting for a specific indexing change to
++   *        become visible.
++   */
++
++  public NRTManagerReopenThread(NRTManager manager, double targetMaxStaleSec, double targetMinStaleSec) {
++    if (targetMaxStaleSec < targetMinStaleSec) {
++      throw new IllegalArgumentException("targetMaxScaleSec (= " + targetMaxStaleSec + ") < targetMinStaleSec (=" + targetMinStaleSec + ")");
++    }
++    this.manager = manager;
++    this.targetMaxStaleNS = (long) (1000000000*targetMaxStaleSec);
++    this.targetMinStaleNS = (long) (1000000000*targetMinStaleSec);
++    manager.addWaitingListener(this);
++  }
++
++  public synchronized void close() {
++    //System.out.println("NRT: set finish");
++    manager.removeWaitingListener(this);
++    this.finish = true;
++    notify();
++    try {
++      join();
++    } catch (InterruptedException ie) {
++      throw new ThreadInterruptedException(ie);
++    }
++  }
++
++  public synchronized void waiting(boolean needsDeletes, long targetGen) {
++    waitingNeedsDeletes |= needsDeletes;
++    waitingGen = Math.max(waitingGen, targetGen);
++    notify();
++    //System.out.println(Thread.currentThread().getName() + ": force wakeup waitingGen=" + waitingGen + " applyDeletes=" + applyDeletes + " waitingNeedsDeletes=" + waitingNeedsDeletes);
++  }
++
++  @Override
++    public void run() {
++    // TODO: maybe use private thread ticktock timer, in
++    // case clock shift messes up nanoTime?
++    long lastReopenStartNS = System.nanoTime();
++
++    //System.out.println("reopen: start");
++    try {
++      while (true) {
++
++        final boolean doApplyDeletes;
++
++        boolean hasWaiting = false;
++
++        synchronized(this) {
++          // TODO: try to guestimate how long reopen might
++          // take based on past data?
++
++          while (!finish) {
++            //System.out.println("reopen: cycle");
++
++            // True if we have someone waiting for reopen'd searcher:
++            hasWaiting = waitingGen > manager.getCurrentSearchingGen(waitingNeedsDeletes);
++            final long nextReopenStartNS = lastReopenStartNS + (hasWaiting ? targetMinStaleNS : targetMaxStaleNS);
++
++            final long sleepNS = nextReopenStartNS - System.nanoTime();
++
++            if (sleepNS > 0) {
++              //System.out.println("reopen: sleep " + (sleepNS/1000000.0) + " ms (hasWaiting=" + hasWaiting + ")");
++              try {
++                wait(sleepNS/1000000, (int) (sleepNS%1000000));
++              } catch (InterruptedException ie) {
++                Thread.currentThread().interrupt();
++                //System.out.println("NRT: set finish on interrupt");
++                finish = true;
++                break;
++              }
++            } else {
++              break;
++            }
++          }
++
++          if (finish) {
++            //System.out.println("reopen: finish");
++            return;
++          }
++
++          doApplyDeletes = hasWaiting ? waitingNeedsDeletes : true;
++          waitingNeedsDeletes = false;
++          //System.out.println("reopen: start hasWaiting=" + hasWaiting);
++        }
++
++        lastReopenStartNS = System.nanoTime();
++        try {
++          //final long t0 = System.nanoTime();
++          manager.reopen(doApplyDeletes);
++          //System.out.println("reopen took " + ((System.nanoTime()-t0)/1000000.0) + " msec");
++        } catch (IOException ioe) {
++          //System.out.println(Thread.currentThread().getName() + ": IOE");
++          //ioe.printStackTrace();
++          throw new RuntimeException(ioe);
++        }
++      }
++    } catch (Throwable t) {
++      //System.out.println("REOPEN EXC");
++      //t.printStackTrace(System.out);
++      throw new RuntimeException(t);
++    }
++  }
++}
+diff --git a/lucene/contrib/misc/src/test/org/apache/lucene/index/TestNRTManager.java b/lucene/contrib/misc/src/test/org/apache/lucene/index/TestNRTManager.java
+new file mode 100644
+index 0000000..6fec355
+--- /dev/null
++++ b/lucene/contrib/misc/src/test/org/apache/lucene/index/TestNRTManager.java
+@@ -0,0 +1,684 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.File;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.Fieldable;
++import org.apache.lucene.index.codecs.CodecProvider;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.PhraseQuery;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.ScoreDoc;
++import org.apache.lucene.search.Sort;
++import org.apache.lucene.search.SortField;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
++import org.apache.lucene.store.NRTCachingDirectory;
++import org.apache.lucene.util.Bits;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LineFileDocs;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.NamedThreadFactory;
++import org.apache.lucene.util._TestUtil;
++import org.junit.Test;
++
++// TODO
++//   - mix in optimize, addIndexes
++//   - randomoly mix in non-congruent docs
++
++// NOTE: This is a copy of TestNRTThreads, but swapping in
++// NRTManager for adding/updating/searching
++
++public class TestNRTManager extends LuceneTestCase {
++
++  private static class SubDocs {
++    public final String packID;
++    public final List<String> subIDs;
++    public boolean deleted;
++
++    public SubDocs(String packID, List<String> subIDs) {
++      this.packID = packID;
++      this.subIDs = subIDs;
++    }
++  }
++
++  // TODO: is there a pre-existing way to do this!!!
++  private Document cloneDoc(Document doc1) {
++    final Document doc2 = new Document();
++    for(Fieldable f : doc1.getFields()) {
++      Field field1 = (Field) f;
++      
++      Field field2 = new Field(field1.name(),
++                               field1.stringValue(),
++                               field1.isStored() ? Field.Store.YES : Field.Store.NO,
++                               field1.isIndexed() ? (field1.isTokenized() ? Field.Index.ANALYZED : Field.Index.NOT_ANALYZED) : Field.Index.NO);
++      if (field1.getOmitNorms()) {
++        field2.setOmitNorms(true);
++      }
++      if (field1.getOmitTermFreqAndPositions()) {
++        field2.setOmitTermFreqAndPositions(true);
++      }
++      doc2.add(field2);
++    }
++
++    return doc2;
++  }
++
++  @Test
++  public void testNRTManager() throws Exception {
++
++    final long t0 = System.currentTimeMillis();
++
++    if (CodecProvider.getDefault().getDefaultFieldCodec().equals("SimpleText")) {
++      // no
++      CodecProvider.getDefault().setDefaultFieldCodec("Standard");
++    }
++
++    final LineFileDocs docs = new LineFileDocs(random);
++    final File tempDir = _TestUtil.getTempDir("nrtopenfiles");
++    final MockDirectoryWrapper _dir = newFSDirectory(tempDir);
++    _dir.setCheckIndexOnClose(false);  // don't double-checkIndex, we do it ourselves
++    Directory dir = _dir;
++    final IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(IndexWriterConfig.OpenMode.CREATE);
++
++    // newIWConfig makes smallish max seg size, which
++    // results in tons and tons of segments for this test
++    // when run nightly:
++    MergePolicy mp = conf.getMergePolicy();
++    if (mp instanceof TieredMergePolicy) {
++      ((TieredMergePolicy) mp).setMaxMergedSegmentMB(5000.);
++    } else if (mp instanceof LogByteSizeMergePolicy) {
++      ((LogByteSizeMergePolicy) mp).setMaxMergeMB(1000.);
++    } else if (mp instanceof LogMergePolicy) {
++      ((LogMergePolicy) mp).setMaxMergeDocs(100000);
++    }
++
++    conf.setMergedSegmentWarmer(new IndexWriter.IndexReaderWarmer() {
++      @Override
++      public void warm(IndexReader reader) throws IOException {
++        if (VERBOSE) {
++          System.out.println("TEST: now warm merged reader=" + reader);
++        }
++        final int maxDoc = reader.maxDoc();
++        final Bits delDocs = reader.getDeletedDocs();
++        int sum = 0;
++        final int inc = Math.max(1, maxDoc/50);
++        for(int docID=0;docID<maxDoc;docID += inc) {
++          if (delDocs == null || !delDocs.get(docID)) {
++            final Document doc = reader.document(docID);
++            sum += doc.getFields().size();
++          }
++        }
++
++        IndexSearcher searcher = newSearcher(reader);
++        sum += searcher.search(new TermQuery(new Term("body", "united")), 10).totalHits;
++        searcher.close();
++
++        if (VERBOSE) {
++          System.out.println("TEST: warm visited " + sum + " fields");
++        }
++      }
++      });
++
++    if (random.nextBoolean()) {
++      if (VERBOSE) {
++        System.out.println("TEST: wrap NRTCachingDir");
++      }
++
++      NRTCachingDirectory nrtDir = new NRTCachingDirectory(dir, 5.0, 60.0);
++      conf.setMergeScheduler(nrtDir.getMergeScheduler());
++      dir = nrtDir;
++    }
++    
++    final IndexWriter writer = new IndexWriter(dir, conf);
++    
++    if (VERBOSE) {
++      writer.setInfoStream(System.out);
++    }
++    _TestUtil.reduceOpenFiles(writer);
++    //System.out.println("TEST: conf=" + writer.getConfig());
++
++    final ExecutorService es = random.nextBoolean() ? null : Executors.newCachedThreadPool(new NamedThreadFactory("NRT search threads"));
++
++    final double minReopenSec = 0.01 + 0.05 * random.nextDouble();
++    final double maxReopenSec = minReopenSec * (1.0 + 10 * random.nextDouble());
++
++    if (VERBOSE) {
++      System.out.println("TEST: make NRTManager maxReopenSec=" + maxReopenSec + " minReopenSec=" + minReopenSec);
++    }
++
++    final NRTManager nrt = new NRTManager(writer, es);
++    final NRTManagerReopenThread nrtThread = new NRTManagerReopenThread(nrt, maxReopenSec, minReopenSec);
++    nrtThread.setName("NRT Reopen Thread");
++    nrtThread.setPriority(Math.min(Thread.currentThread().getPriority()+2, Thread.MAX_PRIORITY));
++    nrtThread.setDaemon(true);
++    nrtThread.start();
++
++    final int NUM_INDEX_THREADS = _TestUtil.nextInt(random, 1, 3);
++    final int NUM_SEARCH_THREADS = _TestUtil.nextInt(random, 1, 3);
++    //final int NUM_INDEX_THREADS = 1;
++    //final int NUM_SEARCH_THREADS = 1;
++    if (VERBOSE) {
++      System.out.println("TEST: " + NUM_INDEX_THREADS + " index threads; " + NUM_SEARCH_THREADS + " search threads");
++    }
++
++    final int RUN_TIME_SEC = LuceneTestCase.TEST_NIGHTLY ? 300 : 5;
++
++    final AtomicBoolean failed = new AtomicBoolean();
++    final AtomicInteger addCount = new AtomicInteger();
++    final AtomicInteger delCount = new AtomicInteger();
++    final AtomicInteger packCount = new AtomicInteger();
++    final List<Long> lastGens = new ArrayList<Long>();
++
++    final Set<String> delIDs = Collections.synchronizedSet(new HashSet<String>());
++    final List<SubDocs> allSubDocs = Collections.synchronizedList(new ArrayList<SubDocs>());
++
++    final long stopTime = System.currentTimeMillis() + RUN_TIME_SEC*1000;
++    Thread[] threads = new Thread[NUM_INDEX_THREADS];
++    for(int thread=0;thread<NUM_INDEX_THREADS;thread++) {
++      threads[thread] = new Thread() {
++          @Override
++          public void run() {
++            // TODO: would be better if this were cross thread, so that we make sure one thread deleting anothers added docs works:
++            final List<String> toDeleteIDs = new ArrayList<String>();
++            final List<SubDocs> toDeleteSubDocs = new ArrayList<SubDocs>();
++
++            long gen = 0;
++            while(System.currentTimeMillis() < stopTime && !failed.get()) {
++
++              //System.out.println(Thread.currentThread().getName() + ": cycle");
++              try {
++                // Occassional longish pause if running
++                // nightly
++                if (LuceneTestCase.TEST_NIGHTLY && random.nextInt(6) == 3) {
++                  if (VERBOSE) {
++                    System.out.println(Thread.currentThread().getName() + ": now long sleep");
++                  }
++                  Thread.sleep(_TestUtil.nextInt(random, 50, 500));
++                }
++
++                // Rate limit ingest rate:
++                Thread.sleep(_TestUtil.nextInt(random, 1, 10));
++                if (VERBOSE) {
++                  System.out.println(Thread.currentThread() + ": done sleep");
++                }
++
++                Document doc = docs.nextDoc();
++                if (doc == null) {
++                  break;
++                }
++                final String addedField;
++                if (random.nextBoolean()) {
++                  addedField = "extra" + random.nextInt(10);
++                  doc.add(new Field(addedField, "a random field", Field.Store.NO, Field.Index.ANALYZED));
++                } else {
++                  addedField = null;
++                }
++                if (random.nextBoolean()) {
++
++                  if (random.nextBoolean()) {
++                    // Add a pack of adjacent sub-docs
++                    final String packID;
++                    final SubDocs delSubDocs;
++                    if (toDeleteSubDocs.size() > 0 && random.nextBoolean()) {
++                      delSubDocs = toDeleteSubDocs.get(random.nextInt(toDeleteSubDocs.size()));
++                      assert !delSubDocs.deleted;
++                      toDeleteSubDocs.remove(delSubDocs);
++                      // reuse prior packID
++                      packID = delSubDocs.packID;
++                    } else {
++                      delSubDocs = null;
++                      // make new packID
++                      packID = packCount.getAndIncrement() + "";
++                    }
++
++                    final Field packIDField = newField("packID", packID, Field.Store.YES, Field.Index.NOT_ANALYZED);
++                    final List<String> docIDs = new ArrayList<String>();
++                    final SubDocs subDocs = new SubDocs(packID, docIDs);
++                    final List<Document> docsList = new ArrayList<Document>();
++
++                    allSubDocs.add(subDocs);
++                    doc.add(packIDField);
++                    docsList.add(cloneDoc(doc));
++                    docIDs.add(doc.get("docid"));
++
++                    final int maxDocCount = _TestUtil.nextInt(random, 1, 10);
++                    while(docsList.size() < maxDocCount) {
++                      doc = docs.nextDoc();
++                      if (doc == null) {
++                        break;
++                      }
++                      docsList.add(cloneDoc(doc));
++                      docIDs.add(doc.get("docid"));
++                    }
++                    addCount.addAndGet(docsList.size());
++
++                    if (delSubDocs != null) {
++                      delSubDocs.deleted = true;
++                      delIDs.addAll(delSubDocs.subIDs);
++                      delCount.addAndGet(delSubDocs.subIDs.size());
++                      if (VERBOSE) {
++                        System.out.println("TEST: update pack packID=" + delSubDocs.packID + " count=" + docsList.size() + " docs=" + docIDs);
++                      }
++                      gen = nrt.updateDocuments(new Term("packID", delSubDocs.packID), docsList);
++                      /*
++                      // non-atomic:
++                      nrt.deleteDocuments(new Term("packID", delSubDocs.packID));
++                      for(Document subDoc : docsList) {
++                        nrt.addDocument(subDoc);
++                      }
++                      */
++                    } else {
++                      if (VERBOSE) {
++                        System.out.println("TEST: add pack packID=" + packID + " count=" + docsList.size() + " docs=" + docIDs);
++                      }
++                      gen = nrt.addDocuments(docsList);
++                      
++                      /*
++                      // non-atomic:
++                      for(Document subDoc : docsList) {
++                        nrt.addDocument(subDoc);
++                      }
++                      */
++                    }
++                    doc.removeField("packID");
++
++                    if (random.nextInt(5) == 2) {
++                      if (VERBOSE) {
++                        System.out.println(Thread.currentThread().getName() + ": buffer del id:" + packID);
++                      }
++                      toDeleteSubDocs.add(subDocs);
++                    }
++
++                    // randomly verify the add/update "took":
++                    if (random.nextInt(20) == 2) {
++                      final boolean applyDeletes = delSubDocs != null;
++                      final IndexSearcher s = nrt.get(gen, applyDeletes);
++                      try {
++                        assertEquals(docsList.size(), s.search(new TermQuery(new Term("packID", packID)), 10).totalHits);
++                      } finally {
++                        nrt.release(s);
++                      }
++                    }
++
++                  } else {
++                    if (VERBOSE) {
++                      System.out.println(Thread.currentThread().getName() + ": add doc docid:" + doc.get("docid"));
++                    }
++
++                    gen = nrt.addDocument(doc);
++                    addCount.getAndIncrement();
++
++                    // randomly verify the add "took":
++                    if (random.nextInt(20) == 2) {
++                      //System.out.println(Thread.currentThread().getName() + ": verify");
++                      final IndexSearcher s = nrt.get(gen, false);
++                      //System.out.println(Thread.currentThread().getName() + ": got s=" + s);
++                      try {
++                        assertEquals(1, s.search(new TermQuery(new Term("docid", doc.get("docid"))), 10).totalHits);
++                      } finally {
++                        nrt.release(s);
++                      }
++                      //System.out.println(Thread.currentThread().getName() + ": done verify");
++                    }
++
++                    if (random.nextInt(5) == 3) {
++                      if (VERBOSE) {
++                        System.out.println(Thread.currentThread().getName() + ": buffer del id:" + doc.get("docid"));
++                      }
++                      toDeleteIDs.add(doc.get("docid"));
++                    }
++                  }
++                } else {
++                  // we use update but it never replaces a
++                  // prior doc
++                  if (VERBOSE) {
++                    System.out.println(Thread.currentThread().getName() + ": update doc id:" + doc.get("docid"));
++                  }
++                  gen = nrt.updateDocument(new Term("docid", doc.get("docid")), doc);
++                  addCount.getAndIncrement();
++
++                  // randomly verify the add "took":
++                  if (random.nextInt(20) == 2) {
++                    final IndexSearcher s = nrt.get(gen, true);
++                    try {
++                      assertEquals(1, s.search(new TermQuery(new Term("docid", doc.get("docid"))), 10).totalHits);
++                    } finally {
++                      nrt.release(s);
++                    }
++                  }
++
++                  if (random.nextInt(5) == 3) {
++                    if (VERBOSE) {
++                      System.out.println(Thread.currentThread().getName() + ": buffer del id:" + doc.get("docid"));
++                    }
++                    toDeleteIDs.add(doc.get("docid"));
++                  }
++                }
++
++                if (random.nextInt(30) == 17) {
++                  if (VERBOSE) {
++                    System.out.println(Thread.currentThread().getName() + ": apply " + toDeleteIDs.size() + " deletes");
++                  }
++                  for(String id : toDeleteIDs) {
++                    if (VERBOSE) {
++                      System.out.println(Thread.currentThread().getName() + ": del term=id:" + id);
++                    }
++                    gen = nrt.deleteDocuments(new Term("docid", id));
++
++                    // randomly verify the delete "took":
++                    if (random.nextInt(20) == 7) {
++                      final IndexSearcher s = nrt.get(gen, true);
++                      try {
++                        assertEquals(0, s.search(new TermQuery(new Term("docid", id)), 10).totalHits);
++                      } finally {
++                        nrt.release(s);
++                      }
++                    }
++                  }
++
++                  final int count = delCount.addAndGet(toDeleteIDs.size());
++                  if (VERBOSE) {
++                    System.out.println(Thread.currentThread().getName() + ": tot " + count + " deletes");
++                  }
++                  delIDs.addAll(toDeleteIDs);
++                  toDeleteIDs.clear();
++
++                  for(SubDocs subDocs : toDeleteSubDocs) {
++                    assertTrue(!subDocs.deleted);
++                    gen = nrt.deleteDocuments(new Term("packID", subDocs.packID));
++                    subDocs.deleted = true;
++                    if (VERBOSE) {
++                      System.out.println("  del subs: " + subDocs.subIDs + " packID=" + subDocs.packID);
++                    }
++                    delIDs.addAll(subDocs.subIDs);
++                    delCount.addAndGet(subDocs.subIDs.size());
++
++                    // randomly verify the delete "took":
++                    if (random.nextInt(20) == 7) {
++                      final IndexSearcher s = nrt.get(gen, true);
++                      try {
++                        assertEquals(0, s.search(new TermQuery(new Term("packID", subDocs.packID)), 1).totalHits);
++                      } finally {
++                        nrt.release(s);
++                      }
++                    }
++                  }
++                  toDeleteSubDocs.clear();
++                }
++                if (addedField != null) {
++                  doc.removeField(addedField);
++                }
++              } catch (Throwable t) {
++                System.out.println(Thread.currentThread().getName() + ": FAILED: hit exc");
++                t.printStackTrace();
++                failed.set(true);
++                throw new RuntimeException(t);
++              }
++            }
++
++            lastGens.add(gen);
++            if (VERBOSE) {
++              System.out.println(Thread.currentThread().getName() + ": indexing done");
++            }
++          }
++        };
++      threads[thread].setDaemon(true);
++      threads[thread].start();
++    }
++
++    if (VERBOSE) {
++      System.out.println("TEST: DONE start indexing threads [" + (System.currentTimeMillis()-t0) + " ms]");
++    }
++
++    // let index build up a bit
++    Thread.sleep(100);
++
++    // silly starting guess:
++    final AtomicInteger totTermCount = new AtomicInteger(100);
++
++    // run search threads
++    final Thread[] searchThreads = new Thread[NUM_SEARCH_THREADS];
++    final AtomicInteger totHits = new AtomicInteger();
++
++    if (VERBOSE) {
++      System.out.println("TEST: start search threads");
++    }
++
++    for(int thread=0;thread<NUM_SEARCH_THREADS;thread++) {
++      searchThreads[thread] = new Thread() {
++          @Override
++          public void run() {
++            while(System.currentTimeMillis() < stopTime && !failed.get()) {
++              final IndexSearcher s = nrt.get(random.nextBoolean());
++              try {
++                try {
++                  smokeTestSearcher(s);
++                  if (s.getIndexReader().numDocs() > 0) {
++                    Fields fields = MultiFields.getFields(s.getIndexReader());
++                    if (fields == null) {
++                      continue;
++                    }
++                    Terms terms = fields.terms("body");
++                    if (terms == null) {
++                      continue;
++                    }
++
++                    TermsEnum termsEnum = terms.iterator();
++                    int seenTermCount = 0;
++                    int shift;
++                    int trigger;
++                    if (totTermCount.get() == 0) {
++                      shift = 0;
++                      trigger = 1;
++                    } else {
++                      shift = random.nextInt(totTermCount.get()/10);
++                      trigger = totTermCount.get()/10;
++                    }
++
++                    while(System.currentTimeMillis() < stopTime) {
++                      BytesRef term = termsEnum.next();
++                      if (term == null) {
++                        if (seenTermCount == 0) {
++                          break;
++                        }
++                        totTermCount.set(seenTermCount);
++                        seenTermCount = 0;
++                        if (totTermCount.get() == 0) {
++                          shift = 0;
++                          trigger = 1;
++                        } else {
++                          trigger = totTermCount.get()/10;
++                          //System.out.println("trigger " + trigger);
++                          shift = random.nextInt(totTermCount.get()/10);
++                        }
++                        termsEnum.seek(new BytesRef(""));
++                        continue;
++                      }
++                      seenTermCount++;
++                      // search 10 terms
++                      if (trigger == 0) {
++                        trigger = 1;
++                      }
++                      if ((seenTermCount + shift) % trigger == 0) {
++                        //if (VERBOSE) {
++                        //System.out.println(Thread.currentThread().getName() + " now search body:" + term.utf8ToString());
++                        //}
++                        totHits.addAndGet(runQuery(s, new TermQuery(new Term("body", term))));
++                      }
++                    }
++                    if (VERBOSE) {
++                      System.out.println(Thread.currentThread().getName() + ": search done");
++                    }
++                  }
++                } finally {
++                  nrt.release(s);
++                }
++              } catch (Throwable t) {
++                System.out.println(Thread.currentThread().getName() + ": FAILED: hit exc");
++                failed.set(true);
++                t.printStackTrace(System.out);
++                throw new RuntimeException(t);
++              }
++            }
++          }
++        };
++      searchThreads[thread].setDaemon(true);
++      searchThreads[thread].start();
++    }
++
++    if (VERBOSE) {
++      System.out.println("TEST: now join");
++    }
++    for(int thread=0;thread<NUM_INDEX_THREADS;thread++) {
++      threads[thread].join();
++    }
++    for(int thread=0;thread<NUM_SEARCH_THREADS;thread++) {
++      searchThreads[thread].join();
++    }
++
++    if (VERBOSE) {
++      System.out.println("TEST: done join [" + (System.currentTimeMillis()-t0) + " ms]; addCount=" + addCount + " delCount=" + delCount);
++      System.out.println("TEST: search totHits=" + totHits);
++    }
++
++    long maxGen = 0;
++    for(long gen : lastGens) {
++      maxGen = Math.max(maxGen, gen);
++    }
++
++    final IndexSearcher s = nrt.get(maxGen, true);
++
++    boolean doFail = false;
++    for(String id : delIDs) {
++      final TopDocs hits = s.search(new TermQuery(new Term("docid", id)), 1);
++      if (hits.totalHits != 0) {
++        System.out.println("doc id=" + id + " is supposed to be deleted, but got docID=" + hits.scoreDocs[0].doc);
++        doFail = true;
++      }
++    }
++
++    // Make sure each group of sub-docs are still in docID order:
++    for(SubDocs subDocs : allSubDocs) {
++      if (!subDocs.deleted) {
++        // We sort by relevance but the scores should be identical so sort falls back to by docID:
++        TopDocs hits = s.search(new TermQuery(new Term("packID", subDocs.packID)), 20);
++        assertEquals(subDocs.subIDs.size(), hits.totalHits);
++        int lastDocID = -1;
++        int startDocID = -1;
++        for(ScoreDoc scoreDoc : hits.scoreDocs) {
++          final int docID = scoreDoc.doc;
++          if (lastDocID != -1) {
++            assertEquals(1+lastDocID, docID);
++          } else {
++            startDocID = docID;
++          }
++          lastDocID = docID;
++          final Document doc = s.doc(docID);
++          assertEquals(subDocs.packID, doc.get("packID"));
++        }
++
++        lastDocID = startDocID - 1;
++        for(String subID : subDocs.subIDs) {
++          hits = s.search(new TermQuery(new Term("docid", subID)), 1);
++          assertEquals(1, hits.totalHits);
++          final int docID = hits.scoreDocs[0].doc;
++          if (lastDocID != -1) {
++            assertEquals(1+lastDocID, docID);
++          }
++          lastDocID = docID;
++        }          
++      } else {
++        for(String subID : subDocs.subIDs) {
++          assertEquals(0, s.search(new TermQuery(new Term("docid", subID)), 1).totalHits);
++        }
++      }
++    }
++    
++    final int endID = Integer.parseInt(docs.nextDoc().get("docid"));
++    for(int id=0;id<endID;id++) {
++      String stringID = ""+id;
++      if (!delIDs.contains(stringID)) {
++        final TopDocs hits = s.search(new TermQuery(new Term("docid", stringID)), 1);
++        if (hits.totalHits != 1) {
++          System.out.println("doc id=" + stringID + " is not supposed to be deleted, but got hitCount=" + hits.totalHits);
++          doFail = true;
++        }
++      }
++    }
++    assertFalse(doFail);
++
++    assertEquals("index=" + writer.segString() + " addCount=" + addCount + " delCount=" + delCount, addCount.get() - delCount.get(), s.getIndexReader().numDocs());
++    nrt.release(s);
++
++    if (es != null) {
++      es.shutdown();
++      es.awaitTermination(1, TimeUnit.SECONDS);
++    }
++
++    writer.commit();
++    assertEquals("index=" + writer.segString() + " addCount=" + addCount + " delCount=" + delCount, addCount.get() - delCount.get(), writer.numDocs());
++
++    if (VERBOSE) {
++      System.out.println("TEST: now close NRTManager");
++    }
++    nrtThread.close();
++    nrt.close();
++    assertFalse(writer.anyNonBulkMerges);
++    writer.close(false);
++    _TestUtil.checkIndex(dir);
++    dir.close();
++    _TestUtil.rmDir(tempDir);
++    docs.close();
++
++    if (VERBOSE) {
++      System.out.println("TEST: done [" + (System.currentTimeMillis()-t0) + " ms]");
++    }
++  }
++
++  private int runQuery(IndexSearcher s, Query q) throws Exception {
++    s.search(q, 10);
++    return s.search(q, null, 10, new Sort(new SortField("title", SortField.STRING))).totalHits;
++  }
++
++  private void smokeTestSearcher(IndexSearcher s) throws Exception {
++    runQuery(s, new TermQuery(new Term("body", "united")));
++    runQuery(s, new TermQuery(new Term("titleTokenized", "states")));
++    PhraseQuery pq = new PhraseQuery();
++    pq.add(new Term("body", "united"));
++    pq.add(new Term("body", "states"));
++    runQuery(s, pq);
++  }
++}
+diff --git a/lucene/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/src/java/org/apache/lucene/index/IndexWriter.java
+index 460b6aa..46a9766 100644
+--- a/lucene/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -3867,6 +3867,7 @@ public class IndexWriter implements Closeable, TwoPhaseCommit {
+   }
+ 
+   synchronized boolean nrtIsCurrent(SegmentInfos infos) {
++    //System.out.println("IW.nrtIsCurrent " + (infos.version == segmentInfos.version && !docWriter.anyChanges() && !bufferedDeletesStream.any()));
+     return infos.version == segmentInfos.version && !docWriter.anyChanges() && !bufferedDeletesStream.any();
+   }
+ 
+diff --git a/lucene/src/test-framework/org/apache/lucene/util/_TestUtil.java b/lucene/src/test-framework/org/apache/lucene/util/_TestUtil.java
+index 2fad787..1d2317b 100644
+--- a/lucene/src/test-framework/org/apache/lucene/util/_TestUtil.java
++++ b/lucene/src/test-framework/org/apache/lucene/util/_TestUtil.java
+@@ -378,6 +378,7 @@ public class _TestUtil {
+     } else if (mp instanceof TieredMergePolicy) {
+       TieredMergePolicy tmp = (TieredMergePolicy) mp;
+       tmp.setMaxMergeAtOnce(Math.min(5, tmp.getMaxMergeAtOnce()));
++      tmp.setSegmentsPerTier(Math.min(5, tmp.getSegmentsPerTier()));
+     }
+     MergeScheduler ms = w.getConfig().getMergeScheduler();
+     if (ms instanceof ConcurrentMergeScheduler) {
+

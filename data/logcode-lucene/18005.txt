@@ -1,0 +1,1016 @@
+GitDiffStart: 90526f0ea12f1e6380242eb8f96dc81763e52726 | Thu Apr 29 15:13:59 2010 +0000
+diff --git a/lucene/src/test/org/apache/lucene/util/LuceneTestCaseJ4.java b/lucene/src/test/org/apache/lucene/util/LuceneTestCaseJ4.java
+index fdb3e9e..8a979b2 100644
+--- a/lucene/src/test/org/apache/lucene/util/LuceneTestCaseJ4.java
++++ b/lucene/src/test/org/apache/lucene/util/LuceneTestCaseJ4.java
+@@ -92,7 +92,9 @@ public class LuceneTestCaseJ4 {
+    * <p><b>NOTE:</b> Change this when development starts for new Lucene version:
+    */
+   public static final Version TEST_VERSION_CURRENT = Version.LUCENE_31;
+-  
++
++  public static boolean checkFieldCacheSanity = true;
++
+   /** Create indexes in this directory, optimally use a subdir, named after the test */
+   public static final File TEMP_DIR;
+   static {
+@@ -197,7 +199,8 @@ public class LuceneTestCaseJ4 {
+       // index readers are used, because they could be gc'ed just before
+       // tearDown is called.
+       // But it's better then nothing.
+-      assertSaneFieldCaches(getTestLabel());
++      if (checkFieldCacheSanity)
++        assertSaneFieldCaches(getTestLabel());
+ 
+       if (ConcurrentMergeScheduler.anyUnhandledExceptions()) {
+         // Clear the failure so that we don't just keep
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index fb89d2a..e45f183 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -154,6 +154,11 @@ Optimizations
+ 
+ * SOLR-1874: Optimize PatternReplaceFilter for better performance. (rmuir, uschindler)
+ 
++* SOLR-1875: Per-segment field faceting for single valued string fields.
++  Enable with facet.method=fcs, control the number of threads used with
++  the "threads" local param on the facet.field param.  This algorithm will
++  only be faster in the presence of rapid index changes.  (yonik)
++
+ Bug Fixes
+ ----------------------
+ 
+diff --git a/solr/src/common/org/apache/solr/common/params/CommonParams.java b/solr/src/common/org/apache/solr/common/params/CommonParams.java
+index acfd4de..bed310a 100755
+--- a/solr/src/common/org/apache/solr/common/params/CommonParams.java
++++ b/solr/src/common/org/apache/solr/common/params/CommonParams.java
+@@ -122,6 +122,7 @@ public interface CommonParams {
+   public static final String OUTPUT_KEY = "key";
+   public static final String FIELD = "f";
+   public static final String VALUE = "v";
++  public static final String THREADS = "threads";
+   public static final String TRUE = Boolean.TRUE.toString();
+   public static final String FALSE = Boolean.FALSE.toString();
+ }
+diff --git a/solr/src/common/org/apache/solr/common/params/FacetParams.java b/solr/src/common/org/apache/solr/common/params/FacetParams.java
+index b9e2332..65dd7e9 100644
+--- a/solr/src/common/org/apache/solr/common/params/FacetParams.java
++++ b/solr/src/common/org/apache/solr/common/params/FacetParams.java
+@@ -43,7 +43,11 @@ public interface FacetParams {
+    * (such as the FieldCache used for sorting).
+    */
+   public static final String FACET_METHOD_fc = "fc";
+-  
++
++  /** Value for FACET_METHOD param, like FACET_METHOD_fc but counts per-segment.
++   */
++  public static final String FACET_METHOD_fcs = "fcs";
++
+   /**
+    * Any lucene formated queries the user would like to use for
+    * Facet Constraint Counts (multi-value)
+diff --git a/solr/src/java/org/apache/solr/request/PerSegmentSingleValuedFaceting.java b/solr/src/java/org/apache/solr/request/PerSegmentSingleValuedFaceting.java
+new file mode 100755
+index 0000000..82a743c
+--- /dev/null
++++ b/solr/src/java/org/apache/solr/request/PerSegmentSingleValuedFaceting.java
+@@ -0,0 +1,365 @@
++package org.apache.solr.request;
++
++import org.apache.lucene.search.DocIdSet;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.FieldCache;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.util.PriorityQueue;
++import org.apache.solr.common.SolrException;
++import org.apache.solr.common.params.FacetParams;
++import org.apache.solr.common.util.NamedList;
++import org.apache.solr.core.SolrCore;
++import org.apache.solr.schema.FieldType;
++import org.apache.solr.search.DocIterator;
++import org.apache.solr.search.DocSet;
++import org.apache.solr.search.SolrIndexReader;
++import org.apache.solr.search.SolrIndexSearcher;
++import org.apache.solr.util.BoundedTreeSet;
++
++import java.io.IOException;
++import java.util.*;
++import java.util.concurrent.*;
++
++
++class PerSegmentSingleValuedFaceting {
++
++  // input params
++  SolrIndexSearcher searcher;
++  DocSet docs;
++  String fieldName;
++  int offset;
++  int limit;
++  int mincount;
++  boolean missing;
++  String sort;
++  String prefix;
++
++  Filter baseSet;
++
++  int nThreads;
++
++  public PerSegmentSingleValuedFaceting(SolrIndexSearcher searcher, DocSet docs, String fieldName, int offset, int limit, int mincount, boolean missing, String sort, String prefix) {
++    this.searcher = searcher;
++    this.docs = docs;
++    this.fieldName = fieldName;
++    this.offset = offset;
++    this.limit = limit;
++    this.mincount = mincount;
++    this.missing = missing;
++    this.sort = sort;
++    this.prefix = prefix;
++  }
++
++  public void setNumThreads(int threads) {
++    nThreads = threads;
++  }
++
++
++  NamedList getFacetCounts(Executor executor) throws IOException {
++
++    CompletionService<SegFacet> completionService = new ExecutorCompletionService<SegFacet>(executor);
++
++    // reuse the translation logic to go from top level set to per-segment set
++    baseSet = docs.getTopFilter();
++
++    SolrIndexReader topReader = searcher.getReader();
++    final SolrIndexReader[] leafReaders = topReader.getLeafReaders();
++    int[] offsets = topReader.getLeafOffsets();
++
++    // The list of pending tasks that aren't immediately submitted
++    // TODO: Is there a completion service, or a delegating executor that can
++    // limit the number of concurrent tasks submitted to a bigger executor?
++    LinkedList<Callable<SegFacet>> pending = new LinkedList<Callable<SegFacet>>();
++
++    int threads = nThreads <= 0 ? Integer.MAX_VALUE : nThreads;
++
++    for (int i=0; i<leafReaders.length; i++) {
++      final SegFacet segFacet = new SegFacet(leafReaders[i], offsets[i]);
++
++      Callable<SegFacet> task = new Callable<SegFacet>() {
++        public SegFacet call() throws Exception {
++          segFacet.countTerms();
++          return segFacet;
++        }
++      };
++
++      // TODO: if limiting threads, submit by largest segment first?
++
++      if (--threads >= 0) {
++        completionService.submit(task);
++      } else {
++        pending.add(task);
++      }
++    }
++
++
++    // now merge the per-segment results
++    PriorityQueue<SegFacet> queue = new PriorityQueue<SegFacet>() {
++      {
++        initialize(leafReaders.length);
++      }
++      @Override
++      protected boolean lessThan(SegFacet a, SegFacet b) {
++        return a.terms[a.pos].compareTo(b.terms[b.pos]) < 0;
++      }
++    };
++
++
++    boolean hasMissingCount=false;
++    int missingCount=0;
++    for (int i=0; i<leafReaders.length; i++) {
++      SegFacet seg = null;
++
++      try {
++        Future<SegFacet> future = completionService.take();        
++        seg = future.get();
++        if (!pending.isEmpty()) {
++          completionService.submit(pending.removeFirst());
++        }
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
++      } catch (ExecutionException e) {
++        Throwable cause = e.getCause();
++        if (cause instanceof RuntimeException) {
++          throw (RuntimeException)cause;
++        } else {
++          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error in per-segment faceting on field: " + fieldName, cause);
++        }
++      }
++
++
++      if (seg.startTermIndex < seg.endTermIndex) {
++        if (seg.startTermIndex==0) {
++          hasMissingCount=true;
++          missingCount += seg.counts[0];
++          seg.pos = 1;
++        } else {
++          seg.pos = seg.startTermIndex;
++        }
++        if (seg.pos < seg.endTermIndex) {
++          queue.add(seg);
++        }
++      }
++    }
++
++    FacetCollector collector;
++    if (sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY)) {
++      collector = new CountSortedFacetCollector(offset, limit, mincount);
++    } else {
++      collector = new IndexSortedFacetCollector(offset, limit, mincount);
++    }
++
++    while (queue.size() > 0) {
++      SegFacet seg = queue.top();
++      String val = seg.terms[seg.pos];
++      int count = 0;
++
++      do {
++        count += seg.counts[seg.pos - seg.startTermIndex];
++
++        // TODO: OPTIMIZATION...
++        // if mincount>0 then seg.pos++ can skip ahead to the next non-zero entry.
++        seg.pos++;
++        if (seg.pos >= seg.endTermIndex) {
++          queue.pop();
++          seg = queue.top();
++        }  else {
++          seg = queue.updateTop();
++        }
++      } while (seg != null && val.compareTo(seg.terms[seg.pos]) == 0);
++
++      boolean stop = collector.collect(val, count);
++      if (stop) break;
++    }
++
++    NamedList res = collector.getFacetCounts();
++
++    // convert labels to readable form    
++    FieldType ft = searcher.getSchema().getFieldType(fieldName);
++    int sz = res.size();
++    for (int i=0; i<sz; i++) {
++      res.setName(i, ft.indexedToReadable(res.getName(i)));
++    }
++
++    if (missing) {
++      if (!hasMissingCount) {
++        missingCount = SimpleFacets.getFieldMissingCount(searcher,docs,fieldName);
++      }
++      res.add(null, missingCount);
++    }
++
++    return res;
++  }
++
++
++
++
++
++    // first element of the fieldcache is null, so we need this comparator.
++  private static final Comparator nullStrComparator = new Comparator() {
++        public int compare(Object o1, Object o2) {
++          if (o1==null) return (o2==null) ? 0 : -1;
++          else if (o2==null) return 1;
++          return ((String)o1).compareTo((String)o2);
++        }
++      };
++  
++
++  class SegFacet {
++    SolrIndexReader reader;
++    int readerOffset;
++
++    SegFacet(SolrIndexReader reader, int readerOffset) {
++      this.reader = reader;
++      this.readerOffset = readerOffset;
++    }
++    
++    int[] ords;
++    String[] terms;
++
++    int startTermIndex;
++    int endTermIndex;
++    int[] counts;
++
++    int pos; // only used during merge with other segments
++
++    void countTerms() throws IOException {
++      FieldCache.StringIndex si = FieldCache.DEFAULT.getStringIndex(reader, fieldName);
++      final String[] terms = this.terms = si.lookup;
++      final int[] termNum = this.ords = si.order;
++      // SolrCore.log.info("reader= " + reader + "  FC=" + System.identityHashCode(si));
++
++      if (prefix!=null) {
++        startTermIndex = Arrays.binarySearch(terms,prefix,nullStrComparator);
++        if (startTermIndex<0) startTermIndex=-startTermIndex-1;
++        // find the end term.  \uffff isn't a legal unicode char, but only compareTo
++        // is used, so it should be fine, and is guaranteed to be bigger than legal chars.
++        // TODO: switch to binarySearch version that takes start/end in Java6
++        endTermIndex = Arrays.binarySearch(terms,prefix+"\uffff\uffff\uffff\uffff",nullStrComparator);
++        endTermIndex = -endTermIndex-1;
++      } else {
++        startTermIndex=0;
++        endTermIndex=terms.length;
++      }
++
++      final int nTerms=endTermIndex-startTermIndex;
++      if (nTerms>0) {
++        // count collection array only needs to be as big as the number of terms we are
++        // going to collect counts for.
++        final int[] counts = this.counts = new int[nTerms];
++        DocIdSet idSet = baseSet.getDocIdSet(reader);
++        DocIdSetIterator iter = idSet.iterator();
++
++        if (startTermIndex==0 && endTermIndex==terms.length) {
++          // specialized version when collecting counts for all terms
++          int doc;
++          while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
++            counts[termNum[doc]]++;
++          }
++        } else {
++          // version that adjusts term numbers because we aren't collecting the full range
++          int doc;
++          while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
++            int term = termNum[doc];
++            int arrIdx = term-startTermIndex;
++            if (arrIdx>=0 && arrIdx<nTerms) counts[arrIdx]++;
++          }
++        }
++      }
++    }
++  }
++
++}
++
++
++
++abstract class FacetCollector {
++  /*** return true to stop collection */
++  public abstract boolean collect(String term, int count);
++  public abstract NamedList getFacetCounts();
++}
++
++
++// This collector expects facets to be collected in index order
++class CountSortedFacetCollector extends FacetCollector {
++  final int offset;
++  final int limit;
++  final int maxsize;
++  final BoundedTreeSet<SimpleFacets.CountPair<String,Integer>> queue;
++
++  int min;  // the smallest value in the top 'N' values
++
++  public CountSortedFacetCollector(int offset, int limit, int mincount) {
++    this.offset = offset;
++    this.limit = limit;
++    maxsize = limit>0 ? offset+limit : Integer.MAX_VALUE-1;
++    queue = new BoundedTreeSet<SimpleFacets.CountPair<String,Integer>>(maxsize);
++    min=mincount-1;  // the smallest value in the top 'N' values
++  }
++
++  @Override
++  public boolean collect(String term, int count) {
++    if (count > min) {
++      // NOTE: we use c>min rather than c>=min as an optimization because we are going in
++      // index order, so we already know that the keys are ordered.  This can be very
++      // important if a lot of the counts are repeated (like zero counts would be).
++      queue.add(new SimpleFacets.CountPair<String,Integer>(term, count));
++      if (queue.size()>=maxsize) min=queue.last().val;
++    }
++    return false;
++  }
++
++  @Override
++  public NamedList getFacetCounts() {
++    NamedList res = new NamedList();
++    int off=offset;
++    int lim=limit>=0 ? limit : Integer.MAX_VALUE;
++     // now select the right page from the results
++     for (SimpleFacets.CountPair<String,Integer> p : queue) {
++       if (--off>=0) continue;
++       if (--lim<0) break;
++       res.add(p.key, p.val);
++     }
++    return res;
++  }
++}
++
++// This collector expects facets to be collected in index order
++class IndexSortedFacetCollector extends FacetCollector {
++  int offset;
++  int limit;
++  final int mincount;
++  final NamedList res = new NamedList();
++
++
++  public IndexSortedFacetCollector(int offset, int limit, int mincount) {
++    this.offset = offset;
++    this.limit = limit>0 ? limit : Integer.MAX_VALUE;
++    this.mincount = mincount;
++  }
++
++  @Override
++  public boolean collect(String term, int count) {
++    if (count < mincount) {
++      return false;
++    }
++
++    if (offset > 0) {
++      offset--;
++      return false;
++    }
++
++    if (limit > 0) {
++      res.add(term, count);
++      limit--;
++    }
++
++    return limit <= 0;
++  }
++
++  @Override
++  public NamedList getFacetCounts() {
++    return res;
++  }
++}
+\ No newline at end of file
+diff --git a/solr/src/java/org/apache/solr/request/SimpleFacets.java b/solr/src/java/org/apache/solr/request/SimpleFacets.java
+index d7b4166..c71c4cb 100644
+--- a/solr/src/java/org/apache/solr/request/SimpleFacets.java
++++ b/solr/src/java/org/apache/solr/request/SimpleFacets.java
+@@ -41,6 +41,10 @@ import org.apache.solr.handler.component.ResponseBuilder;
+ 
+ import java.io.IOException;
+ import java.util.*;
++import java.util.concurrent.Executor;
++import java.util.concurrent.SynchronousQueue;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
+ 
+ /**
+  * A class that generates simple Facet information for a request.
+@@ -64,6 +68,7 @@ public class SimpleFacets {
+   String facetValue;      // the field to or query to facet on (minus local params)
+   DocSet base;            // the base docset for this particular facet
+   String key;             // what name should the results be stored under
++  int threads;
+ 
+   public SimpleFacets(SolrQueryRequest req,
+                       DocSet docs,
+@@ -88,6 +93,7 @@ public class SimpleFacets {
+     base = docs;
+     facetValue = param;
+     key = param;
++    threads = -1;
+ 
+     if (localParams == null) return;
+ 
+@@ -102,6 +108,11 @@ public class SimpleFacets {
+     // allow explicit set of the key
+     key = localParams.get(CommonParams.OUTPUT_KEY, key);
+ 
++    String threadStr = localParams.get(CommonParams.THREADS);
++    if (threadStr != null) {
++      threads = Integer.parseInt(threadStr);
++    }
++
+     // figure out if we need a new base DocSet
+     String excludeStr = localParams.get(CommonParams.EXCLUDE);
+     if (excludeStr == null) return;
+@@ -229,6 +240,10 @@ public class SimpleFacets {
+     // determine what type of faceting method to use
+     String method = params.getFieldParam(field, FacetParams.FACET_METHOD);
+     boolean enumMethod = FacetParams.FACET_METHOD_enum.equals(method);
++
++    // TODO: default to per-segment or not?
++    boolean per_segment = FacetParams.FACET_METHOD_fcs.equals(method);
++
+     if (method == null && ft instanceof BoolField) {
+       // Always use filters for booleans... we know the number of values is very small.
+       enumMethod = true;
+@@ -252,7 +267,16 @@ public class SimpleFacets {
+       } else {
+         // TODO: future logic could use filters instead of the fieldcache if
+         // the number of terms in the field is small enough.
+-        counts = getFieldCacheCounts(searcher, base, field, offset,limit, mincount, missing, sort, prefix);
++
++        if (per_segment) {
++          PerSegmentSingleValuedFaceting ps = new PerSegmentSingleValuedFaceting(searcher, base, field, offset,limit, mincount, missing, sort, prefix);
++          Executor executor = threads==0 ? directExecutor : facetExecutor;
++          ps.setNumThreads(threads);
++          counts = ps.getFacetCounts(facetExecutor);
++        } else {
++          counts = getFieldCacheCounts(searcher, base, field, offset,limit, mincount, missing, sort, prefix);         
++        }
++
+       }
+     }
+ 
+@@ -260,6 +284,19 @@ public class SimpleFacets {
+   }
+ 
+ 
++  static final Executor directExecutor = new Executor() {
++    public void execute(Runnable r) {
++      r.run();
++    }
++  };
++
++  static final Executor facetExecutor = new ThreadPoolExecutor(
++          0,
++          Integer.MAX_VALUE,
++          10, TimeUnit.SECONDS, // terminate idle threads after 10 sec
++          new SynchronousQueue<Runnable>()  // directly hand off tasks
++  );
++  
+   /**
+    * Returns a list of value constraints and the associated facet counts 
+    * for each facet field specified in the params.
+diff --git a/solr/src/test/org/apache/solr/SolrTestCaseJ4.java b/solr/src/test/org/apache/solr/SolrTestCaseJ4.java
+index 6934434..2975429 100755
+--- a/solr/src/test/org/apache/solr/SolrTestCaseJ4.java
++++ b/solr/src/test/org/apache/solr/SolrTestCaseJ4.java
+@@ -265,31 +265,31 @@ public class SolrTestCaseJ4 extends LuceneTestCaseJ4 {
+ 
+   /** Validates an update XML String is successful
+    */
+-  public void assertU(String update) {
++  public static void assertU(String update) {
+     assertU(null, update);
+   }
+ 
+   /** Validates an update XML String is successful
+    */
+-  public void assertU(String message, String update) {
++  public static void assertU(String message, String update) {
+     checkUpdateU(message, update, true);
+   }
+ 
+   /** Validates an update XML String failed
+    */
+-  public void assertFailedU(String update) {
++  public static void assertFailedU(String update) {
+     assertFailedU(null, update);
+   }
+ 
+   /** Validates an update XML String failed
+    */
+-  public void assertFailedU(String message, String update) {
++  public static void assertFailedU(String message, String update) {
+     checkUpdateU(message, update, false);
+   }
+ 
+   /** Checks the success or failure of an update message
+    */
+-  private void checkUpdateU(String message, String update, boolean shouldSucceed) {
++  private static void checkUpdateU(String message, String update, boolean shouldSucceed) {
+     try {
+       String m = (null == message) ? "" : message + " ";
+       if (shouldSucceed) {
+@@ -305,12 +305,12 @@ public class SolrTestCaseJ4 extends LuceneTestCaseJ4 {
+   }
+ 
+   /** Validates a query matches some XPath test expressions and closes the query */
+-  public void assertQ(SolrQueryRequest req, String... tests) {
++  public static void assertQ(SolrQueryRequest req, String... tests) {
+     assertQ(null, req, tests);
+   }
+ 
+   /** Validates a query matches some XPath test expressions and closes the query */
+-  public void assertQ(String message, SolrQueryRequest req, String... tests) {
++  public static void assertQ(String message, SolrQueryRequest req, String... tests) {
+     try {
+       String m = (null == message) ? "" : message + " ";
+       String response = h.query(req);
+diff --git a/solr/src/test/org/apache/solr/request/SimpleFacetsTest.java b/solr/src/test/org/apache/solr/request/SimpleFacetsTest.java
+index 62280c8..2a879fb 100644
+--- a/solr/src/test/org/apache/solr/request/SimpleFacetsTest.java
++++ b/solr/src/test/org/apache/solr/request/SimpleFacetsTest.java
+@@ -18,35 +18,76 @@
+ package org.apache.solr.request;
+ 
+ import org.apache.solr.SolrTestCaseJ4;
+-import org.apache.solr.util.AbstractSolrTestCase;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Random;
+ 
+-public class SimpleFacetsTest extends SolrTestCaseJ4 {
+ 
++public class SimpleFacetsTest extends SolrTestCaseJ4 {
+   @BeforeClass
+   public static void beforeClass() throws Exception {
+     initCore("solrconfig.xml","schema.xml");
++    createIndex();
++    checkFieldCacheSanity = false;
++  }
++
++  static Random rand = new Random(); // TODO: a way to use lucene's newRandom()?
++  static int random_commit_percent = 30;
++  static int random_dupe_percent = 25;   // some duplicates in the index to create deleted docs
++
++  static void randomCommit(int percent_chance) {
++    if (rand.nextInt(100) <= percent_chance)
++      assertU(commit());
++  }
++
++  static ArrayList<String[]> pendingDocs = new ArrayList<String[]>();
++
++  // committing randomly gives different looking segments each time
++  static void add_doc(String... fieldsAndValues) {
++    do {
++      pendingDocs.add(fieldsAndValues);      
++    } while (rand.nextInt(100) <= random_dupe_percent);
++
++    // assertU(adoc(fieldsAndValues));
++    // randomCommit(random_commit_percent);
++  }
++
++
++  static void createIndex() {
++    indexSimpleFacetCounts();
++    indexDateFacets();
++    indexFacetSingleValued();
++    indexFacetPrefixMultiValued();
++    indexFacetPrefixSingleValued();
++    
++   Collections.shuffle(pendingDocs, rand);
++    for (String[] doc : pendingDocs) {
++      assertU(adoc(doc));
++      randomCommit(random_commit_percent);
++    }
++    assertU(commit());
++  }
++
++  static void indexSimpleFacetCounts() {
++    add_doc("id", "42", "trait_s", "Tool", "trait_s", "Obnoxious",
++                 "name", "Zapp Brannigan");
++    add_doc("id", "43" ,
++                 "title", "Democratic Order of Planets");
++    add_doc("id", "44", "trait_s", "Tool",
++                 "name", "The Zapper");
++    add_doc("id", "45", "trait_s", "Chauvinist",
++                 "title", "25 star General");
++    add_doc("id", "46", "trait_s", "Obnoxious",
++                 "subject", "Defeated the pacifists of the Gandhi nebula");
++    add_doc("id", "47", "trait_s", "Pig",
++                 "text", "line up and fly directly at the enemy death cannons, clogging them with wreckage!");   
+   }
+ 
+   @Test
+   public void testSimpleFacetCounts() {
+-    assertU(adoc("id", "42", "trait_s", "Tool", "trait_s", "Obnoxious",
+-                 "name", "Zapp Brannigan"));
+-    assertU(adoc("id", "43" ,
+-                 "title", "Democratic Order of Planets"));
+-    assertU(commit());
+-    assertU(adoc("id", "44", "trait_s", "Tool",
+-                 "name", "The Zapper"));
+-    assertU(adoc("id", "45", "trait_s", "Chauvinist",
+-                 "title", "25 star General"));
+-    assertU(adoc("id", "46", "trait_s", "Obnoxious",
+-                 "subject", "Defeated the pacifists of the Gandhi nebula"));
+-    assertU(commit());
+-    assertU(adoc("id", "47", "trait_s", "Pig",
+-                 "text", "line up and fly directly at the enemy death cannons, clogging them with wreckage!"));
+-    assertU(commit());
+  
+     assertQ("standard request handler returns all matches",
+             req("id:[42 TO 47]"),
+@@ -217,29 +258,31 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+ 
+   }
+ 
++  public static void indexDateFacets() {
++    final String f = "bday";
++    final String pre = "//lst[@name='facet_dates']/lst[@name='"+f+"']";
++
++    add_doc("id", "201",  f, "1976-07-04T12:08:56.235Z");
++    add_doc("id", "202",  f, "1976-07-05T00:00:00.000Z");
++    add_doc("id", "203",  f, "1976-07-15T00:07:67.890Z");
++    add_doc("id", "204",  f, "1976-07-21T00:07:67.890Z");
++    add_doc("id", "205",  f, "1976-07-13T12:12:25.255Z");
++    add_doc("id", "206",  f, "1976-07-03T17:01:23.456Z");
++    add_doc("id", "207",  f, "1976-07-12T12:12:25.255Z");
++    add_doc("id", "208",  f, "1976-07-15T15:15:15.155Z");
++    add_doc("id", "209",  f, "1907-07-12T13:13:23.235Z");
++    add_doc("id", "2010", f, "1976-07-03T11:02:45.678Z");
++    add_doc("id", "2011", f, "1907-07-12T12:12:25.255Z");
++    add_doc("id", "2012", f, "2007-07-30T07:07:07.070Z");
++    add_doc("id", "2013", f, "1976-07-30T22:22:22.222Z");
++    add_doc("id", "2014", f, "1976-07-05T22:22:22.222Z");
++  }
++
+   @Test
+   public void testDateFacets() {
+     final String f = "bday";
+     final String pre = "//lst[@name='facet_dates']/lst[@name='"+f+"']";
+ 
+-    assertU(adoc("id", "1",  f, "1976-07-04T12:08:56.235Z"));
+-    assertU(adoc("id", "2",  f, "1976-07-05T00:00:00.000Z"));
+-    assertU(adoc("id", "3",  f, "1976-07-15T00:07:67.890Z"));
+-    assertU(commit());
+-    assertU(adoc("id", "4",  f, "1976-07-21T00:07:67.890Z"));
+-    assertU(adoc("id", "5",  f, "1976-07-13T12:12:25.255Z"));
+-    assertU(adoc("id", "6",  f, "1976-07-03T17:01:23.456Z"));
+-    assertU(adoc("id", "7",  f, "1976-07-12T12:12:25.255Z"));
+-    assertU(adoc("id", "8",  f, "1976-07-15T15:15:15.155Z"));
+-    assertU(adoc("id", "9",  f, "1907-07-12T13:13:23.235Z"));
+-    assertU(adoc("id", "10", f, "1976-07-03T11:02:45.678Z"));
+-    assertU(commit());
+-    assertU(adoc("id", "11", f, "1907-07-12T12:12:25.255Z"));
+-    assertU(adoc("id", "12", f, "2007-07-30T07:07:07.070Z"));
+-    assertU(adoc("id", "13", f, "1976-07-30T22:22:22.222Z"));
+-    assertU(adoc("id", "14", f, "1976-07-05T22:22:22.222Z"));
+-    assertU(commit());
+-
+     assertQ("check counts for month of facet by day",
+             req( "q", "*:*"
+                 ,"rows", "0"
+@@ -389,43 +432,40 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+     
+   }
+ 
+-  @Test
+-  public void testFacetMultiValued() {
+-    doFacetPrefix("t_s", "facet.method","enum");
+-    doFacetPrefix("t_s", "facet.method", "enum", "facet.enum.cache.minDf", "2");
+-    doFacetPrefix("t_s", "facet.method", "enum", "facet.enum.cache.minDf", "100");
+-    doFacetPrefix("t_s", "facet.method", "fc");
++  static void indexFacetSingleValued() {
++    indexFacets("40","t_s1");
+   }
+ 
+   @Test
+   public void testFacetSingleValued() {
+     doFacets("t_s1");
++    doFacets("t_s1","facet.method","fcs");
++  }
++
++  static void indexFacets(String idPrefix, String f) {
++    add_doc("id", idPrefix+"1",  f, "A");
++    add_doc("id", idPrefix+"2",  f, "B");
++    add_doc("id", idPrefix+"3",  f, "C");
++    add_doc("id", idPrefix+"4",  f, "C");
++    add_doc("id", idPrefix+"5",  f, "D");
++    add_doc("id", idPrefix+"6",  f, "E");
++    add_doc("id", idPrefix+"7",  f, "E");
++    add_doc("id", idPrefix+"8",  f, "E");
++    add_doc("id", idPrefix+"9",  f, "F");
++    add_doc("id", idPrefix+"10", f, "G");
++    add_doc("id", idPrefix+"11", f, "G");
++    add_doc("id", idPrefix+"12", f, "G");
++    add_doc("id", idPrefix+"13", f, "G");
++    add_doc("id", idPrefix+"14", f, "G");
+   }
+ 
+   public void doFacets(String f, String... params) {
+     String pre = "//lst[@name='"+f+"']";
+     String notc = "id:[* TO *] -"+f+":C";
+ 
+-    assertU(adoc("id", "1",  f, "A"));
+-    assertU(adoc("id", "2",  f, "B"));
+-    assertU(commit());
+-    assertU(adoc("id", "3",  f, "C"));
+-    assertU(adoc("id", "4",  f, "C"));
+-    assertU(adoc("id", "5",  f, "D"));
+-    assertU(adoc("id", "6",  f, "E"));
+-    assertU(adoc("id", "7",  f, "E"));
+-    assertU(adoc("id", "8",  f, "E"));
+-    assertU(adoc("id", "9",  f, "F"));
+-    assertU(commit());
+-    assertU(adoc("id", "10", f, "G"));
+-    assertU(adoc("id", "11", f, "G"));
+-    assertU(adoc("id", "12", f, "G"));
+-    assertU(adoc("id", "13", f, "G"));
+-    assertU(adoc("id", "14", f, "G"));
+-    assertU(commit());
+ 
+     assertQ("check counts for unlimited facet",
+-            req(params, "q", "id:[* TO *]"
++            req(params, "q", "id:[* TO *]", "indent","true"
+                 ,"facet", "true"
+                 ,"facet.field", f
+                 )
+@@ -566,47 +606,60 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+   }
+ 
+ 
++  static void indexFacetPrefixMultiValued() {
++    indexFacetPrefix("50","t_s");
++  }
++
+   @Test
+   public void testFacetPrefixMultiValued() {
+-    doFacetPrefix("t_s", "facet.method","enum");
+-    doFacetPrefix("t_s", "facet.method", "enum", "facet.enum.cache.minDf", "3");
+-    doFacetPrefix("t_s", "facet.method", "enum", "facet.enum.cache.minDf", "100");
+-    doFacetPrefix("t_s", "facet.method", "fc");
++    doFacetPrefix("t_s", null, "facet.method","enum");
++    doFacetPrefix("t_s", null, "facet.method", "enum", "facet.enum.cache.minDf", "3");
++    doFacetPrefix("t_s", null, "facet.method", "enum", "facet.enum.cache.minDf", "100");
++    doFacetPrefix("t_s", null, "facet.method", "fc");
++  }
++
++  static void indexFacetPrefixSingleValued() {
++    indexFacetPrefix("60","tt_s1");
+   }
+ 
+   @Test
+   public void testFacetPrefixSingleValued() {
+-    doFacetPrefix("t_s1");
++    doFacetPrefix("tt_s1", null);
++    doFacetPrefix("tt_s1", null, "facet.method","fcs");
++    doFacetPrefix("tt_s1", "{!threads=0}", "facet.method","fcs");   // direct execution
++    doFacetPrefix("tt_s1", "{!threads=-1}", "facet.method","fcs");  // default / unlimited threads
++    doFacetPrefix("tt_s1", "{!threads=2}", "facet.method","fcs");   // specific number of threads
+   }
+ 
+-  public void doFacetPrefix(String f, String... params) {
++
++  static void indexFacetPrefix(String idPrefix, String f) {
++    add_doc("id", idPrefix+"1",  f, "AAA");
++    add_doc("id", idPrefix+"2",  f, "B");
++    add_doc("id", idPrefix+"3",  f, "BB");
++    add_doc("id", idPrefix+"4",  f, "BB");
++    add_doc("id", idPrefix+"5",  f, "BBB");
++    add_doc("id", idPrefix+"6",  f, "BBB");
++    add_doc("id", idPrefix+"7",  f, "BBB");
++    add_doc("id", idPrefix+"8",  f, "CC");
++    add_doc("id", idPrefix+"9",  f, "CC");
++    add_doc("id", idPrefix+"10", f, "CCC");
++    add_doc("id", idPrefix+"11", f, "CCC");
++    add_doc("id", idPrefix+"12", f, "CCC");
++    assertU(commit());
++  }
++
++  public void doFacetPrefix(String f, String local, String... params) {
+     String indent="on";
+     String pre = "//lst[@name='"+f+"']";
+     String notc = "id:[* TO *] -"+f+":C";
++    String lf = local==null ? f : local+f;
+ 
+-    assertU(adoc("id", "1",  f, "AAA"));
+-    assertU(adoc("id", "2",  f, "B"));
+-    assertU(adoc("id", "3",  f, "BB"));
+-    assertU(adoc("id", "4",  f, "BB"));
+-    assertU(commit());
+-    assertU(adoc("id", "5",  f, "BBB"));
+-    assertU(adoc("id", "6",  f, "BBB"));
+-    assertU(commit());
+-    assertU(adoc("id", "7",  f, "BBB"));
+-    assertU(adoc("id", "8",  f, "CC"));
+-    assertU(adoc("id", "9",  f, "CC"));
+-    assertU(commit());
+-    assertU(adoc("id", "10", f, "CCC"));
+-    assertU(adoc("id", "11", f, "CCC"));
+-    assertU(commit());    
+-    assertU(adoc("id", "12", f, "CCC"));
+-    assertU(commit());
+ 
+     assertQ("test facet.prefix middle, exact match first term",
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -623,7 +676,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -641,7 +694,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -659,7 +712,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","1"
+                     ,"facet.limit","100"
+@@ -675,7 +728,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","1"
+                     ,"facet.limit","1"
+@@ -690,7 +743,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","1"
+                     ,"facet.limit","1"
+@@ -705,7 +758,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -721,7 +774,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -737,7 +790,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -751,7 +804,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","1"
+                     ,"facet.limit","-1"
+@@ -765,7 +818,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -779,7 +832,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -793,7 +846,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -807,7 +860,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","0"
+                     ,"facet.limit","100"
+@@ -821,7 +874,7 @@ public class SimpleFacetsTest extends SolrTestCaseJ4 {
+             req(params, "q", "id:[* TO *]"
+                     ,"indent",indent
+                     ,"facet","true"
+-                    ,"facet.field", f
++                    ,"facet.field", lf
+                     ,"facet.mincount","0"
+                     ,"facet.offset","2"
+                     ,"facet.limit","100"
+

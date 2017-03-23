@@ -1,0 +1,1168 @@
+GitDiffStart: aa5227c99f2c9e12aedd383a1dceefb18107ecb1 | Wed Oct 8 15:28:42 2014 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 3d1cf11..5a77324 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -152,6 +152,11 @@ New Features
+   this property from all other replicas within a particular slice. 
+   (Erick Erickson)
+ 
++* SOLR-6513: Add a collectionsAPI call BALANCESLICEUNIQUE. Allows the even
++  distribution of custom replica properties across nodes making up a 
++  collection, at most one node per slice will have the property.
++
++
+ Bug Fixes
+ ----------------------
+ 
+diff --git a/solr/core/src/java/org/apache/solr/cloud/Overseer.java b/solr/core/src/java/org/apache/solr/cloud/Overseer.java
+index 366724f..39075bb 100644
+--- a/solr/core/src/java/org/apache/solr/cloud/Overseer.java
++++ b/solr/core/src/java/org/apache/solr/cloud/Overseer.java
+@@ -18,7 +18,11 @@ package org.apache.solr.cloud;
+  */
+ 
+ import static java.util.Collections.singletonMap;
++import static org.apache.solr.cloud.OverseerCollectionProcessor.SLICE_UNIQUE;
+ import static org.apache.solr.common.cloud.ZkNodeProps.makeMap;
++import static org.apache.solr.cloud.OverseerCollectionProcessor.ONLY_ACTIVE_NODES;
++import static org.apache.solr.cloud.OverseerCollectionProcessor.COLL_PROP_PREFIX;
++import static org.apache.solr.common.params.CollectionParams.CollectionAction.BALANCESLICEUNIQUE;
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
+@@ -26,12 +30,15 @@ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.ListIterator;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Map.Entry;
++import java.util.Random;
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -448,6 +455,13 @@ public class Overseer implements Closeable {
+           case DELETEREPLICAPROP:
+             clusterState = deleteReplicaProp(clusterState, message);
+             break;
++          case BALANCESLICEUNIQUE:
++            ExclusiveSliceProperty dProp = new ExclusiveSliceProperty(this, clusterState, message);
++            if (dProp.balanceProperty()) {
++              String collName = message.getStr(ZkStateReader.COLLECTION_PROP);
++              clusterState = newState(clusterState, singletonMap(collName, dProp.getDocCollection()));
++            }
++            break;
+           default:
+             throw new RuntimeException("unknown operation:" + operation
+                 + " contents:" + message.getProperties());
+@@ -532,9 +546,10 @@ public class Overseer implements Closeable {
+       String sliceName = message.getStr(ZkStateReader.SHARD_ID_PROP);
+       String replicaName = message.getStr(ZkStateReader.REPLICA_PROP);
+       String property = message.getStr(ZkStateReader.PROPERTY_PROP).toLowerCase(Locale.ROOT);
+-      if (property.startsWith(OverseerCollectionProcessor.COLL_PROP_PREFIX) == false) {
++      if (StringUtils.startsWith(property, COLL_PROP_PREFIX) == false) {
+         property = OverseerCollectionProcessor.COLL_PROP_PREFIX + property;
+       }
++      property = property.toLowerCase(Locale.ROOT);
+       String propVal = message.getStr(ZkStateReader.PROPERTY_VALUE_PROP);
+       String sliceUnique = message.getStr(OverseerCollectionProcessor.SLICE_UNIQUE);
+ 
+@@ -593,7 +608,7 @@ public class Overseer implements Closeable {
+       String sliceName = message.getStr(ZkStateReader.SHARD_ID_PROP);
+       String replicaName = message.getStr(ZkStateReader.REPLICA_PROP);
+       String property = message.getStr(ZkStateReader.PROPERTY_PROP).toLowerCase(Locale.ROOT);
+-      if (property.startsWith(OverseerCollectionProcessor.COLL_PROP_PREFIX) == false) {
++      if (StringUtils.startsWith(property, COLL_PROP_PREFIX) == false) {
+         property = OverseerCollectionProcessor.COLL_PROP_PREFIX + property;
+       }
+ 
+@@ -934,8 +949,16 @@ public class Overseer implements Closeable {
+         // System.out.println("########## UPDATE MESSAGE: " + JSONUtil.toJSON(message));
+         if (slice != null) {
+           Replica oldReplica = slice.getReplicasMap().get(coreNodeName);
+-          if (oldReplica != null && oldReplica.containsKey(ZkStateReader.LEADER_PROP)) {
+-            replicaProps.put(ZkStateReader.LEADER_PROP, oldReplica.get(ZkStateReader.LEADER_PROP));
++          if (oldReplica != null) {
++            if (oldReplica.containsKey(ZkStateReader.LEADER_PROP)) {
++              replicaProps.put(ZkStateReader.LEADER_PROP, oldReplica.get(ZkStateReader.LEADER_PROP));
++            }
++            // Move custom props over.
++            for (Map.Entry<String, Object> ent : oldReplica.getProperties().entrySet()) {
++              if (ent.getKey().startsWith(COLL_PROP_PREFIX)) {
++                replicaProps.put(ent.getKey(), ent.getValue());
++              }
++            }
+           }
+         }
+ 
+@@ -1146,7 +1169,7 @@ public class Overseer implements Closeable {
+         return null;
+       }
+ 
+-      private ClusterState updateSlice(ClusterState state, String collectionName, Slice slice) {
++    ClusterState updateSlice(ClusterState state, String collectionName, Slice slice) {
+         // System.out.println("###!!!### OLD CLUSTERSTATE: " + JSONUtil.toJSON(state.getCollectionStates()));
+         // System.out.println("Updating slice:" + slice);
+         DocCollection newCollection = null;
+@@ -1374,6 +1397,307 @@ public class Overseer implements Closeable {
+ 
+   }
+ 
++  // Class to encapsulate processing replica properties that have at most one replica hosting a property per slice.
++  private class ExclusiveSliceProperty {
++    private ClusterStateUpdater updater;
++    private ClusterState clusterState;
++    private final boolean onlyActiveNodes;
++    private final String property;
++    private final DocCollection collection;
++    private final String collectionName;
++
++    // Key structure. For each node, list all replicas on it regardless of whether they have the property or not.
++    private final Map<String, List<SliceReplica>> nodesHostingReplicas = new HashMap<>();
++    // Key structure. For each node, a list of the replicas _currently_ hosting the property.
++    private final Map<String, List<SliceReplica>> nodesHostingProp = new HashMap<>();
++    Set<String> shardsNeedingHosts = new HashSet<String>();
++    Map<String, Slice> changedSlices = new HashMap<>(); // Work on copies rather than the underlying cluster state.
++
++    private int origMaxPropPerNode = 0;
++    private int origModulo = 0;
++    private int tmpMaxPropPerNode = 0;
++    private int tmpModulo = 0;
++    Random rand = new Random();
++
++    private int assigned = 0;
++
++    ExclusiveSliceProperty(ClusterStateUpdater updater, ClusterState clusterState, ZkNodeProps message) {
++      this.updater = updater;
++      this.clusterState = clusterState;
++      String tmp = message.getStr(ZkStateReader.PROPERTY_PROP);
++      if (StringUtils.startsWith(tmp, OverseerCollectionProcessor.COLL_PROP_PREFIX) == false) {
++        tmp = OverseerCollectionProcessor.COLL_PROP_PREFIX + tmp;
++      }
++      this.property = tmp.toLowerCase(Locale.ROOT);
++      collectionName = message.getStr(ZkStateReader.COLLECTION_PROP);
++
++      if (StringUtils.isBlank(collectionName) || StringUtils.isBlank(property)) {
++        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
++            "Overseer '" + message.getStr(QUEUE_OPERATION) + "'  requires both the '" + ZkStateReader.COLLECTION_PROP + "' and '" +
++                ZkStateReader.PROPERTY_PROP + "' parameters. No action taken ");
++      }
++
++      Boolean sliceUnique = Boolean.parseBoolean(message.getStr(SLICE_UNIQUE));
++      if (sliceUnique == false &&
++          Overseer.sliceUniqueBooleanProperties.contains(this.property) == false) {
++        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Balancing properties amongst replicas in a slice requires that"
++            + " the property be a pre-defined property (e.g. 'preferredLeader') or that 'sliceUnique' be set to 'true' " +
++            " Property: " + this.property + " sliceUnique: " + Boolean.toString(sliceUnique));
++      }
++
++      collection = clusterState.getCollection(collectionName);
++      if (collection == null) {
++        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
++            "Could not find collection ' " + collectionName + "' for overseer operation '" +
++                message.getStr(QUEUE_OPERATION) + "'. No action taken.");
++      }
++      onlyActiveNodes = Boolean.parseBoolean(message.getStr(ONLY_ACTIVE_NODES, "true"));
++    }
++
++
++    private DocCollection getDocCollection() {
++      return collection;
++    }
++
++    private boolean isActive(Replica replica) {
++      return ZkStateReader.ACTIVE.equals(replica.getStr(ZkStateReader.STATE_PROP));
++    }
++
++    // Collect a list of all the nodes that _can_ host the indicated property. Along the way, also collect any of
++    // the replicas on that node that _already_ host the property as well as any slices that do _not_ have the
++    // property hosted.
++    //
++    // Return true if anything node needs it's property reassigned. False if the property is already balanced for
++    // the collection.
++
++    private boolean collectCurrentPropStats() {
++      int maxAssigned = 0;
++      // Get a list of potential replicas that can host the property _and_ their counts
++      // Move any obvious entries to a list of replicas to change the property on
++      Set<String> allHosts = new HashSet<>();
++      for (Slice slice : collection.getSlices()) {
++        boolean sliceHasProp = false;
++        for (Replica replica : slice.getReplicas()) {
++          if (onlyActiveNodes && isActive(replica) == false) {
++            if (StringUtils.isNotBlank(replica.getStr(property))) {
++              removeProp(slice, replica.getName()); // Note, we won't be committing this to ZK until later.
++            }
++            continue;
++          }
++          allHosts.add(replica.getNodeName());
++          String nodeName = replica.getNodeName();
++          if (StringUtils.isNotBlank(replica.getStr(property))) {
++            if (sliceHasProp) {
++              throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
++                  "'" + BALANCESLICEUNIQUE + "' should only be called for properties that have at most one member " +
++                      "in any slice with the property set. No action taken.");
++            }
++            if (nodesHostingProp.containsKey(nodeName) == false) {
++              nodesHostingProp.put(nodeName, new ArrayList<SliceReplica>());
++            }
++            nodesHostingProp.get(nodeName).add(new SliceReplica(slice, replica));
++            ++assigned;
++            maxAssigned = Math.max(maxAssigned, nodesHostingProp.get(nodeName).size());
++            sliceHasProp = true;
++          }
++          if (nodesHostingReplicas.containsKey(nodeName) == false) {
++            nodesHostingReplicas.put(nodeName, new ArrayList<SliceReplica>());
++          }
++          nodesHostingReplicas.get(nodeName).add(new SliceReplica(slice, replica));
++        }
++      }
++
++      // If the total number of already-hosted properties assigned to nodes
++      // that have potential to host leaders is equal to the slice count _AND_ none of the current nodes has more than
++      // the max number of properties, there's nothing to do.
++      origMaxPropPerNode = collection.getSlices().size() / allHosts.size();
++
++      // Some nodes can have one more of the proeprty if the numbers aren't exactly even.
++      origModulo = collection.getSlices().size() % allHosts.size();
++      if (origModulo > 0) {
++        origMaxPropPerNode++;  // have to have some nodes with 1 more property.
++      }
++
++      // We can say for sure that we need to rebalance if we don't have as many assigned properties as slices.
++      if (assigned != collection.getSlices().size()) {
++        return true;
++      }
++
++      // Make sure there are no more slices at the limit than the "leftovers"
++      // Let's say there's 7 slices and 3 nodes. We need to distribute the property as 3 on node1, 2 on node2 and 2 on node3
++      // (3, 2, 2) We need to be careful to not distribute them as 3, 3, 1. that's what this check is all about.
++      int counter = origModulo;
++      for (List<SliceReplica> list : nodesHostingProp.values()) {
++        if (list.size() == origMaxPropPerNode) --counter;
++      }
++      if (counter == 0) return false; // nodes with 1 extra leader are exactly the needed number
++
++      return true;
++    }
++
++    private void removeSliceAlreadyHostedFromPossibles(String sliceName) {
++      for (Map.Entry<String, List<SliceReplica>> entReplica : nodesHostingReplicas.entrySet()) {
++
++        ListIterator<SliceReplica> iter = entReplica.getValue().listIterator();
++        while (iter.hasNext()) {
++          SliceReplica sr = iter.next();
++          if (sr.slice.getName().equals(sliceName))
++            iter.remove();
++        }
++      }
++    }
++
++    private void balanceUnassignedReplicas() {
++      tmpMaxPropPerNode = origMaxPropPerNode; // A bit clumsy, but don't want to duplicate code.
++      tmpModulo = origModulo;
++
++      // Get the nodeName and shardName for the node that has the least room for this
++
++      while (shardsNeedingHosts.size() > 0) {
++        String nodeName = "";
++        int minSize = Integer.MAX_VALUE;
++        SliceReplica srToChange = null;
++        for (String slice : shardsNeedingHosts) {
++          for (Map.Entry<String, List<SliceReplica>> ent : nodesHostingReplicas.entrySet()) {
++            // A little tricky. If we don't set this to something below, then it means all possible places to
++            // put this property are full up, so just put it somewhere.
++            if (srToChange == null && ent.getValue().size() > 0) {
++              srToChange = ent.getValue().get(0);
++            }
++            ListIterator<SliceReplica> iter = ent.getValue().listIterator();
++            while (iter.hasNext()) {
++              SliceReplica sr = iter.next();
++              if (StringUtils.equals(slice, sr.slice.getName()) == false) {
++                continue;
++              }
++              if (nodesHostingProp.containsKey(ent.getKey()) == false) {
++                nodesHostingProp.put(ent.getKey(), new ArrayList<SliceReplica>());
++              }
++              if (minSize > nodesHostingReplicas.get(ent.getKey()).size() && nodesHostingProp.get(ent.getKey()).size() < tmpMaxPropPerNode) {
++                minSize = nodesHostingReplicas.get(ent.getKey()).size();
++                srToChange = sr;
++                nodeName = ent.getKey();
++              }
++            }
++          }
++        }
++        // Now, you have a slice and node to put it on
++        shardsNeedingHosts.remove(srToChange.slice.getName());
++        if (nodesHostingProp.containsKey(nodeName) == false) {
++          nodesHostingProp.put(nodeName, new ArrayList<SliceReplica>());
++        }
++        nodesHostingProp.get(nodeName).add(srToChange);
++        adjustLimits(nodesHostingProp.get(nodeName));
++        removeSliceAlreadyHostedFromPossibles(srToChange.slice.getName());
++        addProp(srToChange.slice, srToChange.replica.getName());
++      }
++    }
++
++    // Adjust the min/max counts per allowed per node. Special handling here for dealing with the fact
++    // that no node should have more than 1 more replica with this property than any other.
++    private void adjustLimits(List<SliceReplica> changeList) {
++      if (changeList.size() == tmpMaxPropPerNode) {
++        if (tmpModulo < 0) return;
++
++        --tmpModulo;
++        if (tmpModulo == 0) {
++          --tmpMaxPropPerNode;
++          --tmpModulo;  // Prevent dropping tmpMaxPropPerNode again.
++        }
++      }
++    }
++
++    // Go through the list of presently-hosted proeprties and remove any that have too many replicas that host the property
++    private void removeOverallocatedReplicas() {
++      tmpMaxPropPerNode = origMaxPropPerNode; // A bit clumsy, but don't want to duplicate code.
++      tmpModulo = origModulo;
++
++      for (Map.Entry<String, List<SliceReplica>> ent : nodesHostingProp.entrySet()) {
++        while (ent.getValue().size() > tmpMaxPropPerNode) { // remove delta nodes
++          ent.getValue().remove(rand.nextInt(ent.getValue().size()));
++        }
++        adjustLimits(ent.getValue());
++      }
++    }
++
++    private void removeProp(Slice origSlice, String replicaName) {
++      getReplicaFromChanged(origSlice, replicaName).getProperties().remove(property);
++    }
++
++    private void addProp(Slice origSlice, String replicaName) {
++      getReplicaFromChanged(origSlice, replicaName).getProperties().put(property, "true");
++    }
++
++    // Just a place to encapsulate the fact that we need to have new slices (copy) to update before we
++    // put this all in the cluster state.
++    private Replica getReplicaFromChanged(Slice origSlice, String replicaName) {
++      Slice newSlice = changedSlices.get(origSlice.getName());
++      Replica replica;
++      if (newSlice != null) {
++        replica = newSlice.getReplica(replicaName);
++      } else {
++        newSlice = new Slice(origSlice.getName(), origSlice.getReplicasCopy(), origSlice.shallowCopy());
++        changedSlices.put(origSlice.getName(), newSlice);
++        replica = newSlice.getReplica(replicaName);
++      }
++      if (replica == null) {
++        throw new SolrException(SolrException.ErrorCode.INVALID_STATE, "Should have been able to find replica '" +
++            replicaName + "' in slice '" + origSlice.getName() + "'. No action taken");
++      }
++      return replica;
++
++    }
++    // Main entry point for carrying out the action. Returns "true" if we have actually moved properties around.
++
++    private boolean balanceProperty() {
++      if (collectCurrentPropStats() == false) {
++        return false;
++      }
++
++      // we have two lists based on nodeName
++      // 1> all the nodes that _could_ host a property for the slice
++      // 2> all the nodes that _currently_ host a property for the slice.
++
++      // So, remove a replica from the nodes that have too many
++      removeOverallocatedReplicas();
++
++      // prune replicas belonging to a slice that have the property currently assigned from the list of replicas
++      // that could host the property.
++      for (Map.Entry<String, List<SliceReplica>> entProp : nodesHostingProp.entrySet()) {
++        for (SliceReplica srHosting : entProp.getValue()) {
++          removeSliceAlreadyHostedFromPossibles(srHosting.slice.getName());
++        }
++      }
++
++      // Assemble the list of slices that do not have any replica hosting the property:
++      for (Map.Entry<String, List<SliceReplica>> ent : nodesHostingReplicas.entrySet()) {
++        ListIterator<SliceReplica> iter = ent.getValue().listIterator();
++        while (iter.hasNext()) {
++          SliceReplica sr = iter.next();
++          shardsNeedingHosts.add(sr.slice.getName());
++        }
++      }
++
++      // At this point, nodesHostingProp should contain _only_ lists of replicas that belong to slices that do _not_
++      // have any replica hosting the property. So let's assign them.
++
++      balanceUnassignedReplicas();
++      for (Slice newSlice : changedSlices.values()) {
++        clusterState = updater.updateSlice(clusterState, collectionName, newSlice);
++      }
++      return true;
++    }
++  }
++
++  private class SliceReplica {
++    private Slice slice;
++    private Replica replica;
++
++    SliceReplica(Slice slice, Replica replica) {
++      this.slice = slice;
++      this.replica = replica;
++    }
++  }
+   static void getShardNames(Integer numShards, List<String> shardNames) {
+     if(numShards == null)
+       throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "numShards" + " is a required param");
+diff --git a/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java b/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java
+index 01e7405..4f8ab05 100644
+--- a/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java
++++ b/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java
+@@ -26,6 +26,7 @@ import static org.apache.solr.common.cloud.ZkStateReader.SHARD_ID_PROP;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.ADDREPLICA;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.ADDREPLICAPROP;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.ADDROLE;
++import static org.apache.solr.common.params.CollectionParams.CollectionAction.BALANCESLICEUNIQUE;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.CLUSTERSTATUS;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.CREATE;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.CREATESHARD;
+@@ -154,6 +155,8 @@ public class OverseerCollectionProcessor implements Runnable, Closeable {
+ 
+   public static final String SLICE_UNIQUE = "sliceUnique";
+ 
++  public static final String ONLY_ACTIVE_NODES = "onlyactivenodes";
++
+   public int maxParallelThreads = 10;
+ 
+   public static final Set<String> KNOWN_CLUSTER_PROPS = ImmutableSet.of(ZkStateReader.LEGACY_CLOUD, ZkStateReader.URL_SCHEME);
+@@ -645,6 +648,9 @@ public class OverseerCollectionProcessor implements Runnable, Closeable {
+           case DELETEREPLICAPROP:
+             processReplicaDeletePropertyCommand(message);
+             break;
++          case BALANCESLICEUNIQUE:
++            balanceProperty(message);
++            break;
+           default:
+             throw new SolrException(ErrorCode.BAD_REQUEST, "Unknown operation:"
+                 + operation);
+@@ -708,6 +714,21 @@ public class OverseerCollectionProcessor implements Runnable, Closeable {
+     inQueue.offer(ZkStateReader.toJSON(m));
+   }
+ 
++  private void balanceProperty(ZkNodeProps message) throws KeeperException, InterruptedException {
++    if (StringUtils.isBlank(message.getStr(COLLECTION_PROP)) || StringUtils.isBlank(message.getStr(PROPERTY_PROP))) {
++      throw new SolrException(ErrorCode.BAD_REQUEST,
++          "The '" + COLLECTION_PROP + "' and '" + PROPERTY_PROP +
++              "' parameters are required for the BALANCESLICEUNIQUE operation, no action taken");
++    }
++    SolrZkClient zkClient = zkStateReader.getZkClient();
++    DistributedQueue inQueue = Overseer.getInQueue(zkClient);
++    Map<String, Object> propMap = new HashMap<>();
++    propMap.put(Overseer.QUEUE_OPERATION, BALANCESLICEUNIQUE.toLower());
++    propMap.putAll(message.getProperties());
++    inQueue.offer(ZkStateReader.toJSON(new ZkNodeProps(propMap)));
++  }
++
++
+   @SuppressWarnings("unchecked")
+   private void getOverseerStatus(ZkNodeProps message, NamedList results) throws KeeperException, InterruptedException {
+     String leaderNode = getLeaderNode(zkStateReader.getZkClient());
+diff --git a/solr/core/src/java/org/apache/solr/handler/admin/CollectionsHandler.java b/solr/core/src/java/org/apache/solr/handler/admin/CollectionsHandler.java
+index b5a3731..1537772 100644
+--- a/solr/core/src/java/org/apache/solr/handler/admin/CollectionsHandler.java
++++ b/solr/core/src/java/org/apache/solr/handler/admin/CollectionsHandler.java
+@@ -23,6 +23,7 @@ import static org.apache.solr.cloud.OverseerCollectionProcessor.COLL_CONF;
+ import static org.apache.solr.cloud.OverseerCollectionProcessor.CREATE_NODE_SET;
+ import static org.apache.solr.cloud.OverseerCollectionProcessor.SLICE_UNIQUE;
+ import static org.apache.solr.cloud.OverseerCollectionProcessor.NUM_SLICES;
++import static org.apache.solr.cloud.OverseerCollectionProcessor.ONLY_ACTIVE_NODES;
+ import static org.apache.solr.cloud.OverseerCollectionProcessor.ONLY_IF_DOWN;
+ import static org.apache.solr.cloud.OverseerCollectionProcessor.REPLICATION_FACTOR;
+ import static org.apache.solr.cloud.OverseerCollectionProcessor.REQUESTID;
+@@ -37,6 +38,7 @@ import static org.apache.solr.common.cloud.ZkStateReader.MAX_SHARDS_PER_NODE;
+ import static org.apache.solr.common.cloud.ZkStateReader.AUTO_ADD_REPLICAS;
+ import static org.apache.solr.common.cloud.ZkStateReader.REPLICA_PROP;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.ADDROLE;
++import static org.apache.solr.common.params.CollectionParams.CollectionAction.BALANCESLICEUNIQUE;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.ADDREPLICAPROP;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.CLUSTERPROP;
+ import static org.apache.solr.common.params.CollectionParams.CollectionAction.CREATE;
+@@ -246,7 +248,10 @@ public class CollectionsHandler extends RequestHandlerBase {
+         this.handleDeleteReplicaProp(req, rsp);
+         break;
+       }
+-
++      case BALANCESLICEUNIQUE: {
++        this.handleBalanceSliceUnique(req, rsp);
++        break;
++      }
+       default: {
+           throw new RuntimeException("Unknown action: " + action);
+       }
+@@ -294,6 +299,27 @@ public class CollectionsHandler extends RequestHandlerBase {
+ 
+ 
+ 
++  private void handleBalanceSliceUnique(SolrQueryRequest req, SolrQueryResponse rsp) throws KeeperException, InterruptedException {
++    req.getParams().required().check(COLLECTION_PROP, PROPERTY_PROP);
++    Boolean sliceUnique = Boolean.parseBoolean(req.getParams().get(SLICE_UNIQUE));
++    String prop = req.getParams().get(PROPERTY_PROP).toLowerCase(Locale.ROOT);
++    if (StringUtils.startsWith(prop, OverseerCollectionProcessor.COLL_PROP_PREFIX) == false) {
++      prop = OverseerCollectionProcessor.COLL_PROP_PREFIX + prop;
++    }
++
++    if (sliceUnique == false &&
++        Overseer.sliceUniqueBooleanProperties.contains(prop) == false) {
++      throw new SolrException(ErrorCode.BAD_REQUEST, "Balancing properties amongst replicas in a slice requires that"
++      + " the property be pre-defined as a unique property (e.g. 'preferredLeader') or that 'sliceUnique' be set to 'true'. " +
++      " Property: " + prop + " sliceUnique: " + Boolean.toString(sliceUnique));
++    }
++
++    Map<String, Object> map = ZkNodeProps.makeMap(Overseer.QUEUE_OPERATION, BALANCESLICEUNIQUE.toLower());
++    copyIfNotNull(req.getParams(), map, COLLECTION_PROP, PROPERTY_PROP, ONLY_ACTIVE_NODES, SLICE_UNIQUE);
++
++    handleResponse(BALANCESLICEUNIQUE.toLower(), new ZkNodeProps(map), rsp);
++  }
++
+   private void handleOverseerStatus(SolrQueryRequest req, SolrQueryResponse rsp) throws KeeperException, InterruptedException {
+     Map<String, Object> props = ZkNodeProps.makeMap(
+         Overseer.QUEUE_OPERATION, OVERSEERSTATUS.toLower());
+diff --git a/solr/core/src/test/org/apache/solr/cloud/ReplicaPropertiesBase.java b/solr/core/src/test/org/apache/solr/cloud/ReplicaPropertiesBase.java
+new file mode 100644
+index 0000000..7246406
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/cloud/ReplicaPropertiesBase.java
+@@ -0,0 +1,178 @@
++package org.apache.solr.cloud;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++
++import org.apache.commons.lang.StringUtils;
++import org.apache.solr.client.solrj.SolrServerException;
++import org.apache.solr.client.solrj.impl.CloudSolrServer;
++import org.apache.solr.client.solrj.request.QueryRequest;
++import org.apache.solr.common.cloud.ClusterState;
++import org.apache.solr.common.cloud.DocCollection;
++import org.apache.solr.common.cloud.Replica;
++import org.apache.solr.common.cloud.Slice;
++import org.apache.solr.common.params.ModifiableSolrParams;
++import org.apache.zookeeper.KeeperException;
++
++// Collect useful operations for testing assigning properties to individual replicas
++// Could probably expand this to do something creative with getting random slices
++// and shards, but for now this will do.
++public abstract class ReplicaPropertiesBase extends AbstractFullDistribZkTestBase {
++
++  void doPropertyAction(CloudSolrServer client, String... paramsIn) throws IOException, SolrServerException {
++    assertTrue("paramsIn must be an even multiple of 2, it is: " + paramsIn.length, (paramsIn.length % 2) == 0);
++    ModifiableSolrParams params = new ModifiableSolrParams();
++    for (int idx = 0; idx < paramsIn.length; idx += 2) {
++      params.set(paramsIn[idx], paramsIn[idx + 1]);
++    }
++    QueryRequest request = new QueryRequest(params);
++    request.setPath("/admin/collections");
++    client.request(request);
++
++  }
++
++  void verifyPropertyNotPresent(CloudSolrServer client, String collectionName, String replicaName,
++                                String property)
++      throws KeeperException, InterruptedException {
++    ClusterState clusterState = null;
++    Replica replica = null;
++    for (int idx = 0; idx < 300; ++idx) {
++      client.getZkStateReader().updateClusterState(true);
++      clusterState = client.getZkStateReader().getClusterState();
++      replica = clusterState.getReplica(collectionName, replicaName);
++      if (replica == null) {
++        fail("Could not find collection/replica pair! " + collectionName + "/" + replicaName);
++      }
++      if (StringUtils.isBlank(replica.getStr(property))) return;
++      Thread.sleep(100);
++    }
++    fail("Property " + property + " not set correctly for collection/replica pair: " +
++        collectionName + "/" + replicaName + ". Replica props: " + replica.getProperties().toString() +
++        ". Cluster state is " + clusterState.toString());
++
++  }
++
++  // The params are triplets,
++  // collection
++  // shard
++  // replica
++  void verifyPropertyVal(CloudSolrServer client, String collectionName,
++                         String replicaName, String property, String val)
++      throws InterruptedException, KeeperException {
++    Replica replica = null;
++    ClusterState clusterState = null;
++
++    for (int idx = 0; idx < 300; ++idx) { // Keep trying while Overseer writes the ZK state for up to 30 seconds.
++      client.getZkStateReader().updateClusterState(true);
++      clusterState = client.getZkStateReader().getClusterState();
++      replica = clusterState.getReplica(collectionName, replicaName);
++      if (replica == null) {
++        fail("Could not find collection/replica pair! " + collectionName + "/" + replicaName);
++      }
++      if (StringUtils.equals(val, replica.getStr(property))) return;
++      Thread.sleep(100);
++    }
++
++    fail("Property '" + property + "' with value " + replica.getStr(property) +
++        " not set correctly for collection/replica pair: " + collectionName + "/" + replicaName + " property map is " +
++        replica.getProperties().toString() + ".");
++
++  }
++
++  // Verify that
++  // 1> the property is only set once in all the replicas in a slice.
++  // 2> the property is balanced evenly across all the nodes hosting collection
++  void verifyUniqueAcrossCollection(CloudSolrServer client, String collectionName,
++                                    String property) throws KeeperException, InterruptedException {
++    verifyUnique(client, collectionName, property, true);
++  }
++
++  void verifyUniquePropertyWithinCollection(CloudSolrServer client, String collectionName,
++                            String property) throws KeeperException, InterruptedException {
++    verifyUnique(client, collectionName, property, false);
++  }
++  void verifyUnique(CloudSolrServer client, String collectionName, String property, boolean balanced)
++      throws KeeperException, InterruptedException {
++
++    DocCollection col = null;
++    for (int idx = 0; idx < 300; ++idx) {
++      client.getZkStateReader().updateClusterState(true);
++      ClusterState clusterState = client.getZkStateReader().getClusterState();
++
++      col = clusterState.getCollection(collectionName);
++      if (col == null) {
++        fail("Could not find collection " + collectionName);
++      }
++      Map<String, Integer> counts = new HashMap<>();
++      Set<String> uniqueNodes = new HashSet<>();
++      boolean allSlicesHaveProp = true;
++      boolean badSlice = false;
++      for (Slice slice : col.getSlices()) {
++        boolean thisSliceHasProp = false;
++        int propCount = 0;
++        for (Replica replica : slice.getReplicas()) {
++          uniqueNodes.add(replica.getNodeName());
++          String propVal = replica.getStr(property);
++          if (StringUtils.isNotBlank(propVal)) {
++            ++propCount;
++            if (counts.containsKey(replica.getNodeName()) == false) {
++              counts.put(replica.getNodeName(), 0);
++            }
++            int count = counts.get(replica.getNodeName());
++            thisSliceHasProp = true;
++            counts.put(replica.getNodeName(), count + 1);
++          }
++        }
++        badSlice = (propCount > 1) ? true : badSlice;
++        allSlicesHaveProp = allSlicesHaveProp ? thisSliceHasProp : allSlicesHaveProp;
++      }
++      if (balanced == false && badSlice == false) {
++        return;
++      }
++      if (allSlicesHaveProp && balanced) {
++        // Check that the properties are evenly distributed.
++        int minProps = col.getSlices().size() / uniqueNodes.size();
++        int maxProps = minProps;
++
++        if (col.getSlices().size() % uniqueNodes.size() > 0) {
++          ++maxProps;
++        }
++        boolean doSleep = false;
++        for (Map.Entry<String, Integer> ent : counts.entrySet()) {
++          if (ent.getValue() != minProps && ent.getValue() != maxProps) {
++            doSleep = true;
++          }
++        }
++
++        if (doSleep == false) {
++          assertTrue("We really shouldn't be calling this if there is no node with the property " + property,
++              counts.size() > 0);
++          return;
++        }
++      }
++      Thread.sleep(100);
++    }
++    fail("Collection " + collectionName + " does not have roles evenly distributed. Collection is: " + col.toString());
++  }
++
++}
+diff --git a/solr/core/src/test/org/apache/solr/cloud/TestCollectionAPI.java b/solr/core/src/test/org/apache/solr/cloud/TestCollectionAPI.java
+index 496158b..0297c8e 100644
+--- a/solr/core/src/test/org/apache/solr/cloud/TestCollectionAPI.java
++++ b/solr/core/src/test/org/apache/solr/cloud/TestCollectionAPI.java
+@@ -19,7 +19,6 @@ package org.apache.solr.cloud;
+ 
+ 
+ import com.google.common.collect.Lists;
+-import org.apache.commons.lang.StringUtils;
+ import org.apache.solr.client.solrj.SolrRequest;
+ import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.client.solrj.impl.CloudSolrServer;
+@@ -45,7 +44,7 @@ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ 
+-public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
++public class TestCollectionAPI extends ReplicaPropertiesBase {
+ 
+   public static final String COLLECTION_NAME = "testcollection";
+   public static final String COLLECTION_NAME1 = "testcollection1";
+@@ -338,9 +337,7 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+ 
+       // The above should have set exactly one preferredleader...
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader", "true");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r2, "property.preferredLeader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r1, "property.preferredLeader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
+ 
+       doPropertyAction(client,
+           "action", CollectionParams.CollectionAction.ADDREPLICAPROP.toString(),
+@@ -351,9 +348,7 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+           "property.value", "true");
+       // The preferred leader property for shard1 should have switched to the other replica.
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.preferredleader", "true");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredLeader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r1, "property.preferredLeader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
+ 
+       doPropertyAction(client,
+           "action", CollectionParams.CollectionAction.ADDREPLICAPROP.toString(),
+@@ -365,9 +360,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+ 
+       // Now we should have a preferred leader in both shards...
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.preferredleader", "true");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
+ 
+       doPropertyAction(client,
+           "action", CollectionParams.CollectionAction.ADDREPLICAPROP.toString(),
+@@ -381,6 +375,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader", "true");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+       doPropertyAction(client,
+           "action", CollectionParams.CollectionAction.DELETEREPLICAPROP.toString(),
+@@ -393,9 +389,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       // But first we have to wait for the overseer to finish the action
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+       // Try adding an arbitrary property to one that has the leader property
+       doPropertyAction(client,
+@@ -409,10 +404,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r1, "property.testprop", "true");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+       doPropertyAction(client,
+           "action", CollectionParams.CollectionAction.ADDREPLICAPROP.toString(),
+@@ -426,10 +419,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r1, "property.testprop", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.prop", "silly");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+       doPropertyAction(client,
+           "action", CollectionParams.CollectionAction.ADDREPLICAPROP.toLower(),
+@@ -444,10 +435,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r1, "property.testprop", "nonsense");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.prop", "silly");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+ 
+       doPropertyAction(client,
+@@ -463,10 +452,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r1, "property.testprop", "true");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.prop", "silly");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+       doPropertyAction(client,
+           "action", CollectionParams.CollectionAction.DELETEREPLICAPROP.toLower(),
+@@ -479,10 +466,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+       verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.testprop");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.prop", "silly");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+       try {
+         doPropertyAction(client,
+@@ -503,10 +488,8 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s2_r1, "property.preferredleader", "true");
+       verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.testprop");
+       verifyPropertyVal(client, COLLECTION_NAME, c1_s1_r2, "property.prop", "silly");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME, c1_s2_r2, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
+-      verifyPropertyNotPresent(client, COLLECTION_NAME1, c2_s1_r1, "property.preferredleader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME, "property.preferredLeader");
++      verifyUniquePropertyWithinCollection(client, COLLECTION_NAME1, "property.preferredLeader");
+ 
+       Map<String, String> origProps = getProps(client, COLLECTION_NAME, c1_s1_r1,
+           "state", "core", "node_name", "base_url");
+@@ -592,68 +575,11 @@ public class TestCollectionAPI extends AbstractFullDistribZkTestBase {
+     }
+   }
+ 
+-  private void doPropertyAction(CloudSolrServer client, String... paramsIn) throws IOException, SolrServerException {
+-    assertTrue("paramsIn must be an even multiple of 2, it is: " + paramsIn.length, (paramsIn.length % 2) == 0);
+-    ModifiableSolrParams params = new ModifiableSolrParams();
+-    for (int idx = 0; idx < paramsIn.length; idx += 2) {
+-      params.set(paramsIn[idx], paramsIn[idx + 1]);
+-    }
+-    QueryRequest request = new QueryRequest(params);
+-    request.setPath("/admin/collections");
+-    client.request(request);
+-
+-  }
+ 
+-  private void verifyPropertyNotPresent(CloudSolrServer client, String collectionName, String replicaName,
+-                                        String property)
++  // Expects the map will have keys, but blank values.
++  private Map<String, String> getProps(CloudSolrServer client, String collectionName, String replicaName, String... props)
+       throws KeeperException, InterruptedException {
+-    ClusterState clusterState = null;
+-    Replica replica = null;
+-    for (int idx = 0; idx < 300; ++idx) {
+-      client.getZkStateReader().updateClusterState(true);
+-      clusterState = client.getZkStateReader().getClusterState();
+-      replica = clusterState.getReplica(collectionName, replicaName);
+-      if (replica == null) {
+-        fail("Could not find collection/replica pair! " + collectionName + "/" + replicaName);
+-      }
+-      if (StringUtils.isBlank(replica.getStr(property))) return;
+-      Thread.sleep(100);
+-    }
+-    fail("Property " + property + " not set correctly for collection/replica pair: " +
+-        collectionName + "/" + replicaName + ". Replica props: " + replica.getProperties().toString() +
+-        ". Cluster state is " + clusterState.toString());
+-
+-  }
+ 
+-  // The params are triplets,
+-  // collection
+-  // shard
+-  // replica
+-  private void verifyPropertyVal(CloudSolrServer client, String collectionName,
+-                                 String replicaName, String property, String val)
+-      throws InterruptedException, KeeperException {
+-    Replica replica = null;
+-    ClusterState clusterState = null;
+-
+-    for (int idx = 0; idx < 300; ++idx) { // Keep trying while Overseer writes the ZK state for up to 30 seconds.
+-      client.getZkStateReader().updateClusterState(true);
+-      clusterState = client.getZkStateReader().getClusterState();
+-      replica = clusterState.getReplica(collectionName, replicaName);
+-      if (replica == null) {
+-        fail("Could not find collection/replica pair! " + collectionName + "/" + replicaName);
+-      }
+-      if (StringUtils.equals(val, replica.getStr(property))) return;
+-      Thread.sleep(100);
+-    }
+-
+-    fail("Property '" + property + "' with value " + replica.getStr(property) +
+-        " not set correctly for collection/replica pair: " + collectionName + "/" + replicaName + " property map is " +
+-        replica.getProperties().toString() + ".");
+-
+-  }
+-
+-  // Expects the map will have keys, but blank values.
+-  private Map<String, String> getProps(CloudSolrServer client, String collectionName, String replicaName, String... props) throws KeeperException, InterruptedException {
+     client.getZkStateReader().updateClusterState(true);
+     ClusterState clusterState = client.getZkStateReader().getClusterState();
+     Replica replica = clusterState.getReplica(collectionName, replicaName);
+diff --git a/solr/core/src/test/org/apache/solr/cloud/TestReplicaProperties.java b/solr/core/src/test/org/apache/solr/cloud/TestReplicaProperties.java
+new file mode 100644
+index 0000000..154f67d
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/cloud/TestReplicaProperties.java
+@@ -0,0 +1,206 @@
++package org.apache.solr.cloud;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.lucene.util.LuceneTestCase.Slow;
++import org.apache.solr.client.solrj.SolrRequest;
++import org.apache.solr.client.solrj.SolrServerException;
++import org.apache.solr.client.solrj.impl.CloudSolrServer;
++import org.apache.solr.client.solrj.request.QueryRequest;
++import org.apache.solr.common.SolrException;
++import org.apache.solr.common.cloud.Slice;
++import org.apache.solr.common.params.CollectionParams;
++import org.apache.solr.common.params.ModifiableSolrParams;
++import org.apache.solr.common.util.NamedList;
++import org.junit.Before;
++
++@Slow
++public class TestReplicaProperties extends ReplicaPropertiesBase {
++
++  public static final String COLLECTION_NAME = "testcollection";
++
++  public TestReplicaProperties() {
++    schemaString = "schema15.xml";      // we need a string id
++  }
++
++  @Override
++  @Before
++  public void setUp() throws Exception {
++    fixShardCount = true;
++    sliceCount = 2;
++    shardCount = 4;
++    super.setUp();
++  }
++
++  @Override
++  public void doTest() throws Exception {
++    CloudSolrServer client = createCloudClient(null);
++    try {
++      // Mix up a bunch of different combinations of shards and replicas in order to exercise boundary cases.
++      // shards, replicationfactor, maxreplicaspernode
++      int shards = random().nextInt(7);
++      if (shards < 2) shards = 2;
++      int rFactor = random().nextInt(3);
++      if (rFactor < 2) rFactor = 2;
++      createCollection(null, COLLECTION_NAME, shards, rFactor, shards * rFactor + 1, client, null, "conf1");
++    } finally {
++      //remove collections
++      client.shutdown();
++    }
++
++    waitForCollection(cloudClient.getZkStateReader(), COLLECTION_NAME, 2);
++    waitForRecoveriesToFinish(COLLECTION_NAME, false);
++
++    listCollection();
++
++    clusterAssignPropertyTest();
++  }
++
++  private void listCollection() throws IOException, SolrServerException {
++    CloudSolrServer client = createCloudClient(null);
++    try {
++      ModifiableSolrParams params = new ModifiableSolrParams();
++      params.set("action", CollectionParams.CollectionAction.LIST.toString());
++      SolrRequest request = new QueryRequest(params);
++      request.setPath("/admin/collections");
++
++      NamedList<Object> rsp = client.request(request);
++      List<String> collections = (List<String>) rsp.get("collections");
++      assertTrue("control_collection was not found in list", collections.contains("control_collection"));
++      assertTrue(DEFAULT_COLLECTION + " was not found in list", collections.contains(DEFAULT_COLLECTION));
++      assertTrue(COLLECTION_NAME + " was not found in list", collections.contains(COLLECTION_NAME));
++    } finally {
++      //remove collections
++      client.shutdown();
++    }
++  }
++
++
++  private void clusterAssignPropertyTest() throws Exception {
++    CloudSolrServer client = createCloudClient(null);
++    try {
++      client.connect();
++      try {
++        doPropertyAction(client,
++            "action", CollectionParams.CollectionAction.BALANCESLICEUNIQUE.toString(),
++            "property", "preferredLeader");
++      } catch (SolrException se) {
++        assertTrue("Should have seen missing required parameter 'collection' error",
++            se.getMessage().contains("Missing required parameter: collection"));
++      }
++
++      doPropertyAction(client,
++          "action", CollectionParams.CollectionAction.BALANCESLICEUNIQUE.toString(),
++          "collection", COLLECTION_NAME,
++          "property", "preferredLeader");
++
++      verifyUniqueAcrossCollection(client, COLLECTION_NAME, "property.preferredleader");
++
++      doPropertyAction(client,
++          "action", CollectionParams.CollectionAction.BALANCESLICEUNIQUE.toString(),
++          "collection", COLLECTION_NAME,
++          "property", "property.newunique",
++          "sliceUnique", "true");
++      verifyUniqueAcrossCollection(client, COLLECTION_NAME, "property.newunique");
++
++      try {
++        doPropertyAction(client,
++            "action", CollectionParams.CollectionAction.BALANCESLICEUNIQUE.toString(),
++            "collection", COLLECTION_NAME,
++            "property", "whatever",
++            "sliceUnique", "false");
++        fail("Should have thrown an exception here.");
++      } catch (SolrException se) {
++        assertTrue("Should have gotten a specific error message here",
++            se.getMessage().contains("Balancing properties amongst replicas in a slice requires that the " +
++                "property be pre-defined as a unique property (e.g. 'preferredLeader') or that 'sliceUnique' be set to 'true'"));
++      }
++      // Should be able to set non-unique-per-slice values in several places.
++      Map<String, Slice> slices = client.getZkStateReader().getClusterState().getCollection(COLLECTION_NAME).getSlicesMap();
++      List<String> sliceList = new ArrayList<>(slices.keySet());
++      String c1_s1 = sliceList.get(0);
++      List<String> replicasList = new ArrayList<>(slices.get(c1_s1).getReplicasMap().keySet());
++      String c1_s1_r1 = replicasList.get(0);
++      String c1_s1_r2 = replicasList.get(1);
++
++      addProperty(client,
++          "action", CollectionParams.CollectionAction.ADDREPLICAPROP.toString(),
++          "collection", COLLECTION_NAME,
++          "shard", c1_s1,
++          "replica", c1_s1_r1,
++          "property", "bogus1",
++          "property.value", "true");
++
++      addProperty(client,
++          "action", CollectionParams.CollectionAction.ADDREPLICAPROP.toString(),
++          "collection", COLLECTION_NAME,
++          "shard", c1_s1,
++          "replica", c1_s1_r2,
++          "property", "property.bogus1",
++          "property.value", "whatever");
++
++      try {
++        doPropertyAction(client,
++            "action", CollectionParams.CollectionAction.BALANCESLICEUNIQUE.toString(),
++            "collection", COLLECTION_NAME,
++            "property", "bogus1",
++            "sliceUnique", "false");
++        fail("Should have thrown parameter error here");
++      } catch (SolrException se) {
++        assertTrue("Should have caught specific exception ",
++            se.getMessage().contains("Balancing properties amongst replicas in a slice requires that the property be " +
++                "pre-defined as a unique property (e.g. 'preferredLeader') or that 'sliceUnique' be set to 'true'"));
++      }
++
++      // Should have no effect despite the "sliceUnique" param being set.
++
++      doPropertyAction(client,
++          "action", CollectionParams.CollectionAction.BALANCESLICEUNIQUE.toString(),
++          "collection", COLLECTION_NAME,
++          "property", "property.bogus1",
++          "sliceUnique", "true");
++
++      verifyPropertyVal(client, COLLECTION_NAME,
++          c1_s1_r1, "property.bogus1", "true");
++      verifyPropertyVal(client, COLLECTION_NAME,
++          c1_s1_r2, "property.bogus1", "whatever");
++
++    } finally {
++      client.shutdown();
++    }
++  }
++
++  private void addProperty(CloudSolrServer client, String... paramsIn) throws IOException, SolrServerException {
++    assertTrue("paramsIn must be an even multiple of 2, it is: " + paramsIn.length, (paramsIn.length % 2) == 0);
++    ModifiableSolrParams params = new ModifiableSolrParams();
++    for (int idx = 0; idx < paramsIn.length; idx += 2) {
++      params.set(paramsIn[idx], paramsIn[idx + 1]);
++    }
++    QueryRequest request = new QueryRequest(params);
++    request.setPath("/admin/collections");
++    client.request(request);
++
++  }
++}
++
+diff --git a/solr/solrj/src/java/org/apache/solr/common/params/CollectionParams.java b/solr/solrj/src/java/org/apache/solr/common/params/CollectionParams.java
+index ed95a14..8fbb3d9 100644
+--- a/solr/solrj/src/java/org/apache/solr/common/params/CollectionParams.java
++++ b/solr/solrj/src/java/org/apache/solr/common/params/CollectionParams.java
+@@ -48,7 +48,8 @@ public interface CollectionParams
+     LIST,
+     CLUSTERSTATUS,
+     ADDREPLICAPROP,
+-    DELETEREPLICAPROP;
++    DELETEREPLICAPROP,
++    BALANCESLICEUNIQUE;
+     
+     public static CollectionAction get( String p )
+     {
+

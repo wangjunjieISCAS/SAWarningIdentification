@@ -1,0 +1,777 @@
+GitDiffStart: d404fc7ad31dd7cd2a8c0ff47a4f171407308fab | Wed Oct 31 13:22:03 2012 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index e24ee87..2ef7d62 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -74,6 +74,9 @@ API Changes
+   information about the trigger of the merge ie. merge triggered due
+   to a segment merge or a full flush etc. (Simon Willnauer)
+ 
++* Lucene-4415: TermsFilter is now immutable. All terms need to be provided
++  as constructor argument. (Simon Willnauer)
++
+ Bug Fixes
+ 
+ * LUCENE-1822: BaseFragListBuilder hard-coded 6 char margin is too naive.
+@@ -98,6 +101,9 @@ Bug Fixes
+ * LUCENE-4504: Fix broken sort comparator in ValueSource.getSortField,
+   used when sorting by a function query.  (Tom Shally via Robert Muir)
+ 
++* LUCENE-4511: TermsFilter might return wrong results if a field is not 
++  indexed or doesn't exist in the index. (Simon Willnauer)
++
+ Optimizations
+ 
+ * LUCENE-4443: Lucene41PostingsFormat no longer writes unnecessary offsets 
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/TermsFilter.java b/lucene/queries/src/java/org/apache/lucene/queries/TermsFilter.java
+index 699d0e2..f13abd7 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/TermsFilter.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/TermsFilter.java
+@@ -21,13 +21,17 @@ import org.apache.lucene.index.*;
+ import org.apache.lucene.search.DocIdSet;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.Filter;
++import org.apache.lucene.util.ArrayUtil;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.FixedBitSet;
+ 
+ import java.io.IOException;
+-import java.util.Set;
+-import java.util.TreeSet;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.List;
+ 
+ /**
+  * Constructs a filter for docs matching any of the terms added to this class.
+@@ -36,57 +40,169 @@ import java.util.TreeSet;
+  * a choice of "category" labels picked by the end user. As a filter, this is much faster than the
+  * equivalent query (a BooleanQuery with many "should" TermQueries)
+  */
+-public class TermsFilter extends Filter {
+-
+-  private final Set<Term> terms = new TreeSet<Term>();
++public final class TermsFilter extends Filter {
+ 
++  /*
++   * this class is often used for large number of terms in a single field.
++   * to optimize for this case and to be filter-cache friendly we 
++   * serialize all terms into a single byte array and store offsets
++   * in a parallel array to keep the # of object constant and speed up
++   * equals / hashcode.
++   * 
++   * This adds quite a bit of complexity but allows large term filters to
++   * be efficient for GC and cache-lookups
++   */
++  private final int[] offsets;
++  private final byte[] termsBytes;
++  private final TermsAndField[] termsAndFields;
++  private final int hashCode; // cached hashcode for fast cache lookups
++  private static final int PRIME = 31;
++  
+   /**
+-   * Adds a term to the list of acceptable terms
++   * Creates a new {@link TermsFilter} from the given list. The list
++   * can contain duplicate terms and multiple fields.
+    */
+-  public void addTerm(Term term) {
+-    terms.add(term);
++  public TermsFilter(final List<Term> terms) {
++    this(new FieldAndTermEnum() {
++      // we need to sort for deduplication and to have a common cache key
++      final Iterator<Term> iter = sort(terms).iterator();
++      @Override
++      public BytesRef next() {
++        if (iter.hasNext()) {
++          Term next = iter.next();
++          field = next.field();
++          return next.bytes();
++        }
++        return null;
++      }}, terms.size());
+   }
+-
+-/* (non-Javadoc)
+-   * @see org.apache.lucene.search.Filter#getDocIdSet(org.apache.lucene.index.IndexReader)
++  
++  /**
++   * Creates a new {@link TermsFilter} from the given {@link BytesRef} list for
++   * a single field.
+    */
+-
++  public TermsFilter(final String field, final List<BytesRef> terms) {
++    this(new FieldAndTermEnum(field) {
++      // we need to sort for deduplication and to have a common cache key
++      final Iterator<BytesRef> iter = sort(terms).iterator();
++      @Override
++      public BytesRef next() {
++        if (iter.hasNext()) {
++          return iter.next();
++        }
++        return null;
++      }
++    }, terms.size());
++  }
++  
++  /**
++   * Creates a new {@link TermsFilter} from the given {@link BytesRef} array for
++   * a single field.
++   */
++  public TermsFilter(final String field, final BytesRef...terms) {
++    // this ctor prevents unnecessary Term creations
++   this(field, Arrays.asList(terms));
++  }
++  
++  /**
++   * Creates a new {@link TermsFilter} from the given array. The array can
++   * contain duplicate terms and multiple fields.
++   */
++  public TermsFilter(final Term... terms) {
++    this(Arrays.asList(terms));
++  }
++  
++  
++  private TermsFilter(FieldAndTermEnum iter, int length) {
++    int hash = 9;
++    byte[] serializedTerms = new byte[0];
++    this.offsets = new int[length+1];
++    int lastEndOffset = 0;
++    int index = 0;
++    ArrayList<TermsAndField> termsAndFields = new ArrayList<TermsAndField>();
++    TermsAndField lastTermsAndField = null;
++    BytesRef previousTerm = null;
++    String previousField = null;
++    BytesRef currentTerm;
++    String currentField;
++    while((currentTerm = iter.next()) != null) {
++      currentField = iter.field();
++      if (currentField == null) {
++        throw new IllegalArgumentException("Field must not be null");
++      }
++      if (previousField != null) {
++        // deduplicate
++        if (previousField.equals(currentField)) {
++          if (previousTerm.bytesEquals(currentTerm)){
++            continue;            
++          }
++        } else {
++          final int start = lastTermsAndField == null ? 0 : lastTermsAndField.end;
++          lastTermsAndField = new TermsAndField(start, index, previousField);
++          termsAndFields.add(lastTermsAndField);
++        }
++      }
++      hash = PRIME *  hash + currentField.hashCode();
++      hash = PRIME *  hash + currentTerm.hashCode();
++      if (serializedTerms.length < lastEndOffset+currentTerm.length) {
++        serializedTerms = ArrayUtil.grow(serializedTerms, lastEndOffset+currentTerm.length);
++      }
++      System.arraycopy(currentTerm.bytes, currentTerm.offset, serializedTerms, lastEndOffset, currentTerm.length);
++      offsets[index] = lastEndOffset; 
++      lastEndOffset += currentTerm.length;
++      index++;
++      previousTerm = currentTerm;
++      previousField = currentField;
++    }
++    offsets[index] = lastEndOffset;
++    final int start = lastTermsAndField == null ? 0 : lastTermsAndField.end;
++    lastTermsAndField = new TermsAndField(start, index, previousField);
++    termsAndFields.add(lastTermsAndField);
++    this.termsBytes = ArrayUtil.shrink(serializedTerms, lastEndOffset);
++    this.termsAndFields = termsAndFields.toArray(new TermsAndField[termsAndFields.size()]);
++    this.hashCode = hash;
++    
++  }
++  
++  
+   @Override
+   public DocIdSet getDocIdSet(AtomicReaderContext context, Bits acceptDocs) throws IOException {
+-    AtomicReader reader = context.reader();
+-    FixedBitSet result = new FixedBitSet(reader.maxDoc());
+-    Fields fields = reader.fields();
+-
++    final AtomicReader reader = context.reader();
++    FixedBitSet result = null;  // lazy init if needed - no need to create a big bitset ahead of time
++    final Fields fields = reader.fields();
++    final BytesRef spare = new BytesRef(this.termsBytes);
+     if (fields == null) {
+       return result;
+     }
+-
+-    BytesRef br = new BytesRef();
+-    String lastField = null;
+-    Terms termsC;
++    Terms terms = null;
+     TermsEnum termsEnum = null;
+     DocsEnum docs = null;
+-    for (Term term : terms) {
+-      if (!term.field().equals(lastField)) {
+-        termsC = fields.terms(term.field());
+-        if (termsC == null) {
+-          return result;
+-        }
+-        termsEnum = termsC.iterator(null);
+-        lastField = term.field();
+-      }
+-
+-      if (terms != null) { // TODO this check doesn't make sense, decide which variable its supposed to be for
+-        br.copyBytes(term.bytes());
+-        assert termsEnum != null;
+-        if (termsEnum.seekExact(br,true)) {
+-          docs = termsEnum.docs(acceptDocs, docs, 0);
+-          while (docs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+-            result.set(docs.docID());
++    for (TermsAndField termsAndField : this.termsAndFields) {
++      if ((terms = fields.terms(termsAndField.field)) != null) {
++        termsEnum = terms.iterator(termsEnum); // this won't return null
++        for (int i = termsAndField.start; i < termsAndField.end; i++) {
++          spare.offset = offsets[i];
++          spare.length = offsets[i+1] - offsets[i];
++          if (termsEnum.seekExact(spare, false)) { // don't use cache since we could pollute the cache here easily
++            docs = termsEnum.docs(acceptDocs, docs, 0); // no freq since we don't need them
++            if (result == null) {
++              if (docs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
++                result = new FixedBitSet(reader.maxDoc());
++                // lazy init but don't do it in the hot loop since we could read many docs
++                result.set(docs.docID());
++              }
++            }
++            while (docs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
++              result.set(docs.docID());
++            }
+           }
+         }
+       }
+     }
++    /*
++     * TODO: we should explore if it is worth to build the union of the terms in
++     * an automaton an call intersect on the termsenum if the density is high
++     */
+     return result;
+   }
+ 
+@@ -98,19 +214,114 @@ public class TermsFilter extends Filter {
+     if ((obj == null) || (obj.getClass() != this.getClass())) {
+       return false;
+     }
+-
++    
+     TermsFilter test = (TermsFilter) obj;
+-    return (terms == test.terms ||
+-        (terms != null && terms.equals(test.terms)));
++    if (test.hashCode == hashCode && this.termsAndFields.length == test.termsAndFields.length) {
++      // first check the fields before even comparing the bytes
++      for (int i = 0; i < termsAndFields.length; i++) {
++        TermsAndField current = termsAndFields[i];
++        if (!current.equals(test.termsAndFields[i])) {
++          return false;
++        }
++      }
++      // straight byte comparison since we sort they must be identical
++      int end = offsets[termsAndFields.length];
++      byte[] left = this.termsBytes;
++      byte[] right = test.termsBytes;
++      for(int i=0;i < end;i++) {
++        if (left[i] != right[i]) {
++          return false;
++        }
++      }
++      return true;
++    }
++    return false;
+   }
+ 
+   @Override
+   public int hashCode() {
+-    int hash = 9;
+-    for (Term term : terms) {
+-      hash = 31 * hash + term.hashCode();
++    return hashCode;
++  }
++  
++  @Override
++  public String toString() {
++    StringBuilder builder = new StringBuilder();
++    BytesRef spare = new BytesRef(termsBytes);
++    for (int i = 0; i < termsAndFields.length; i++) {
++      TermsAndField current = termsAndFields[i];
++      for (int j = current.start; j < current.end; j++) {
++        spare.offset = offsets[j];
++        spare.length = offsets[j+1] - offsets[j];
++        builder.append(current.field).append(':');
++        builder.append(spare.utf8ToString());
++        builder.append(' ');
++      }
++
+     }
+-    return hash;
++    return builder.toString();
+   }
++  
++  private static final class TermsAndField {
++    final int start;
++    final int end;
++    final String field;
++    
++    
++    TermsAndField(int start, int end, String field) {
++      super();
++      this.start = start;
++      this.end = end;
++      this.field = field;
++    }
+ 
++    @Override
++    public int hashCode() {
++      final int prime = 31;
++      int result = 1;
++      result = prime * result + ((field == null) ? 0 : field.hashCode());
++      result = prime * result + end;
++      result = prime * result + start;
++      return result;
++    }
++    
++    @Override
++    public boolean equals(Object obj) {
++      if (this == obj) return true;
++      if (obj == null) return false;
++      if (getClass() != obj.getClass()) return false;
++      TermsAndField other = (TermsAndField) obj;
++      if (field == null) {
++        if (other.field != null) return false;
++      } else if (!field.equals(other.field)) return false;
++      if (end != other.end) return false;
++      if (start != other.start) return false;
++      return true;
++    }
++    
++  }
++  
++  private static abstract class FieldAndTermEnum {
++    protected String field;
++    
++    public abstract BytesRef next();
++    
++    public FieldAndTermEnum() {}
++    
++    public FieldAndTermEnum(String field) { this.field = field; }
++    
++    public String field() {
++      return field;
++    }
++  }
++  
++  /*
++   * simple utility that returns the in-place sorted list
++   */
++  private static <T extends Comparable<? super T>> List<T> sort(List<T> toSort) {
++    if (toSort.isEmpty()) {
++      throw new IllegalArgumentException("no terms provided");
++    }
++    Collections.sort(toSort);
++    return toSort;
++  }
+ }
+diff --git a/lucene/queries/src/test/org/apache/lucene/queries/BooleanFilterTest.java b/lucene/queries/src/test/org/apache/lucene/queries/BooleanFilterTest.java
+index 976a18d..caf8245 100644
+--- a/lucene/queries/src/test/org/apache/lucene/queries/BooleanFilterTest.java
++++ b/lucene/queries/src/test/org/apache/lucene/queries/BooleanFilterTest.java
+@@ -82,10 +82,7 @@ public class BooleanFilterTest extends LuceneTestCase {
+   }
+ 
+   private Filter getTermsFilter(String field, String text) {
+-    TermsFilter tf = new TermsFilter();
+-    tf.addTerm(new Term(field, text));
+-
+-    return tf;
++    return new TermsFilter(new Term(field, text));
+   }
+   
+   private Filter getWrappedTermQuery(String field, String text) {
+diff --git a/lucene/queries/src/test/org/apache/lucene/queries/TermsFilterTest.java b/lucene/queries/src/test/org/apache/lucene/queries/TermsFilterTest.java
+index 1403b22..8335149 100644
+--- a/lucene/queries/src/test/org/apache/lucene/queries/TermsFilterTest.java
++++ b/lucene/queries/src/test/org/apache/lucene/queries/TermsFilterTest.java
+@@ -17,7 +17,14 @@ package org.apache.lucene.queries;
+  * limitations under the License.
+  */
+ 
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+@@ -27,28 +34,34 @@ import org.apache.lucene.index.MultiReader;
+ import org.apache.lucene.index.RandomIndexWriter;
+ import org.apache.lucene.index.SlowCompositeReaderWrapper;
+ import org.apache.lucene.index.Term;
++import org.apache.lucene.search.BooleanClause;
++import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.ConstantScoreQuery;
++import org.apache.lucene.search.DocIdSet;
+ import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.BooleanClause.Occur;
++import org.apache.lucene.search.MatchAllDocsQuery;
++import org.apache.lucene.search.ScoreDoc;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.TopDocs;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
+ 
+ public class TermsFilterTest extends LuceneTestCase {
+ 
+   public void testCachability() throws Exception {
+-    TermsFilter a = new TermsFilter();
+-    a.addTerm(new Term("field1", "a"));
+-    a.addTerm(new Term("field1", "b"));
++    TermsFilter a = termsFilter(random().nextBoolean(), new Term("field1", "a"), new Term("field1", "b"));
+     HashSet<Filter> cachedFilters = new HashSet<Filter>();
+     cachedFilters.add(a);
+-    TermsFilter b = new TermsFilter();
+-    b.addTerm(new Term("field1", "a"));
+-    b.addTerm(new Term("field1", "b"));
+-
+-    assertTrue("Must be cached", cachedFilters.contains(b));
+-    b.addTerm(new Term("field1", "a")); //duplicate term
++    TermsFilter b = termsFilter(random().nextBoolean(), new Term("field1", "b"), new Term("field1", "a"));
+     assertTrue("Must be cached", cachedFilters.contains(b));
+-    b.addTerm(new Term("field1", "c"));
+-    assertFalse("Must not be cached", cachedFilters.contains(b));
++    //duplicate term
++    assertTrue("Must be cached", cachedFilters.contains(termsFilter(true, new Term("field1", "a"), new Term("field1", "a"), new Term("field1", "b"))));
++    assertFalse("Must not be cached", cachedFilters.contains(termsFilter(random().nextBoolean(), new Term("field1", "a"), new Term("field1", "a"), new Term("field1", "b"),  new Term("field1", "v"))));
+   }
+ 
+   public void testMissingTerms() throws Exception {
+@@ -66,21 +79,21 @@ public class TermsFilterTest extends LuceneTestCase {
+     AtomicReaderContext context = (AtomicReaderContext) reader.getContext();
+     w.close();
+ 
+-    TermsFilter tf = new TermsFilter();
+-    tf.addTerm(new Term(fieldName, "19"));
+-    FixedBitSet bits = (FixedBitSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
+-    assertEquals("Must match nothing", 0, bits.cardinality());
++    List<Term> terms = new ArrayList<Term>();
++    terms.add(new Term(fieldName, "19"));
++    FixedBitSet bits = (FixedBitSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
++    assertNull("Must match nothing", bits);
+ 
+-    tf.addTerm(new Term(fieldName, "20"));
+-    bits = (FixedBitSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
++    terms.add(new Term(fieldName, "20"));
++    bits = (FixedBitSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
+     assertEquals("Must match 1", 1, bits.cardinality());
+ 
+-    tf.addTerm(new Term(fieldName, "10"));
+-    bits = (FixedBitSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
++    terms.add(new Term(fieldName, "10"));
++    bits = (FixedBitSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
+     assertEquals("Must match 2", 2, bits.cardinality());
+ 
+-    tf.addTerm(new Term(fieldName, "00"));
+-    bits = (FixedBitSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
++    terms.add(new Term(fieldName, "00"));
++    bits = (FixedBitSet) termsFilter(random().nextBoolean(), terms).getDocIdSet(context, context.reader().getLiveDocs());
+     assertEquals("Must match 2", 2, bits.cardinality());
+ 
+     reader.close();
+@@ -106,13 +119,16 @@ public class TermsFilterTest extends LuceneTestCase {
+     IndexReader reader2 = w2.getReader();
+     w2.close();
+     
+-    TermsFilter tf = new TermsFilter();
+-    tf.addTerm(new Term(fieldName, "content1"));
+-    
++    TermsFilter tf = new TermsFilter(new Term(fieldName, "content1"));
+     MultiReader multi = new MultiReader(reader1, reader2);
+     for (AtomicReaderContext context : multi.leaves()) {
+-      FixedBitSet bits = (FixedBitSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
+-      assertTrue("Must be >= 0", bits.cardinality() >= 0);      
++      DocIdSet docIdSet = tf.getDocIdSet(context, context.reader().getLiveDocs());
++      if (context.reader().docFreq(new Term(fieldName, "content1")) == 0) {
++        assertNull(docIdSet);
++      } else {
++        FixedBitSet bits = (FixedBitSet) docIdSet;
++        assertTrue("Must be >= 0", bits.cardinality() >= 0);      
++      }
+     }
+     multi.close();
+     reader1.close();
+@@ -120,5 +136,188 @@ public class TermsFilterTest extends LuceneTestCase {
+     rd1.close();
+     rd2.close();
+   }
++  
++  public void testFieldNotPresent() throws IOException {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    int num = atLeast(3);
++    int skip = random().nextInt(num);
++    List<Term> terms = new ArrayList<Term>();
++    for (int i = 0; i < num; i++) {
++      terms.add(new Term("field" + i, "content1"));
++      Document doc = new Document();
++      if (skip == i) {
++        continue;
++      }
++      doc.add(newStringField("field" + i, "content1", Field.Store.YES));
++      w.addDocument(doc);  
++    }
++    
++    w.forceMerge(1);
++    IndexReader reader = w.getReader();
++    w.close();
++    assertEquals(1, reader.leaves().size());
++    
++    
++    
++    AtomicReaderContext context = reader.leaves().get(0);
++    TermsFilter tf = new TermsFilter(terms);
++
++    FixedBitSet bits = (FixedBitSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
++    assertEquals("Must be num fields - 1 since we skip only one field", num-1, bits.cardinality());  
++    reader.close();
++    dir.close();
++  }
++  
++  public void testSkipField() throws IOException {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    int num = atLeast(10);
++    Set<Term> terms = new HashSet<Term>();
++    for (int i = 0; i < num; i++) {
++      String field = "field" + random().nextInt(100);
++      terms.add(new Term(field, "content1"));
++      Document doc = new Document();
++      doc.add(newStringField(field, "content1", Field.Store.YES));
++      w.addDocument(doc);
++    }
++    int randomFields = random().nextInt(10);
++    for (int i = 0; i < randomFields; i++) {
++      while (true) {
++        String field = "field" + random().nextInt(100);
++        Term t = new Term(field, "content1");
++        if (!terms.contains(t)) {
++          terms.add(t);
++          break;
++        }
++      }
++    }
++    w.forceMerge(1);
++    IndexReader reader = w.getReader();
++    w.close();
++    assertEquals(1, reader.leaves().size());
++    AtomicReaderContext context = reader.leaves().get(0);
++    TermsFilter tf = new TermsFilter(new ArrayList<Term>(terms));
++
++    FixedBitSet bits = (FixedBitSet) tf.getDocIdSet(context, context.reader().getLiveDocs());
++    assertEquals(context.reader().numDocs(), bits.cardinality());  
++    reader.close();
++    dir.close();
++  }
++  
++  public void testRandom() throws IOException {
++    Directory dir = newDirectory();
++    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
++    int num = atLeast(100);
++    final boolean singleField = random().nextBoolean();
++    List<Term> terms = new ArrayList<Term>();
++    for (int i = 0; i < num; i++) {
++      String field = "field" + (singleField ? "1" : random().nextInt(100));
++      String string = _TestUtil.randomRealisticUnicodeString(random());
++      terms.add(new Term(field, string));
++      Document doc = new Document();
++      doc.add(newStringField(field, string, Field.Store.YES));
++      w.addDocument(doc);
++    }
++    IndexReader reader = w.getReader();
++    w.close();
++    
++    IndexSearcher searcher = new IndexSearcher(reader);
++    
++    int numQueries = atLeast(10);
++    for (int i = 0; i < numQueries; i++) {
++      Collections.shuffle(terms, random());
++      int numTerms = 1 + random().nextInt(
++          Math.min(BooleanQuery.getMaxClauseCount(), terms.size()));
++      BooleanQuery bq = new BooleanQuery();
++      for (int j = 0; j < numTerms; j++) {
++        bq.add(new BooleanClause(new TermQuery(terms.get(j)), Occur.SHOULD));
++      }
++      TopDocs queryResult = searcher.search(new ConstantScoreQuery(bq), reader.maxDoc());
++      
++      MatchAllDocsQuery matchAll = new MatchAllDocsQuery();
++      final TermsFilter filter = termsFilter(singleField, terms.subList(0, numTerms));;
++      TopDocs filterResult = searcher.search(matchAll, filter, reader.maxDoc());
++      assertEquals(filterResult.totalHits, queryResult.totalHits);
++      ScoreDoc[] scoreDocs = filterResult.scoreDocs;
++      for (int j = 0; j < scoreDocs.length; j++) {
++        assertEquals(scoreDocs[j].doc, queryResult.scoreDocs[j].doc);
++      }
++    }
++    
++    reader.close();
++    dir.close();
++  }
++  
++  private TermsFilter termsFilter(boolean singleField, Term...terms) {
++    return termsFilter(singleField, Arrays.asList(terms));
++  }
+ 
++  private TermsFilter termsFilter(boolean singleField, Collection<Term> termList) {
++    if (!singleField) {
++      return new TermsFilter(new ArrayList<Term>(termList));
++    }
++    final TermsFilter filter;
++    List<BytesRef> bytes = new ArrayList<BytesRef>();
++    String field = null;
++    for (Term term : termList) {
++        bytes.add(term.bytes());
++        if (field != null) {
++          assertEquals(term.field(), field);
++        }
++        field = term.field();
++    }
++    assertNotNull(field);
++    filter = new TermsFilter(field, bytes);
++    return filter;
++  }
++  
++  public void testHashCodeAndEquals() {
++    int num = atLeast(100);
++    final boolean singleField = random().nextBoolean();
++    List<Term> terms = new ArrayList<Term>();
++    Set<Term> uniqueTerms = new HashSet<Term>();
++    for (int i = 0; i < num; i++) {
++      String field = "field" + (singleField ? "1" : random().nextInt(100));
++      String string = _TestUtil.randomRealisticUnicodeString(random());
++      terms.add(new Term(field, string));
++      uniqueTerms.add(new Term(field, string));
++      TermsFilter left = termsFilter(singleField ? random().nextBoolean() : false, uniqueTerms);
++      Collections.shuffle(terms, random());
++      TermsFilter right = termsFilter(singleField ? random().nextBoolean() : false, terms);
++      assertEquals(right, left);
++      assertEquals(right.hashCode(), left.hashCode());
++      if (i > 0) {
++        List<Term> asList = new ArrayList<Term>(uniqueTerms);
++        asList.remove(0);
++        TermsFilter notEqual = termsFilter(singleField ? random().nextBoolean() : false, asList);
++        assertFalse(left.equals(notEqual));
++        assertFalse(right.equals(notEqual));
++      }
++    }
++  }
++  
++  public void testNoTerms() {
++    List<Term> emptyTerms = Collections.emptyList();
++    List<BytesRef> emptyBytesRef = Collections.emptyList();
++    try {
++      new TermsFilter(emptyTerms);
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++    
++    try {
++      new TermsFilter(emptyTerms.toArray(new Term[0]));
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++    
++    try {
++      new TermsFilter(null, emptyBytesRef.toArray(new BytesRef[0]));
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++    
++    try {
++      new TermsFilter(null, emptyBytesRef);
++      fail("must fail - no terms!");
++    } catch (IllegalArgumentException e) {}
++  }
+ }
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/TermsFilterBuilder.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/TermsFilterBuilder.java
+index b3b0f84..e162d89 100644
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/TermsFilterBuilder.java
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/xml/builders/TermsFilterBuilder.java
+@@ -14,6 +14,8 @@ import org.w3c.dom.Element;
+ 
+ import java.io.IOException;
+ import java.io.StringReader;
++import java.util.ArrayList;
++import java.util.List;
+ 
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+@@ -49,7 +51,7 @@ public class TermsFilterBuilder implements FilterBuilder {
+     * @see org.apache.lucene.xmlparser.FilterBuilder#process(org.w3c.dom.Element)
+     */
+   public Filter getFilter(Element e) throws ParserException {
+-    TermsFilter tf = new TermsFilter();
++    List<BytesRef> terms = new ArrayList<BytesRef>();
+     String text = DOMUtils.getNonBlankTextOrFail(e);
+     String fieldName = DOMUtils.getAttributeWithInheritanceOrFail(e, "fieldName");
+ 
+@@ -61,8 +63,7 @@ public class TermsFilterBuilder implements FilterBuilder {
+       ts.reset();
+       while (ts.incrementToken()) {
+         termAtt.fillBytesRef();
+-        term = new Term(fieldName, BytesRef.deepCopyOf(bytes));
+-        tf.addTerm(term);
++        terms.add(BytesRef.deepCopyOf(bytes));
+       }
+       ts.end();
+       ts.close();
+@@ -70,6 +71,6 @@ public class TermsFilterBuilder implements FilterBuilder {
+     catch (IOException ioe) {
+       throw new RuntimeException("Error constructing terms from index:" + ioe);
+     }
+-    return tf;
++    return new TermsFilter(fieldName, terms);
+   }
+ }
+diff --git a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java
+index 8eb14ee..37e6ce4 100644
+--- a/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java
++++ b/lucene/spatial/src/java/org/apache/lucene/spatial/prefix/TermQueryPrefixTreeStrategy.java
+@@ -18,7 +18,6 @@ package org.apache.lucene.spatial.prefix;
+  */
+ 
+ import com.spatial4j.core.shape.Shape;
+-import org.apache.lucene.index.Term;
+ import org.apache.lucene.queries.TermsFilter;
+ import org.apache.lucene.search.Filter;
+ import org.apache.lucene.spatial.prefix.tree.Node;
+@@ -26,6 +25,7 @@ import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
+ import org.apache.lucene.spatial.query.SpatialArgs;
+ import org.apache.lucene.spatial.query.SpatialOperation;
+ import org.apache.lucene.spatial.query.UnsupportedSpatialOperation;
++import org.apache.lucene.util.BytesRef;
+ 
+ import java.util.List;
+ 
+@@ -55,11 +55,12 @@ public class TermQueryPrefixTreeStrategy extends PrefixTreeStrategy {
+     Shape shape = args.getShape();
+     int detailLevel = grid.getLevelForDistance(args.resolveDistErr(ctx, distErrPct));
+     List<Node> cells = grid.getNodes(shape, detailLevel, false);
+-    TermsFilter filter = new TermsFilter();
++    BytesRef[] terms = new BytesRef[cells.size()];
++    int i = 0;
+     for (Node cell : cells) {
+-      filter.addTerm(new Term(getFieldName(), cell.getTokenString()));
++      terms[i++] = new BytesRef(cell.getTokenString());
+     }
+-    return filter;
++    return new TermsFilter(getFieldName(), terms);
+   }
+ 
+ }
+

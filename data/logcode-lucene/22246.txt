@@ -1,0 +1,1415 @@
+GitDiffStart: 68aa14653501d3aa0b67583e585d68bd383d9922 | Thu Sep 20 07:27:07 2007 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 4c7fd43..64cb170 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -136,6 +136,12 @@ Optimizations
+  9. LUCENE-871: Speedup ISOLatin1AccentFilter (Ian Boston via Mike
+     McCandless)
+ 
++10. LUCENE-986: Refactored SegmentInfos from IndexReader into the new
++    subclass DirectoryIndexReader. SegmentReader and MultiSegmentReader
++    now extend DirectoryIndexReader and are the only IndexReader 
++    implementations that use SegmentInfos to access an index and 
++    acquire a write lock for index modifications. (Michael Busch)
++
+ Documentation
+ 
+ Build
+diff --git a/src/java/org/apache/lucene/index/DirectoryIndexReader.java b/src/java/org/apache/lucene/index/DirectoryIndexReader.java
+new file mode 100644
+index 0000000..318b84c
+--- /dev/null
++++ b/src/java/org/apache/lucene/index/DirectoryIndexReader.java
+@@ -0,0 +1,257 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.Lock;
++import org.apache.lucene.store.LockObtainFailedException;
++
++/**
++ * IndexReader implementation that has access to a Directory. 
++ * Instances that have a SegmentInfos object (i. e. segmentInfos != null)
++ * "own" the directory, which means that they try to acquire a write lock
++ * whenever index modifications are performed.
++ */
++abstract class DirectoryIndexReader extends IndexReader {
++  private Directory directory;
++  private boolean closeDirectory;
++  private IndexDeletionPolicy deletionPolicy;
++
++  private SegmentInfos segmentInfos;
++  private Lock writeLock;
++  private boolean stale;
++
++  /** Used by commit() to record pre-commit state in case
++   * rollback is necessary */
++  private boolean rollbackHasChanges;
++  private SegmentInfos rollbackSegmentInfos;
++
++  
++  void init(Directory directory, SegmentInfos segmentInfos, boolean closeDirectory) {
++    this.directory = directory;
++    this.segmentInfos = segmentInfos;
++    this.closeDirectory = closeDirectory;
++  }
++  
++  protected DirectoryIndexReader() {}
++  
++  DirectoryIndexReader(Directory directory, SegmentInfos segmentInfos,
++      boolean closeDirectory) {
++    super();
++    init(directory, segmentInfos, closeDirectory);
++  }
++  
++  public void setDeletionPolicy(IndexDeletionPolicy deletionPolicy) {
++    this.deletionPolicy = deletionPolicy;
++  }
++  
++  /** Returns the directory this index resides in.
++   */
++  public Directory directory() {
++    ensureOpen();
++    return directory;
++  }
++
++  /**
++   * Version number when this IndexReader was opened.
++   */
++  public long getVersion() {
++    ensureOpen();
++    return segmentInfos.getVersion();
++  }
++
++  /**
++   * Check whether this IndexReader is still using the
++   * current (i.e., most recently committed) version of the
++   * index.  If a writer has committed any changes to the
++   * index since this reader was opened, this will return
++   * <code>false</code>, in which case you must open a new
++   * IndexReader in order to see the changes.  See the
++   * description of the <a href="IndexWriter.html#autoCommit"><code>autoCommit</code></a>
++   * flag which controls when the {@link IndexWriter}
++   * actually commits changes to the index.
++   * 
++   * @throws CorruptIndexException if the index is corrupt
++   * @throws IOException if there is a low-level IO error
++   */
++  public boolean isCurrent() throws CorruptIndexException, IOException {
++    ensureOpen();
++    return SegmentInfos.readCurrentVersion(directory) == segmentInfos.getVersion();
++  }
++
++  /**
++   * Checks is the index is optimized (if it has a single segment and no deletions)
++   * @return <code>true</code> if the index is optimized; <code>false</code> otherwise
++   */
++  public boolean isOptimized() {
++    ensureOpen();
++    return segmentInfos.size() == 1 && hasDeletions() == false;
++  }
++
++  protected void doClose() throws IOException {
++    if (segmentInfos != null)
++      closed = true;
++    if(closeDirectory)
++      directory.close();
++  }
++  
++  /**
++   * Commit changes resulting from delete, undeleteAll, or
++   * setNorm operations
++   *
++   * If an exception is hit, then either no changes or all
++   * changes will have been committed to the index
++   * (transactional semantics).
++   * @throws IOException if there is a low-level IO error
++   */
++  protected void doCommit() throws IOException {
++    if(hasChanges){
++      if (segmentInfos != null) {
++
++        // Default deleter (for backwards compatibility) is
++        // KeepOnlyLastCommitDeleter:
++        IndexFileDeleter deleter =  new IndexFileDeleter(directory,
++                                                         deletionPolicy == null ? new KeepOnlyLastCommitDeletionPolicy() : deletionPolicy,
++                                                         segmentInfos, null, null);
++
++        // Checkpoint the state we are about to change, in
++        // case we have to roll back:
++        startCommit();
++
++        boolean success = false;
++        try {
++          commitChanges();
++          segmentInfos.write(directory);
++          success = true;
++        } finally {
++
++          if (!success) {
++
++            // Rollback changes that were made to
++            // SegmentInfos but failed to get [fully]
++            // committed.  This way this reader instance
++            // remains consistent (matched to what's
++            // actually in the index):
++            rollbackCommit();
++
++            // Recompute deletable files & remove them (so
++            // partially written .del files, etc, are
++            // removed):
++            deleter.refresh();
++          }
++        }
++
++        // Have the deleter remove any now unreferenced
++        // files due to this commit:
++        deleter.checkpoint(segmentInfos, true);
++
++        if (writeLock != null) {
++          writeLock.release();  // release write lock
++          writeLock = null;
++        }
++      }
++      else
++        commitChanges();
++    }
++    hasChanges = false;
++  }
++  
++  protected abstract void commitChanges() throws IOException;
++  
++  /**
++   * Tries to acquire the WriteLock on this directory.
++   * this method is only valid if this IndexReader is directory owner.
++   * 
++   * @throws StaleReaderException if the index has changed
++   * since this reader was opened
++   * @throws CorruptIndexException if the index is corrupt
++   * @throws LockObtainFailedException if another writer
++   *  has this index open (<code>write.lock</code> could not
++   *  be obtained)
++   * @throws IOException if there is a low-level IO error
++   */
++  protected void acquireWriteLock() throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
++    if (segmentInfos != null) {
++      ensureOpen();
++      if (stale)
++        throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
++  
++      if (writeLock == null) {
++        Lock writeLock = directory.makeLock(IndexWriter.WRITE_LOCK_NAME);
++        if (!writeLock.obtain(IndexWriter.WRITE_LOCK_TIMEOUT)) // obtain write lock
++          throw new LockObtainFailedException("Index locked for write: " + writeLock);
++        this.writeLock = writeLock;
++  
++        // we have to check whether index has changed since this reader was opened.
++        // if so, this reader is no longer valid for deletion
++        if (SegmentInfos.readCurrentVersion(directory) > segmentInfos.getVersion()) {
++          stale = true;
++          this.writeLock.release();
++          this.writeLock = null;
++          throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
++        }
++      }
++    }
++  }
++
++  /**
++   * Should internally checkpoint state that will change
++   * during commit so that we can rollback if necessary.
++   */
++  void startCommit() {
++    if (segmentInfos != null) {
++      rollbackSegmentInfos = (SegmentInfos) segmentInfos.clone();
++    }
++    rollbackHasChanges = hasChanges;
++  }
++
++  /**
++   * Rolls back state to just before the commit (this is
++   * called by commit() if there is some exception while
++   * committing).
++   */
++  void rollbackCommit() {
++    if (segmentInfos != null) {
++      for(int i=0;i<segmentInfos.size();i++) {
++        // Rollback each segmentInfo.  Because the
++        // SegmentReader holds a reference to the
++        // SegmentInfo we can't [easily] just replace
++        // segmentInfos, so we reset it in place instead:
++        segmentInfos.info(i).reset(rollbackSegmentInfos.info(i));
++      }
++      rollbackSegmentInfos = null;
++    }
++
++    hasChanges = rollbackHasChanges;
++  }
++
++  /** Release the write lock, if needed. */
++  protected void finalize() throws Throwable {
++    try {
++      if (writeLock != null) {
++        writeLock.release();                        // release write lock
++        writeLock = null;
++      }
++    } finally {
++      super.finalize();
++    }
++  }
++
++}
+diff --git a/src/java/org/apache/lucene/index/FilterIndexReader.java b/src/java/org/apache/lucene/index/FilterIndexReader.java
+index 60de314..95daad5 100644
+--- a/src/java/org/apache/lucene/index/FilterIndexReader.java
++++ b/src/java/org/apache/lucene/index/FilterIndexReader.java
+@@ -19,6 +19,7 @@ package org.apache.lucene.index;
+ 
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.FieldSelector;
++import org.apache.lucene.store.Directory;
+ 
+ import java.io.IOException;
+ import java.util.Collection;
+@@ -99,10 +100,14 @@ public class FilterIndexReader extends IndexReader {
+    * @param in specified base reader.
+    */
+   public FilterIndexReader(IndexReader in) {
+-    super(in.directory());
++    super();
+     this.in = in;
+   }
+ 
++  public Directory directory() {
++    return in.directory();
++  }
++  
+   public TermFreqVector[] getTermFreqVectors(int docNumber)
+           throws IOException {
+     ensureOpen();
+diff --git a/src/java/org/apache/lucene/index/IndexReader.java b/src/java/org/apache/lucene/index/IndexReader.java
+index fd6841c..e46c515 100644
+--- a/src/java/org/apache/lucene/index/IndexReader.java
++++ b/src/java/org/apache/lucene/index/IndexReader.java
+@@ -44,6 +44,13 @@ import java.util.Collection;
+  <p> An IndexReader can be opened on a directory for which an IndexWriter is
+  opened already, but it cannot be used to delete documents from the index then.
+ 
++ <p>
++ NOTE: for backwards API compatibility, several methods are not listed 
++ as abstract, but have no useful implementations in this base class and 
++ instead always throw UnsupportedOperationException.  Subclasses are 
++ strongly encouraged to override these methods, but in many cases may not 
++ need to.
++ </p>
+ 
+  @version $Id$
+ */
+@@ -80,41 +87,35 @@ public abstract class IndexReader {
+     public static final FieldOption TERMVECTOR_WITH_POSITION_OFFSET = new FieldOption ("TERMVECTOR_WITH_POSITION_OFFSET");
+   }
+ 
+-  /**
+-   * Constructor used if IndexReader is not owner of its directory. 
+-   * This is used for IndexReaders that are used within other IndexReaders that take care or locking directories.
+-   * 
+-   * @param directory Directory where IndexReader files reside.
++  protected boolean closed;
++  protected boolean hasChanges;
++  
++  /** 
++   * @deprecated will be deleted when IndexReader(Directory) is deleted
++   * @see #directory()
+    */
+-  protected IndexReader(Directory directory) {
+-    this.directory = directory;
+-  }
++  private Directory directory;
+ 
+   /**
+-   * Constructor used if IndexReader is owner of its directory.
+-   * If IndexReader is owner of its directory, it locks its directory in case of write operations.
++   * Legacy Constructor for backwards compatibility.
++   *
++   * <p>
++   * This Constructor should not be used, it exists for backwards 
++   * compatibility only to support legacy subclasses that did not "own" 
++   * a specific directory, but needed to specify something to be returned 
++   * by the directory() method.  Future subclasses should delegate to the 
++   * no arg constructor and implement the directory() method as appropriate.
+    * 
+-   * @param directory Directory where IndexReader files reside.
+-   * @param segmentInfos Used for write-l
+-   * @param closeDirectory
++   * @param directory Directory to be returned by the directory() method
++   * @see #directory()
++   * @deprecated - use IndexReader()
+    */
+-  IndexReader(Directory directory, SegmentInfos segmentInfos, boolean closeDirectory) {
+-    init(directory, segmentInfos, closeDirectory, true);
+-  }
+-
+-  void init(Directory directory, SegmentInfos segmentInfos, boolean closeDirectory, boolean directoryOwner) {
++  protected IndexReader(Directory directory) {
+     this.directory = directory;
+-    this.segmentInfos = segmentInfos;
+-    this.directoryOwner = directoryOwner;
+-    this.closeDirectory = closeDirectory;
+   }
+-
+-  private Directory directory;
+-  private boolean directoryOwner;
+-  private boolean closeDirectory;
+-  private IndexDeletionPolicy deletionPolicy;
+-  private boolean closed;
+-
++  
++  protected IndexReader() { /* NOOP */ }
++  
+   /**
+    * @throws AlreadyClosedException if this IndexReader is closed
+    */
+@@ -124,16 +125,6 @@ public abstract class IndexReader {
+     }
+   }
+ 
+-  private SegmentInfos segmentInfos;
+-  private Lock writeLock;
+-  private boolean stale;
+-  private boolean hasChanges;
+-
+-  /** Used by commit() to record pre-commit state in case
+-   * rollback is necessary */
+-  private boolean rollbackHasChanges;
+-  private SegmentInfos rollbackSegmentInfos;
+-
+   /** Returns an IndexReader reading the index in an FSDirectory in the named
+    path.
+    * @throws CorruptIndexException if the index is corrupt
+@@ -184,43 +175,33 @@ public abstract class IndexReader {
+         SegmentInfos infos = new SegmentInfos();
+         infos.read(directory, segmentFileName);
+ 
+-        IndexReader reader;
++        DirectoryIndexReader reader;
+ 
+         if (infos.size() == 1) {		  // index is optimized
+           reader = SegmentReader.get(infos, infos.info(0), closeDirectory);
+         } else {
+-
+-          // To reduce the chance of hitting FileNotFound
+-          // (and having to retry), we open segments in
+-          // reverse because IndexWriter merges & deletes
+-          // the newest segments first.
+-
+-          IndexReader[] readers = new IndexReader[infos.size()];
+-          for (int i = infos.size()-1; i >= 0; i--) {
+-            try {
+-              readers[i] = SegmentReader.get(infos.info(i));
+-            } catch (IOException e) {
+-              // Close all readers we had opened:
+-              for(i++;i<infos.size();i++) {
+-                readers[i].close();
+-              }
+-              throw e;
+-            }
+-          }
+-
+-          reader = new MultiSegmentReader(directory, infos, closeDirectory, readers);
++          reader = new MultiSegmentReader(directory, infos, closeDirectory);
+         }
+-        reader.deletionPolicy = deletionPolicy;
++        reader.setDeletionPolicy(deletionPolicy);
+         return reader;
+       }
+     }.run();
+   }
+ 
+-  /** Returns the directory this index resides in.
++  /** 
++   * Returns the directory associated with this index.  The Default 
++   * implementation returns the directory specified by subclasses when 
++   * delegating to the IndexReader(Directory) constructor, or throws an 
++   * UnsupportedOperationException if one was not specified.
++   * @throws UnsupportedOperationException if no directory
+    */
+   public Directory directory() {
+     ensureOpen();
+-    return directory;
++    if (null != directory) {
++      return directory;
++    } else {
++      throw new UnsupportedOperationException("This reader does not support this method.");  
++    }
+   }
+ 
+   /**
+@@ -310,11 +291,11 @@ public abstract class IndexReader {
+   }
+ 
+   /**
+-   * Version number when this IndexReader was opened.
++   * Version number when this IndexReader was opened. Not implemented in the IndexReader base class.
++   * @throws UnsupportedOperationException unless overridden in subclass
+    */
+   public long getVersion() {
+-    ensureOpen();
+-    return segmentInfos.getVersion();
++    throw new UnsupportedOperationException("This reader does not support this method.");
+   }
+ 
+   /**
+@@ -328,23 +309,27 @@ public abstract class IndexReader {
+    * flag which controls when the {@link IndexWriter}
+    * actually commits changes to the index.
+    * 
++   * <p>
++   * Not implemented in the IndexReader base class.
++   * </p>
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
++   * @throws UnsupportedOperationException unless overridden in subclass
+    */
+   public boolean isCurrent() throws CorruptIndexException, IOException {
+-    ensureOpen();
+-    return SegmentInfos.readCurrentVersion(directory) == segmentInfos.getVersion();
++    throw new UnsupportedOperationException("This reader does not support this method.");
+   }
+ 
+   /**
+-   * Checks is the index is optimized (if it has a single segment and no deletions)
++   * Checks is the index is optimized (if it has a single segment and 
++   * no deletions).  Not implemented in the IndexReader base class.
+    * @return <code>true</code> if the index is optimized; <code>false</code> otherwise
++   * @throws UnsupportedOperationException unless overridden in subclass
+    */
+   public boolean isOptimized() {
+-    ensureOpen();
+-    return segmentInfos.size() == 1 && hasDeletions() == false;
++    throw new UnsupportedOperationException("This reader does not support this method.");
+   }
+-
++  
+   /**
+    *  Return an array of term frequency vectors for the specified document.
+    *  The array contains a vector for each vectorized field in the document.
+@@ -524,8 +509,7 @@ public abstract class IndexReader {
+   public final synchronized  void setNorm(int doc, String field, byte value)
+           throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
+     ensureOpen();
+-    if(directoryOwner)
+-      acquireWriteLock();
++    acquireWriteLock();
+     hasChanges = true;
+     doSetNorm(doc, field, value);
+   }
+@@ -630,39 +614,6 @@ public abstract class IndexReader {
+    */
+   public abstract TermPositions termPositions() throws IOException;
+ 
+-  /**
+-   * Tries to acquire the WriteLock on this directory.
+-   * this method is only valid if this IndexReader is directory owner.
+-   * 
+-   * @throws StaleReaderException if the index has changed
+-   * since this reader was opened
+-   * @throws CorruptIndexException if the index is corrupt
+-   * @throws LockObtainFailedException if another writer
+-   *  has this index open (<code>write.lock</code> could not
+-   *  be obtained)
+-   * @throws IOException if there is a low-level IO error
+-   */
+-  private void acquireWriteLock() throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
+-    ensureOpen();
+-    if (stale)
+-      throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
+-
+-    if (writeLock == null) {
+-      Lock writeLock = directory.makeLock(IndexWriter.WRITE_LOCK_NAME);
+-      if (!writeLock.obtain(IndexWriter.WRITE_LOCK_TIMEOUT)) // obtain write lock
+-        throw new LockObtainFailedException("Index locked for write: " + writeLock);
+-      this.writeLock = writeLock;
+-
+-      // we have to check whether index has changed since this reader was opened.
+-      // if so, this reader is no longer valid for deletion
+-      if (SegmentInfos.readCurrentVersion(directory) > segmentInfos.getVersion()) {
+-        stale = true;
+-        this.writeLock.release();
+-        this.writeLock = null;
+-        throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
+-      }
+-    }
+-  }
+ 
+ 
+   /** Deletes the document numbered <code>docNum</code>.  Once a document is
+@@ -682,8 +633,7 @@ public abstract class IndexReader {
+    */
+   public final synchronized void deleteDocument(int docNum) throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
+     ensureOpen();
+-    if(directoryOwner)
+-      acquireWriteLock();
++    acquireWriteLock();
+     hasChanges = true;
+     doDelete(docNum);
+   }
+@@ -740,8 +690,7 @@ public abstract class IndexReader {
+    */
+   public final synchronized void undeleteAll() throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
+     ensureOpen();
+-    if(directoryOwner)
+-      acquireWriteLock();
++    acquireWriteLock();
+     hasChanges = true;
+     doUndeleteAll();
+   }
+@@ -749,35 +698,10 @@ public abstract class IndexReader {
+   /** Implements actual undeleteAll() in subclass. */
+   protected abstract void doUndeleteAll() throws CorruptIndexException, IOException;
+ 
+-  /**
+-   * Should internally checkpoint state that will change
+-   * during commit so that we can rollback if necessary.
+-   */
+-  void startCommit() {
+-    if (directoryOwner) {
+-      rollbackSegmentInfos = (SegmentInfos) segmentInfos.clone();
+-    }
+-    rollbackHasChanges = hasChanges;
+-  }
+-
+-  /**
+-   * Rolls back state to just before the commit (this is
+-   * called by commit() if there is some exception while
+-   * committing).
+-   */
+-  void rollbackCommit() {
+-    if (directoryOwner) {
+-      for(int i=0;i<segmentInfos.size();i++) {
+-        // Rollback each segmentInfo.  Because the
+-        // SegmentReader holds a reference to the
+-        // SegmentInfo we can't [easily] just replace
+-        // segmentInfos, so we reset it in place instead:
+-        segmentInfos.info(i).reset(rollbackSegmentInfos.info(i));
+-      }
+-      rollbackSegmentInfos = null;
+-    }
+-
+-    hasChanges = rollbackHasChanges;
++  /** Does nothing by default. Subclasses that require a write lock for
++   *  index modifications must implement this method. */
++  protected synchronized void acquireWriteLock() throws IOException {
++    /* NOOP */
+   }
+ 
+   /**
+@@ -791,52 +715,7 @@ public abstract class IndexReader {
+    */
+   protected final synchronized void commit() throws IOException {
+     if(hasChanges){
+-      if(directoryOwner){
+-
+-        // Default deleter (for backwards compatibility) is
+-        // KeepOnlyLastCommitDeleter:
+-        IndexFileDeleter deleter =  new IndexFileDeleter(directory,
+-                                                         deletionPolicy == null ? new KeepOnlyLastCommitDeletionPolicy() : deletionPolicy,
+-                                                         segmentInfos, null, null);
+-
+-        // Checkpoint the state we are about to change, in
+-        // case we have to roll back:
+-        startCommit();
+-
+-        boolean success = false;
+-        try {
+-          doCommit();
+-          segmentInfos.write(directory);
+-          success = true;
+-        } finally {
+-
+-          if (!success) {
+-
+-            // Rollback changes that were made to
+-            // SegmentInfos but failed to get [fully]
+-            // committed.  This way this reader instance
+-            // remains consistent (matched to what's
+-            // actually in the index):
+-            rollbackCommit();
+-
+-            // Recompute deletable files & remove them (so
+-            // partially written .del files, etc, are
+-            // removed):
+-            deleter.refresh();
+-          }
+-        }
+-
+-        // Have the deleter remove any now unreferenced
+-        // files due to this commit:
+-        deleter.checkpoint(segmentInfos, true);
+-
+-        if (writeLock != null) {
+-          writeLock.release();  // release write lock
+-          writeLock = null;
+-        }
+-      }
+-      else
+-        doCommit();
++      doCommit();
+     }
+     hasChanges = false;
+   }
+@@ -854,28 +733,12 @@ public abstract class IndexReader {
+     if (!closed) {
+       commit();
+       doClose();
+-      if (directoryOwner)
+-        closed = true;
+-      if(closeDirectory)
+-        directory.close();
+     }
+   }
+ 
+   /** Implements close. */
+   protected abstract void doClose() throws IOException;
+ 
+-  /** Release the write lock, if needed. */
+-  protected void finalize() throws Throwable {
+-    try {
+-      if (writeLock != null) {
+-        writeLock.release();                        // release write lock
+-        writeLock = null;
+-      }
+-    } finally {
+-      super.finalize();
+-    }
+-  }
+-
+ 
+   /**
+    * Get a list of unique field names that exist in this index and have the specified
+diff --git a/src/java/org/apache/lucene/index/MultiReader.java b/src/java/org/apache/lucene/index/MultiReader.java
+index 2b9eead..b2fa34d 100644
+--- a/src/java/org/apache/lucene/index/MultiReader.java
++++ b/src/java/org/apache/lucene/index/MultiReader.java
+@@ -19,19 +19,27 @@ package org.apache.lucene.index;
+ 
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.FieldSelector;
+-import org.apache.lucene.store.Directory;
+ 
+ import java.io.IOException;
+ import java.util.Collection;
+-import java.util.HashSet;
+ import java.util.Hashtable;
+-import java.util.Set;
++
++import org.apache.lucene.index.MultiSegmentReader.MultiTermDocs;
++import org.apache.lucene.index.MultiSegmentReader.MultiTermEnum;
++import org.apache.lucene.index.MultiSegmentReader.MultiTermPositions;
+ 
+ /** An IndexReader which reads multiple indexes, appending their content.
+  *
+  * @version $Id$
+  */
+-public class MultiReader extends MultiSegmentReader {
++public class MultiReader extends IndexReader {
++  protected IndexReader[] subReaders;
++  private int[] starts;                           // 1st docno for each segment
++  private Hashtable normsCache = new Hashtable();
++  private int maxDoc = 0;
++  private int numDocs = -1;
++  private boolean hasDeletions = false;
++  
+  /**
+   * <p>Construct a MultiReader aggregating the named set of (sub)readers.
+   * Directory locking for delete, undeleteAll, and setNorm operations is
+@@ -40,11 +48,199 @@ public class MultiReader extends MultiSegmentReader {
+   * @param subReaders set of (sub)readers
+   * @throws IOException
+   */
+-  public MultiReader(IndexReader[] subReaders) throws IOException {
+-    super(subReaders.length == 0 ? null : subReaders[0].directory(), 
+-          null, false, subReaders);
++  public MultiReader(IndexReader[] subReaders) {
++    initialize(subReaders);
++  }
++
++  
++  private void initialize(IndexReader[] subReaders) {
++    this.subReaders = subReaders;
++    starts = new int[subReaders.length + 1];    // build starts array
++    for (int i = 0; i < subReaders.length; i++) {
++      starts[i] = maxDoc;
++      maxDoc += subReaders[i].maxDoc();      // compute maxDocs
++
++      if (subReaders[i].hasDeletions())
++        hasDeletions = true;
++    }
++    starts[subReaders.length] = maxDoc;
++  }
++
++
++  public TermFreqVector[] getTermFreqVectors(int n) throws IOException {
++    ensureOpen();
++    int i = readerIndex(n);        // find segment num
++    return subReaders[i].getTermFreqVectors(n - starts[i]); // dispatch to segment
++  }
++
++  public TermFreqVector getTermFreqVector(int n, String field)
++      throws IOException {
++    ensureOpen();
++    int i = readerIndex(n);        // find segment num
++    return subReaders[i].getTermFreqVector(n - starts[i], field);
++  }
++
++
++  public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException {
++    ensureOpen();
++    int i = readerIndex(docNumber);        // find segment num
++    subReaders[i].getTermFreqVector(docNumber - starts[i], field, mapper);
++  }
++
++  public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException {
++    ensureOpen();
++    int i = readerIndex(docNumber);        // find segment num
++    subReaders[i].getTermFreqVector(docNumber - starts[i], mapper);
++  }
++
++  public boolean isOptimized() {
++    return false;
+   }
++  
++  public synchronized int numDocs() {
++    // Don't call ensureOpen() here (it could affect performance)
++    if (numDocs == -1) {        // check cache
++      int n = 0;                // cache miss--recompute
++      for (int i = 0; i < subReaders.length; i++)
++        n += subReaders[i].numDocs();      // sum from readers
++      numDocs = n;
++    }
++    return numDocs;
++  }
++
++  public int maxDoc() {
++    // Don't call ensureOpen() here (it could affect performance)
++    return maxDoc;
++  }
++
++  // inherit javadoc
++  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
++    ensureOpen();
++    int i = readerIndex(n);                          // find segment num
++    return subReaders[i].document(n - starts[i], fieldSelector);    // dispatch to segment reader
++  }
++
++  public boolean isDeleted(int n) {
++    // Don't call ensureOpen() here (it could affect performance)
++    int i = readerIndex(n);                           // find segment num
++    return subReaders[i].isDeleted(n - starts[i]);    // dispatch to segment reader
++  }
++
++  public boolean hasDeletions() {
++    // Don't call ensureOpen() here (it could affect performance)
++    return hasDeletions;
++  }
++
++  protected void doDelete(int n) throws CorruptIndexException, IOException {
++    numDocs = -1;                             // invalidate cache
++    int i = readerIndex(n);                   // find segment num
++    subReaders[i].deleteDocument(n - starts[i]);      // dispatch to segment reader
++    hasDeletions = true;
++  }
++
++  protected void doUndeleteAll() throws CorruptIndexException, IOException {
++    for (int i = 0; i < subReaders.length; i++)
++      subReaders[i].undeleteAll();
+ 
++    hasDeletions = false;
++    numDocs = -1;                                 // invalidate cache
++  }
++
++  private int readerIndex(int n) {    // find reader for doc n:
++    return MultiSegmentReader.readerIndex(n, this.starts, this.subReaders.length);
++  }
++  
++  public boolean hasNorms(String field) throws IOException {
++    ensureOpen();
++    for (int i = 0; i < subReaders.length; i++) {
++      if (subReaders[i].hasNorms(field)) return true;
++    }
++    return false;
++  }
++
++  private byte[] ones;
++  private byte[] fakeNorms() {
++    if (ones==null) ones=SegmentReader.createFakeNorms(maxDoc());
++    return ones;
++  }
++  
++  public synchronized byte[] norms(String field) throws IOException {
++    ensureOpen();
++    byte[] bytes = (byte[])normsCache.get(field);
++    if (bytes != null)
++      return bytes;          // cache hit
++    if (!hasNorms(field))
++      return fakeNorms();
++
++    bytes = new byte[maxDoc()];
++    for (int i = 0; i < subReaders.length; i++)
++      subReaders[i].norms(field, bytes, starts[i]);
++    normsCache.put(field, bytes);      // update cache
++    return bytes;
++  }
++
++  public synchronized void norms(String field, byte[] result, int offset)
++    throws IOException {
++    ensureOpen();
++    byte[] bytes = (byte[])normsCache.get(field);
++    if (bytes==null && !hasNorms(field)) bytes=fakeNorms();
++    if (bytes != null)                            // cache hit
++      System.arraycopy(bytes, 0, result, offset, maxDoc());
++
++    for (int i = 0; i < subReaders.length; i++)      // read from segments
++      subReaders[i].norms(field, result, offset + starts[i]);
++  }
++
++  protected void doSetNorm(int n, String field, byte value)
++    throws CorruptIndexException, IOException {
++    normsCache.remove(field);                         // clear cache
++    int i = readerIndex(n);                           // find segment num
++    subReaders[i].setNorm(n-starts[i], field, value); // dispatch
++  }
++
++  public TermEnum terms() throws IOException {
++    ensureOpen();
++    return new MultiTermEnum(subReaders, starts, null);
++  }
++
++  public TermEnum terms(Term term) throws IOException {
++    ensureOpen();
++    return new MultiTermEnum(subReaders, starts, term);
++  }
++
++  public int docFreq(Term t) throws IOException {
++    ensureOpen();
++    int total = 0;          // sum freqs in segments
++    for (int i = 0; i < subReaders.length; i++)
++      total += subReaders[i].docFreq(t);
++    return total;
++  }
++
++  public TermDocs termDocs() throws IOException {
++    ensureOpen();
++    return new MultiTermDocs(subReaders, starts);
++  }
++
++  public TermPositions termPositions() throws IOException {
++    ensureOpen();
++    return new MultiTermPositions(subReaders, starts);
++  }
++
++  protected void doCommit() throws IOException {
++    for (int i = 0; i < subReaders.length; i++)
++      subReaders[i].commit();
++  }
++
++  protected synchronized void doClose() throws IOException {
++    for (int i = 0; i < subReaders.length; i++)
++      subReaders[i].close();
++  }
++
++  public Collection getFieldNames (IndexReader.FieldOption fieldNames) {
++    ensureOpen();
++    return MultiSegmentReader.getFieldNames(fieldNames, this.subReaders);
++  }  
++  
+   /**
+    * Checks recursively if all subreaders are up to date. 
+    */
+diff --git a/src/java/org/apache/lucene/index/MultiSegmentReader.java b/src/java/org/apache/lucene/index/MultiSegmentReader.java
+index 82c9900..578f7ed 100644
+--- a/src/java/org/apache/lucene/index/MultiSegmentReader.java
++++ b/src/java/org/apache/lucene/index/MultiSegmentReader.java
+@@ -30,8 +30,8 @@ import java.util.Set;
+ /** 
+  * An IndexReader which reads indexes with multiple segments.
+  */
+-class MultiSegmentReader extends IndexReader {
+-  protected IndexReader[] subReaders;
++class MultiSegmentReader extends DirectoryIndexReader {
++  protected SegmentReader[] subReaders;
+   private int[] starts;                           // 1st docno for each segment
+   private Hashtable normsCache = new Hashtable();
+   private int maxDoc = 0;
+@@ -39,12 +39,30 @@ class MultiSegmentReader extends IndexReader {
+   private boolean hasDeletions = false;
+ 
+   /** Construct reading the named set of readers. */
+-  MultiSegmentReader(Directory directory, SegmentInfos sis, boolean closeDirectory, IndexReader[] subReaders) {
++  MultiSegmentReader(Directory directory, SegmentInfos sis, boolean closeDirectory) throws IOException {
+     super(directory, sis, closeDirectory);
+-    initialize(subReaders);
++    // To reduce the chance of hitting FileNotFound
++    // (and having to retry), we open segments in
++    // reverse because IndexWriter merges & deletes
++    // the newest segments first.
++
++    SegmentReader[] readers = new SegmentReader[sis.size()];
++    for (int i = sis.size()-1; i >= 0; i--) {
++      try {
++        readers[i] = SegmentReader.get(sis.info(i));
++      } catch (IOException e) {
++        // Close all readers we had opened:
++        for(i++;i<sis.size();i++) {
++          readers[i].close();
++        }
++        throw e;
++      }
++    }
++
++    initialize(readers);
+   }
+ 
+-  private void initialize(IndexReader[] subReaders) {
++  private void initialize(SegmentReader[] subReaders) {
+     this.subReaders = subReaders;
+     starts = new int[subReaders.length + 1];    // build starts array
+     for (int i = 0; i < subReaders.length; i++) {
+@@ -138,8 +156,12 @@ class MultiSegmentReader extends IndexReader {
+   }
+ 
+   private int readerIndex(int n) {    // find reader for doc n:
++    return readerIndex(n, this.starts, this.subReaders.length);
++  }
++  
++  static int readerIndex(int n, int[] starts, int numSubReaders) {    // find reader for doc n:
+     int lo = 0;                                      // search starts array
+-    int hi = subReaders.length - 1;                  // for first element less
++    int hi = numSubReaders - 1;                  // for first element less
+ 
+     while (hi >= lo) {
+       int mid = (lo + hi) >> 1;
+@@ -149,7 +171,7 @@ class MultiSegmentReader extends IndexReader {
+       else if (n > midValue)
+         lo = mid + 1;
+       else {                                      // found a match
+-        while (mid+1 < subReaders.length && starts[mid+1] == midValue) {
++        while (mid+1 < numSubReaders && starts[mid+1] == midValue) {
+           mid++;                                  // scan to last match
+         }
+         return mid;
+@@ -234,7 +256,7 @@ class MultiSegmentReader extends IndexReader {
+     return new MultiTermPositions(subReaders, starts);
+   }
+ 
+-  protected void doCommit() throws IOException {
++  protected void commitChanges() throws IOException {
+     for (int i = 0; i < subReaders.length; i++)
+       subReaders[i].commit();
+   }
+@@ -256,11 +278,18 @@ class MultiSegmentReader extends IndexReader {
+   protected synchronized void doClose() throws IOException {
+     for (int i = 0; i < subReaders.length; i++)
+       subReaders[i].close();
++    
++    // maybe close directory
++    super.doClose();
+   }
+ 
+   public Collection getFieldNames (IndexReader.FieldOption fieldNames) {
+-    // maintain a unique set of field names
+     ensureOpen();
++    return getFieldNames(fieldNames, this.subReaders);
++  }
++  
++  static Collection getFieldNames (IndexReader.FieldOption fieldNames, IndexReader[] subReaders) {
++    // maintain a unique set of field names
+     Set fieldSet = new HashSet();
+     for (int i = 0; i < subReaders.length; i++) {
+       IndexReader reader = subReaders[i];
+diff --git a/src/java/org/apache/lucene/index/ParallelReader.java b/src/java/org/apache/lucene/index/ParallelReader.java
+index 34d3a80..57e30e9 100644
+--- a/src/java/org/apache/lucene/index/ParallelReader.java
++++ b/src/java/org/apache/lucene/index/ParallelReader.java
+@@ -54,7 +54,7 @@ public class ParallelReader extends IndexReader {
+   private boolean hasDeletions;
+ 
+  /** Construct a ParallelReader. */
+-  public ParallelReader() throws IOException { super(null); }
++  public ParallelReader() throws IOException { super(); }
+ 
+  /** Add an IndexReader.
+   * @throws IOException if there is a low-level IO error
+@@ -488,3 +488,4 @@ public class ParallelReader extends IndexReader {
+ 
+ 
+ 
++
+diff --git a/src/java/org/apache/lucene/index/SegmentReader.java b/src/java/org/apache/lucene/index/SegmentReader.java
+index 4f8d548..417e5bd 100644
+--- a/src/java/org/apache/lucene/index/SegmentReader.java
++++ b/src/java/org/apache/lucene/index/SegmentReader.java
+@@ -32,7 +32,7 @@ import java.util.*;
+ /**
+  * @version $Id$
+  */
+-class SegmentReader extends IndexReader {
++class SegmentReader extends DirectoryIndexReader {
+   private String segment;
+   private SegmentInfo si;
+ 
+@@ -122,8 +122,6 @@ class SegmentReader extends IndexReader {
+     }
+   }
+ 
+-  protected SegmentReader() { super(null); }
+-
+   /**
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
+@@ -193,7 +191,7 @@ class SegmentReader extends IndexReader {
+     } catch (Exception e) {
+       throw new RuntimeException("cannot load SegmentReader class: " + e, e);
+     }
+-    instance.init(dir, sis, closeDir, ownDir);
++    instance.init(dir, sis, closeDir);
+     instance.initialize(si, readBufferSize, doOpenStores);
+     return instance;
+   }
+@@ -289,7 +287,7 @@ class SegmentReader extends IndexReader {
+     }
+   }
+ 
+-  protected void doCommit() throws IOException {
++  protected void commitChanges() throws IOException {
+     if (deletedDocsDirty) {               // re-write deleted
+       si.advanceDelGen();
+ 
+@@ -339,6 +337,9 @@ class SegmentReader extends IndexReader {
+ 
+     if (storeCFSReader != null)
+       storeCFSReader.close();
++    
++    // maybe close directory
++    super.doClose();
+   }
+ 
+   static boolean hasDeletions(SegmentInfo si) throws IOException {
+diff --git a/src/test/org/apache/lucene/index/TestMultiReader.java b/src/test/org/apache/lucene/index/TestMultiReader.java
+index 9f6766a..30130bc 100644
+--- a/src/test/org/apache/lucene/index/TestMultiReader.java
++++ b/src/test/org/apache/lucene/index/TestMultiReader.java
+@@ -17,128 +17,33 @@ package org.apache.lucene.index;
+  * limitations under the License.
+  */
+ 
+-import junit.framework.TestCase;
++import java.io.IOException;
+ 
+-import org.apache.lucene.analysis.standard.StandardAnalyzer;
+-import org.apache.lucene.document.Document;
+-import org.apache.lucene.document.Field;
+ import org.apache.lucene.store.Directory;
+-import org.apache.lucene.store.RAMDirectory;
+-
+-import java.io.IOException;
+ 
+-public class TestMultiReader extends TestCase {
+-  private Directory dir = new RAMDirectory();
+-  private Document doc1 = new Document();
+-  private Document doc2 = new Document();
+-  private SegmentReader reader1;
+-  private SegmentReader reader2;
+-  private SegmentReader [] readers = new SegmentReader[2];
+-  private SegmentInfos sis = new SegmentInfos();
+-  
++public class TestMultiReader extends TestMultiSegmentReader {
+   public TestMultiReader(String s) {
+     super(s);
+   }
+ 
+-  protected void setUp() throws IOException {
+-    DocHelper.setupDoc(doc1);
+-    DocHelper.setupDoc(doc2);
+-    SegmentInfo info1 = DocHelper.writeDoc(dir, doc1);
+-    SegmentInfo info2 = DocHelper.writeDoc(dir, doc2);
+-    sis.write(dir);
+-    openReaders();
+-  }
++  protected IndexReader openReader() throws IOException {
++    IndexReader reader;
+ 
+-  private void openReaders() throws IOException {
+     sis.read(dir);
+-    reader1 = SegmentReader.get(sis.info(0));
+-    reader2 = SegmentReader.get(sis.info(1));
++    SegmentReader reader1 = SegmentReader.get(sis.info(0));
++    SegmentReader reader2 = SegmentReader.get(sis.info(1));
+     readers[0] = reader1;
+     readers[1] = reader2;
+-  }
+-
+-  public void test() {
+-    assertTrue(dir != null);
+     assertTrue(reader1 != null);
+     assertTrue(reader2 != null);
+-    assertTrue(sis != null);
+-  }    
+ 
+-  public void testDocument() throws IOException {
+-    sis.read(dir);
+-    MultiSegmentReader reader = new MultiSegmentReader(dir, sis, false, readers);
+-    assertTrue(reader != null);
+-    Document newDoc1 = reader.document(0);
+-    assertTrue(newDoc1 != null);
+-    assertTrue(DocHelper.numFields(newDoc1) == DocHelper.numFields(doc1) - DocHelper.unstored.size());
+-    Document newDoc2 = reader.document(1);
+-    assertTrue(newDoc2 != null);
+-    assertTrue(DocHelper.numFields(newDoc2) == DocHelper.numFields(doc2) - DocHelper.unstored.size());
+-    TermFreqVector vector = reader.getTermFreqVector(0, DocHelper.TEXT_FIELD_2_KEY);
+-    assertTrue(vector != null);
+-    TestSegmentReader.checkNorms(reader);
+-  }
++    reader = new MultiReader(readers);
+ 
+-  public void testUndeleteAll() throws IOException {
+-    sis.read(dir);
+-    MultiSegmentReader reader = new MultiSegmentReader(dir, sis, false, readers);
+-    assertTrue(reader != null);
+-    assertEquals( 2, reader.numDocs() );
+-    reader.deleteDocument(0);
+-    assertEquals( 1, reader.numDocs() );
+-    reader.undeleteAll();
+-    assertEquals( 2, reader.numDocs() );
+-
+-    // Ensure undeleteAll survives commit/close/reopen:
+-    reader.commit();
+-    reader.close();
+-    sis.read(dir);
+-    openReaders();
+-    reader = new MultiSegmentReader(dir, sis, false, readers);
+-    assertEquals( 2, reader.numDocs() );
+-
+-    reader.deleteDocument(0);
+-    assertEquals( 1, reader.numDocs() );
+-    reader.commit();
+-    reader.close();
+-    sis.read(dir);
+-    reader = new MultiSegmentReader(dir, sis, false, readers);
+-    assertEquals( 1, reader.numDocs() );
+-  }
+-        
+-  
+-  public void testTermVectors() {
+-    MultiSegmentReader reader = new MultiSegmentReader(dir, sis, false, readers);
++    assertTrue(dir != null);
++    assertTrue(sis != null);
+     assertTrue(reader != null);
++    
++    return reader;
+   }
+-  
+ 
+-  public void testIsCurrent() throws IOException {
+-    RAMDirectory ramDir1=new RAMDirectory();
+-    addDoc(ramDir1, "test foo", true);
+-    RAMDirectory ramDir2=new RAMDirectory();
+-    addDoc(ramDir2, "test blah", true);
+-    IndexReader[] readers = new IndexReader[]{IndexReader.open(ramDir1), IndexReader.open(ramDir2)};
+-    MultiReader mr = new MultiReader(readers);
+-    assertTrue(mr.isCurrent());   // just opened, must be current
+-    addDoc(ramDir1, "more text", false);
+-    assertFalse(mr.isCurrent());   // has been modified, not current anymore
+-    addDoc(ramDir2, "even more text", false);
+-    assertFalse(mr.isCurrent());   // has been modified even more, not current anymore
+-    try {
+-      mr.getVersion();
+-      fail();
+-    } catch (UnsupportedOperationException e) {
+-      // expected exception
+-    }
+-    mr.close();
+-  }
+-
+-  private void addDoc(RAMDirectory ramDir1, String s, boolean create) throws IOException {
+-    IndexWriter iw = new IndexWriter(ramDir1, new StandardAnalyzer(), create);
+-    Document doc = new Document();
+-    doc.add(new Field("body", s, Field.Store.YES, Field.Index.TOKENIZED));
+-    iw.addDocument(doc);
+-    iw.close();
+-  }
+ }
+diff --git a/src/test/org/apache/lucene/index/TestMultiSegmentReader.java b/src/test/org/apache/lucene/index/TestMultiSegmentReader.java
+new file mode 100644
+index 0000000..541d630
+--- /dev/null
++++ b/src/test/org/apache/lucene/index/TestMultiSegmentReader.java
+@@ -0,0 +1,148 @@
++package org.apache.lucene.index;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import junit.framework.TestCase;
++
++import org.apache.lucene.analysis.standard.StandardAnalyzer;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.RAMDirectory;
++
++import java.io.IOException;
++
++public class TestMultiSegmentReader extends TestCase {
++  protected Directory dir;
++  private Document doc1;
++  private Document doc2;
++  protected SegmentReader [] readers = new SegmentReader[2];
++  protected SegmentInfos sis;
++  
++  
++  public TestMultiSegmentReader(String s) {
++    super(s);
++  }
++
++  protected void setUp() throws IOException {
++    dir = new RAMDirectory();
++    sis = new SegmentInfos();
++    doc1 = new Document();
++    doc2 = new Document();
++    DocHelper.setupDoc(doc1);
++    DocHelper.setupDoc(doc2);
++    SegmentInfo info1 = DocHelper.writeDoc(dir, doc1);
++    SegmentInfo info2 = DocHelper.writeDoc(dir, doc2);
++    sis.write(dir);
++  }
++
++  protected IndexReader openReader() throws IOException {
++    IndexReader reader;
++    reader = IndexReader.open(dir);
++    assertTrue(reader instanceof MultiSegmentReader);
++
++    assertTrue(dir != null);
++    assertTrue(sis != null);
++    assertTrue(reader != null);
++    
++    return reader;
++  }
++
++  public void test() throws IOException {
++    setUp();
++    doTestDocument();
++    doTestUndeleteAll();
++  }    
++
++  public void doTestDocument() throws IOException {
++    sis.read(dir);
++    IndexReader reader = openReader();
++    assertTrue(reader != null);
++    Document newDoc1 = reader.document(0);
++    assertTrue(newDoc1 != null);
++    assertTrue(DocHelper.numFields(newDoc1) == DocHelper.numFields(doc1) - DocHelper.unstored.size());
++    Document newDoc2 = reader.document(1);
++    assertTrue(newDoc2 != null);
++    assertTrue(DocHelper.numFields(newDoc2) == DocHelper.numFields(doc2) - DocHelper.unstored.size());
++    TermFreqVector vector = reader.getTermFreqVector(0, DocHelper.TEXT_FIELD_2_KEY);
++    assertTrue(vector != null);
++    TestSegmentReader.checkNorms(reader);
++  }
++
++  public void doTestUndeleteAll() throws IOException {
++    sis.read(dir);
++    IndexReader reader = openReader();
++    assertTrue(reader != null);
++    assertEquals( 2, reader.numDocs() );
++    reader.deleteDocument(0);
++    assertEquals( 1, reader.numDocs() );
++    reader.undeleteAll();
++    assertEquals( 2, reader.numDocs() );
++
++    // Ensure undeleteAll survives commit/close/reopen:
++    reader.commit();
++    reader.close();
++    sis.read(dir);
++    reader = openReader();
++    assertEquals( 2, reader.numDocs() );
++
++    reader.deleteDocument(0);
++    assertEquals( 1, reader.numDocs() );
++    reader.commit();
++    reader.close();
++    sis.read(dir);
++    reader = openReader();
++    assertEquals( 1, reader.numDocs() );
++  }
++        
++  
++  public void _testTermVectors() {
++    MultiReader reader = new MultiReader(readers);
++    assertTrue(reader != null);
++  }
++  
++
++  public void testIsCurrent() throws IOException {
++    RAMDirectory ramDir1=new RAMDirectory();
++    addDoc(ramDir1, "test foo", true);
++    RAMDirectory ramDir2=new RAMDirectory();
++    addDoc(ramDir2, "test blah", true);
++    IndexReader[] readers = new IndexReader[]{IndexReader.open(ramDir1), IndexReader.open(ramDir2)};
++    MultiReader mr = new MultiReader(readers);
++    assertTrue(mr.isCurrent());   // just opened, must be current
++    addDoc(ramDir1, "more text", false);
++    assertFalse(mr.isCurrent());   // has been modified, not current anymore
++    addDoc(ramDir2, "even more text", false);
++    assertFalse(mr.isCurrent());   // has been modified even more, not current anymore
++    try {
++      mr.getVersion();
++      fail();
++    } catch (UnsupportedOperationException e) {
++      // expected exception
++    }
++    mr.close();
++  }
++
++  private void addDoc(RAMDirectory ramDir1, String s, boolean create) throws IOException {
++    IndexWriter iw = new IndexWriter(ramDir1, new StandardAnalyzer(), create);
++    Document doc = new Document();
++    doc.add(new Field("body", s, Field.Store.YES, Field.Index.TOKENIZED));
++    iw.addDocument(doc);
++    iw.close();
++  }
++}
+

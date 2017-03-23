@@ -1,0 +1,609 @@
+GitDiffStart: 1aab3f64f0a8c2662b3cd8803afc684fdacc5808 | Fri Nov 27 15:32:57 2009 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 416a680..6416837 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -30,6 +30,13 @@ Optimizations
+ * LUCENE-2086: When resolving deleted terms, do so in term sort order
+   for better performance. (Bogdan Ghidireac via Mike McCandless)
+ 
++* LUCENE-2075: Terms dict cache is now shared across threads instead
++  of being stored separately in thread local storage.  Also fixed
++  terms dict so that the cache is used when seeking the thread local
++  term enum, which will be important for MultiTermQuery impls that do
++  lots of seeking (Mike McCandless, Uwe Schindler, Robert Muir, Yonik
++  Seeley)
++
+ Build
+ 
+ ======================= Release 3.0.0 2009-11-25 =======================
+diff --git a/src/java/org/apache/lucene/index/TermInfo.java b/src/java/org/apache/lucene/index/TermInfo.java
+index ec07ac0..5fd0b92 100644
+--- a/src/java/org/apache/lucene/index/TermInfo.java
++++ b/src/java/org/apache/lucene/index/TermInfo.java
+@@ -19,7 +19,7 @@ package org.apache.lucene.index;
+ 
+ /** A TermInfo is the record of information stored for a term.*/
+ 
+-final class TermInfo {
++class TermInfo {
+   /** The number of documents which contain the term. */
+   int docFreq = 0;
+ 
+@@ -42,6 +42,28 @@ final class TermInfo {
+     skipOffset = ti.skipOffset;
+   }
+ 
++  public boolean equals(Object obj) {
++    if (obj instanceof TermInfo) {
++      TermInfo other = (TermInfo) obj;
++      return other.docFreq == docFreq &&
++        other.freqPointer == freqPointer &&
++        other.proxPointer == proxPointer &&
++        other.skipOffset == skipOffset;
++    } else {
++      return false;
++    }
++  }
++
++  public int hashCode() {
++    final int PRIME = 17;
++    int result = 1;
++    result = PRIME * result + docFreq;
++    result = (int) (PRIME * result + freqPointer);
++    result = (int) (PRIME * result + proxPointer);
++    result = (int) (PRIME * result + skipOffset);
++    return result;
++  }
++
+   final void set(int docFreq,
+                  long freqPointer, long proxPointer, int skipOffset) {
+     this.docFreq = docFreq;
+diff --git a/src/java/org/apache/lucene/index/TermInfosReader.java b/src/java/org/apache/lucene/index/TermInfosReader.java
+index 22e2a32..7d90f30 100644
+--- a/src/java/org/apache/lucene/index/TermInfosReader.java
++++ b/src/java/org/apache/lucene/index/TermInfosReader.java
+@@ -21,7 +21,7 @@ import java.io.IOException;
+ 
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.cache.Cache;
+-import org.apache.lucene.util.cache.SimpleLRUCache;
++import org.apache.lucene.util.cache.DoubleBarrelLRUCache;
+ import org.apache.lucene.util.CloseableThreadLocal;
+ 
+ /** This stores a monotonically increasing set of <Term, TermInfo> pairs in a
+@@ -44,15 +44,23 @@ final class TermInfosReader {
+   private final int totalIndexInterval;
+ 
+   private final static int DEFAULT_CACHE_SIZE = 1024;
++
++  // Just adds term's ord to TermInfo
++  private final static class TermInfoAndOrd extends TermInfo {
++    final int termOrd;
++    public TermInfoAndOrd(TermInfo ti, int termOrd) {
++      super(ti);
++      this.termOrd = termOrd;
++    }
++  }
++
++  private final Cache<Term,TermInfoAndOrd> termsCache = new DoubleBarrelLRUCache<Term,TermInfoAndOrd>(DEFAULT_CACHE_SIZE);
+   
+   /**
+    * Per-thread resources managed by ThreadLocal
+    */
+   private static final class ThreadResources {
+     SegmentTermEnum termEnum;
+-    
+-    // Used for caching the least recently looked-up Terms
+-    Cache<Term,TermInfo> termInfoCache;
+   }
+   
+   TermInfosReader(Directory dir, String seg, FieldInfos fis, int readBufferSize, int indexDivisor)
+@@ -130,6 +138,7 @@ final class TermInfosReader {
+     if (origEnum != null)
+       origEnum.close();
+     threadResources.close();
++    termsCache.close();
+   }
+ 
+   /** Returns the number of term/value pairs in the set. */
+@@ -142,8 +151,6 @@ final class TermInfosReader {
+     if (resources == null) {
+       resources = new ThreadResources();
+       resources.termEnum = terms();
+-      // Cache does not have to be thread-safe, it is only used by one thread at the same time
+-      resources.termInfoCache = new SimpleLRUCache<Term,TermInfo>(DEFAULT_CACHE_SIZE);
+       threadResources.set(resources);
+     }
+     return resources;
+@@ -176,26 +183,20 @@ final class TermInfosReader {
+ 
+   /** Returns the TermInfo for a Term in the set, or null. */
+   TermInfo get(Term term) throws IOException {
+-    return get(term, true);
++    return get(term, false);
+   }
+   
+   /** Returns the TermInfo for a Term in the set, or null. */
+-  private TermInfo get(Term term, boolean useCache) throws IOException {
++  private TermInfo get(Term term, boolean mustSeekEnum) throws IOException {
+     if (size == 0) return null;
+ 
+     ensureIndexIsRead();
+ 
+-    TermInfo ti;
++    TermInfoAndOrd tiOrd = termsCache.get(term);
+     ThreadResources resources = getThreadResources();
+-    Cache<Term,TermInfo> cache = null;
+     
+-    if (useCache) {
+-      cache = resources.termInfoCache;
+-      // check the cache first if the term was recently looked up
+-      ti = cache.get(term);
+-      if (ti != null) {
+-        return ti;
+-      }
++    if (!mustSeekEnum && tiOrd != null) {
++      return tiOrd;
+     }
+     
+     // optimize sequential access: first try scanning cached enum w/o seeking
+@@ -208,16 +209,23 @@ final class TermInfosReader {
+     || term.compareTo(indexTerms[enumOffset]) < 0) {
+        // no need to seek
+ 
++        final TermInfo ti;
++
+         int numScans = enumerator.scanTo(term);
+         if (enumerator.term() != null && term.compareTo(enumerator.term()) == 0) {
+           ti = enumerator.termInfo();
+-          if (cache != null && numScans > 1) {
++          if (numScans > 1) {
+             // we only  want to put this TermInfo into the cache if
+             // scanEnum skipped more than one dictionary entry.
+             // This prevents RangeQueries or WildcardQueries to 
+             // wipe out the cache when they iterate over a large numbers
+             // of terms in order
+-            cache.put(term, ti);
++            if (tiOrd == null) {
++              termsCache.put(term, new TermInfoAndOrd(ti, (int) enumerator.position));
++            } else {
++              assert ti.equals(tiOrd);
++              assert (int) enumerator.position == tiOrd.termOrd;
++            }
+           }
+         } else {
+           ti = null;
+@@ -228,12 +236,24 @@ final class TermInfosReader {
+     }
+ 
+     // random-access: must seek
+-    seekEnum(enumerator, getIndexOffset(term));
++    final int indexPos;
++    if (tiOrd != null) {
++      indexPos = tiOrd.termOrd / totalIndexInterval;
++    } else {
++      // Must do binary search:
++      indexPos = getIndexOffset(term);
++    }
++
++    seekEnum(enumerator, indexPos);
+     enumerator.scanTo(term);
++    final TermInfo ti;
+     if (enumerator.term() != null && term.compareTo(enumerator.term()) == 0) {
+       ti = enumerator.termInfo();
+-      if (cache != null) {
+-        cache.put(term, ti);
++      if (tiOrd == null) {
++        termsCache.put(term, new TermInfoAndOrd(ti, (int) enumerator.position));
++      } else {
++        assert ti.equals(tiOrd);
++        assert (int) enumerator.position == tiOrd.termOrd;
+       }
+     } else {
+       ti = null;
+@@ -294,9 +314,7 @@ final class TermInfosReader {
+ 
+   /** Returns an enumeration of terms starting at or after the named term. */
+   public SegmentTermEnum terms(Term term) throws IOException {
+-    // don't use the cache in this call because we want to reposition the
+-    // enumeration
+-    get(term, false);
++    get(term, true);
+     return (SegmentTermEnum)getThreadResources().termEnum.clone();
+   }
+ }
+diff --git a/src/java/org/apache/lucene/util/cache/DoubleBarrelLRUCache.java b/src/java/org/apache/lucene/util/cache/DoubleBarrelLRUCache.java
+new file mode 100644
+index 0000000..cf7307a
+--- /dev/null
++++ b/src/java/org/apache/lucene/util/cache/DoubleBarrelLRUCache.java
+@@ -0,0 +1,128 @@
++package org.apache.lucene.util.cache;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.Map;
++
++/**
++ * Simple concurrent LRU cache, using a "double barrel"
++ * approach where two ConcurrentHashMaps record entries.
++ *
++ * <p>At any given time, one hash is primary and the other
++ * is secondary.  {@link #get} first checks primary, and if
++ * that's a miss, checks secondary.  If secondary has the
++ * entry, it's promoted to primary.  Once primary is full,
++ * the secondary is cleared and the two are swapped.</p>
++ *
++ * <p>This is not as space efficient as other possible
++ * concurrent approaches (see LUCENE-2075): to achieve
++ * perfect LRU(N) it requires 2*N storage.  But, this
++ * approach is relatively simple and seems in practice to
++ * not grow unbounded in size when under hideously high
++ * load.</p>
++ *
++ * <p>NOTE: this class is meant only to be used internally
++ * by Lucene; it's only public so it can be shared across
++ * packages.  This means the API is freely subject to
++ * change, and, the class could be removed entirely, in any
++ * Lucene release.  Use directly at your own risk!
++ */
++
++final public class DoubleBarrelLRUCache<K,V> extends Cache<K,V> {
++  private final Map<K,V> cache1;
++  private final Map<K,V> cache2;
++  private final AtomicInteger countdown;
++  private volatile boolean swapped;
++  private final int maxSize;
++
++  public DoubleBarrelLRUCache(int maxSize) {
++    this.maxSize = maxSize;
++    countdown = new AtomicInteger(maxSize);
++    cache1 = new ConcurrentHashMap<K,V>();
++    cache2 = new ConcurrentHashMap<K,V>();
++  }
++
++  @Override
++  public boolean containsKey(Object k) {
++    return false;
++  }
++
++  @Override
++  public void close() {
++  }
++
++  @Override @SuppressWarnings("unchecked")
++  public V get(Object key) {
++    final Map<K,V> primary;
++    final Map<K,V> secondary;
++    if (swapped) {
++      primary = cache2;
++      secondary = cache1;
++    } else {
++      primary = cache1;
++      secondary = cache2;
++    }
++
++    // Try primary frist
++    V result = primary.get(key);
++    if (result == null) {
++      // Not found -- try secondary
++      result = secondary.get(key);
++      if (result != null) {
++        // Promote to primary
++        put((K) key, result);
++      }
++    }
++    return result;
++  }
++
++  @Override
++  public void put(K key, V value) {
++    final Map<K,V> primary;
++    final Map<K,V> secondary;
++    if (swapped) {
++      primary = cache2;
++      secondary = cache1;
++    } else {
++      primary = cache1;
++      secondary = cache2;
++    }
++    primary.put(key, value);
++
++    if (countdown.decrementAndGet() == 0) {
++      // Time to swap
++
++      // NOTE: there is saturation risk here, that the
++      // thread that's doing the clear() takes too long to
++      // do so, while other threads continue to add to
++      // primary, but in practice this seems not to be an
++      // issue (see LUCENE-2075 for benchmark & details)
++
++      // First, clear secondary
++      secondary.clear();
++
++      // Second, swap
++      swapped = !swapped;
++
++      // Third, reset countdown
++      countdown.set(maxSize);
++    }
++  }
++}
+diff --git a/src/java/org/apache/lucene/util/cache/SimpleLRUCache.java b/src/java/org/apache/lucene/util/cache/SimpleLRUCache.java
+index 1e0f350..eb1a66b 100644
+--- a/src/java/org/apache/lucene/util/cache/SimpleLRUCache.java
++++ b/src/java/org/apache/lucene/util/cache/SimpleLRUCache.java
+@@ -24,7 +24,9 @@ import java.util.Map;
+  * Simple LRU cache implementation that uses a LinkedHashMap.
+  * This cache is not synchronized, use {@link Cache#synchronizedCache(Cache)}
+  * if needed.
+- * 
++ *
++ * @deprecated Lucene's internal use of this class has now
++ * switched to {@link DoubleBarrelLRUCache}.
+  */
+ public class SimpleLRUCache<K,V> extends SimpleMapCache<K,V> {
+   private final static float LOADFACTOR = 0.75f;
+diff --git a/src/java/org/apache/lucene/util/cache/SimpleMapCache.java b/src/java/org/apache/lucene/util/cache/SimpleMapCache.java
+index 293bd80..8d917b5 100644
+--- a/src/java/org/apache/lucene/util/cache/SimpleMapCache.java
++++ b/src/java/org/apache/lucene/util/cache/SimpleMapCache.java
+@@ -25,6 +25,9 @@ import java.util.Set;
+  * Simple cache implementation that uses a HashMap to store (key, value) pairs.
+  * This cache is not synchronized, use {@link Cache#synchronizedCache(Cache)}
+  * if needed.
++ *
++ * @deprecated Lucene's internal use of this class has now
++ * switched to {@link DoubleBarrelLRUCache}.
+  */
+ public class SimpleMapCache<K,V> extends Cache<K,V> {
+   protected Map<K,V> map;
+diff --git a/src/test/org/apache/lucene/util/cache/BaseTestLRU.java b/src/test/org/apache/lucene/util/cache/BaseTestLRU.java
+new file mode 100644
+index 0000000..69341a2
+--- /dev/null
++++ b/src/test/org/apache/lucene/util/cache/BaseTestLRU.java
+@@ -0,0 +1,60 @@
++package org.apache.lucene.util.cache;
++
++/**
++* Licensed to the Apache Software Foundation (ASF) under one or more
++* contributor license agreements.  See the NOTICE file distributed with
++* this work for additional information regarding copyright ownership.
++* The ASF licenses this file to You under the Apache License, Version 2.0
++* (the "License"); you may not use this file except in compliance with
++* the License.  You may obtain a copy of the License at
++*
++*     http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++import org.apache.lucene.util.LuceneTestCase;
++
++public class BaseTestLRU extends LuceneTestCase {
++
++  protected void testCache(Cache cache, int n) throws Exception {
++    Object dummy = new Object();
++    
++    for (int i = 0; i < n; i++) {
++      cache.put(Integer.valueOf(i), dummy);
++    }
++    
++    // access every 2nd item in cache
++    for (int i = 0; i < n; i+=2) {
++      assertNotNull(cache.get(Integer.valueOf(i)));
++    }
++    
++    // add n/2 elements to cache, the ones that weren't
++    // touched in the previous loop should now be thrown away
++    for (int i = n; i < n + (n / 2); i++) {
++      cache.put(Integer.valueOf(i), dummy);
++    }
++    
++    // access every 4th item in cache
++    for (int i = 0; i < n; i+=4) {
++      assertNotNull(cache.get(Integer.valueOf(i)));
++    }
++
++    // add 3/4n elements to cache, the ones that weren't
++    // touched in the previous loops should now be thrown away
++    for (int i = n; i < n + (n * 3 / 4); i++) {
++      cache.put(Integer.valueOf(i), dummy);
++    }
++    
++    // access every 4th item in cache
++    for (int i = 0; i < n; i+=4) {
++      assertNotNull(cache.get(Integer.valueOf(i)));
++    }
++    
++  }
++  
++}
+diff --git a/src/test/org/apache/lucene/util/cache/TestDoubleBarrelLRUCache.java b/src/test/org/apache/lucene/util/cache/TestDoubleBarrelLRUCache.java
+new file mode 100644
+index 0000000..0455012
+--- /dev/null
++++ b/src/test/org/apache/lucene/util/cache/TestDoubleBarrelLRUCache.java
+@@ -0,0 +1,103 @@
++package org.apache.lucene.util.cache;
++
++/**
++* Licensed to the Apache Software Foundation (ASF) under one or more
++* contributor license agreements.  See the NOTICE file distributed with
++* this work for additional information regarding copyright ownership.
++* The ASF licenses this file to You under the Apache License, Version 2.0
++* (the "License"); you may not use this file except in compliance with
++* the License.  You may obtain a copy of the License at
++*
++*     http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++public class TestDoubleBarrelLRUCache extends BaseTestLRU {
++
++  public void testLRUCache() throws Exception {
++    final int n = 100;
++    testCache(new DoubleBarrelLRUCache(n), n);
++  }
++
++  private class CacheThread extends Thread {
++    private final Object[] objs;
++    private final Cache<Object,Object> c;
++    private final long endTime;
++    volatile boolean failed;
++
++    public CacheThread(Cache<Object,Object> c,
++                     Object[] objs, long endTime) {
++      this.c = c;
++      this.objs = objs;
++      this.endTime = endTime;
++    }
++
++    public void run() {
++      try {
++        long count = 0;
++        long miss = 0;
++        long hit = 0;
++        final int limit = objs.length;
++
++        while(true) {
++          final Object obj = objs[(int) ((count/2) % limit)];
++          Object v = c.get(obj);
++          if (v == null) {
++            c.put(obj, obj);
++            miss++;
++          } else {
++            assert obj == v;
++            hit++;
++          }
++          if ((++count % 10000) == 0) {
++            if (System.currentTimeMillis() >= endTime)  {
++              break;
++            }
++          }
++        }
++
++        addResults(miss, hit);
++      } catch (Throwable t) {
++        failed = true;
++        throw new RuntimeException(t);
++      }
++    }
++  }
++
++  long totMiss, totHit;
++  void addResults(long miss, long hit) {
++    totMiss += miss;
++    totHit += hit;
++  }
++
++  public void testThreadCorrectness() throws Exception {
++    final int NUM_THREADS = 4;
++    final int CACHE_SIZE = 512;
++    final int OBJ_COUNT = 3*CACHE_SIZE;
++
++    Cache<Object,Object> c = new DoubleBarrelLRUCache<Object,Object>(1024);
++
++    Object[] objs = new Object[OBJ_COUNT];
++    for(int i=0;i<OBJ_COUNT;i++) {
++      objs[i] = new Object();
++    }
++    
++    final CacheThread[] threads = new CacheThread[NUM_THREADS];
++    final long endTime = System.currentTimeMillis()+((long) 1000);
++    for(int i=0;i<NUM_THREADS;i++) {
++      threads[i] = new CacheThread(c, objs, endTime);
++      threads[i].start();
++    }
++    for(int i=0;i<NUM_THREADS;i++) {
++      threads[i].join();
++      assert !threads[i].failed;
++    }
++    //System.out.println("hits=" + totHit + " misses=" + totMiss);
++  }
++  
++}
+diff --git a/src/test/org/apache/lucene/util/cache/TestSimpleLRUCache.java b/src/test/org/apache/lucene/util/cache/TestSimpleLRUCache.java
+index 4191ec7..825f990 100644
+--- a/src/test/org/apache/lucene/util/cache/TestSimpleLRUCache.java
++++ b/src/test/org/apache/lucene/util/cache/TestSimpleLRUCache.java
+@@ -17,47 +17,10 @@ package org.apache.lucene.util.cache;
+ * limitations under the License.
+ */
+ 
+-import org.apache.lucene.util.LuceneTestCase;
+-
+-public class TestSimpleLRUCache extends LuceneTestCase {
+-
++/** @deprecated */
++public class TestSimpleLRUCache extends BaseTestLRU {
+   public void testLRUCache() throws Exception {
+     final int n = 100;
+-    Object dummy = new Object();
+-    
+-    Cache cache = new SimpleLRUCache(n);
+-    
+-    for (int i = 0; i < n; i++) {
+-      cache.put(Integer.valueOf(i), dummy);
+-    }
+-    
+-    // access every 2nd item in cache
+-    for (int i = 0; i < n; i+=2) {
+-      assertNotNull(cache.get(Integer.valueOf(i)));
+-    }
+-    
+-    // add n/2 elements to cache, the ones that weren't
+-    // touched in the previous loop should now be thrown away
+-    for (int i = n; i < n + (n / 2); i++) {
+-      cache.put(Integer.valueOf(i), dummy);
+-    }
+-    
+-    // access every 4th item in cache
+-    for (int i = 0; i < n; i+=4) {
+-      assertNotNull(cache.get(Integer.valueOf(i)));
+-    }
+-
+-    // add 3/4n elements to cache, the ones that weren't
+-    // touched in the previous loops should now be thrown away
+-    for (int i = n; i < n + (n * 3 / 4); i++) {
+-      cache.put(Integer.valueOf(i), dummy);
+-    }
+-    
+-    // access every 4th item in cache
+-    for (int i = 0; i < n; i+=4) {
+-      assertNotNull(cache.get(Integer.valueOf(i)));
+-    }
+-    
++    testCache(new SimpleLRUCache(n), n);
+   }
+-  
+ }
+

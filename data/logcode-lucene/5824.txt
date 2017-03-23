@@ -1,0 +1,659 @@
+GitDiffStart: 2671418cfb65abe054ed58f4ee9152fd09454a81 | Tue Jul 15 15:23:57 2014 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 0390e3c..476eb16 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -175,6 +175,14 @@ Bug Fixes
+ 
+ * SOLR-6245: Socket and Connection configuration are ignored in HttpSolrServer when passing in HttpClient.
+   (Patanachai Tangchaisin, shalin)
++  
++* SOLR-6137: Schemaless concurrency improvements:
++  - Fixed an NPE when reloading a managed schema with no dynamic copy fields
++  - Moved parsing and schema fields addition to after the distributed phase
++  - AddSchemaFieldsUpdateProcessor now uses a fixed schema rather than always
++    retrieving the latest, and holds the schema update lock through the entire
++    schema swap-out process
++  (Gregory Chanan via Steve Rowe)
+ 
+ Optimizations
+ ---------------------
+diff --git a/solr/core/src/java/org/apache/solr/schema/ManagedIndexSchema.java b/solr/core/src/java/org/apache/solr/schema/ManagedIndexSchema.java
+index 0c88d4e..ec898de 100644
+--- a/solr/core/src/java/org/apache/solr/schema/ManagedIndexSchema.java
++++ b/solr/core/src/java/org/apache/solr/schema/ManagedIndexSchema.java
+@@ -336,7 +336,7 @@ public final class ManagedIndexSchema extends IndexSchema {
+       // create new copyField-related objects so we don't affect the
+       // old schema
+       newSchema.copyFieldsMap = new HashMap<>();
+-      newSchema.dynamicCopyFields = null;
++      newSchema.dynamicCopyFields = new DynamicCopy[] {};
+       newSchema.copyFieldTargetCounts = new HashMap<>();
+       newSchema.loadCopyFields(document, xpath);
+       if (null != uniqueKeyField) {
+diff --git a/solr/core/src/java/org/apache/solr/update/processor/AddSchemaFieldsUpdateProcessorFactory.java b/solr/core/src/java/org/apache/solr/update/processor/AddSchemaFieldsUpdateProcessorFactory.java
+index 000f713..fddbb05 100644
+--- a/solr/core/src/java/org/apache/solr/update/processor/AddSchemaFieldsUpdateProcessorFactory.java
++++ b/solr/core/src/java/org/apache/solr/update/processor/AddSchemaFieldsUpdateProcessorFactory.java
+@@ -22,6 +22,7 @@ import org.apache.solr.common.SolrInputDocument;
+ import org.apache.solr.common.SolrInputField;
+ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.core.SolrCore;
++import org.apache.solr.core.SolrResourceLoader;
+ import org.apache.solr.request.SolrQueryRequest;
+ import org.apache.solr.response.SolrQueryResponse;
+ import org.apache.solr.schema.IndexSchema;
+@@ -127,14 +128,9 @@ public class AddSchemaFieldsUpdateProcessorFactory extends UpdateRequestProcesso
+   private List<TypeMapping> typeMappings = Collections.emptyList();
+   private SelectorParams inclusions = new SelectorParams();
+   private Collection<SelectorParams> exclusions = new ArrayList<>();
+-  private FieldNameSelector selector = null;
++  private SolrResourceLoader solrResourceLoader = null;
+   private String defaultFieldType;
+ 
+-  protected final FieldMutatingUpdateProcessor.FieldNameSelector getSelector() {
+-    if (null != selector) return selector;
+-    throw new SolrException(SERVER_ERROR, "selector was never initialized, inform(SolrCore) never called???");
+-  }
+-
+   @Override
+   public UpdateRequestProcessor getInstance(SolrQueryRequest req, 
+                                             SolrQueryResponse rsp, 
+@@ -168,28 +164,13 @@ public class AddSchemaFieldsUpdateProcessorFactory extends UpdateRequestProcesso
+ 
+   @Override
+   public void inform(SolrCore core) {
+-    selector = FieldMutatingUpdateProcessor.createFieldNameSelector
+-        (core.getResourceLoader(), core, inclusions, getDefaultSelector(core));
+-
+-    for (SelectorParams exc : exclusions) {
+-      selector = FieldMutatingUpdateProcessor.wrap(selector, FieldMutatingUpdateProcessor.createFieldNameSelector
+-          (core.getResourceLoader(), core, exc, FieldMutatingUpdateProcessor.SELECT_NO_FIELDS));
+-    }
++    solrResourceLoader = core.getResourceLoader();
+ 
+     for (TypeMapping typeMapping : typeMappings) {
+       typeMapping.populateValueClasses(core);
+     }
+   }
+ 
+-  private FieldNameSelector getDefaultSelector(final SolrCore core) {
+-    return new FieldNameSelector() {
+-      @Override
+-      public boolean shouldMutate(final String fieldName) {
+-        return null == core.getLatestSchema().getFieldTypeNoEx(fieldName);
+-      }
+-    };
+-  }
+-
+   private static List<TypeMapping> parseTypeMappings(NamedList args) {
+     List<TypeMapping> typeMappings = new ArrayList<>();
+     List<Object> typeMappingsParams = args.getAll(TYPE_MAPPING_PARAM);
+@@ -281,17 +262,23 @@ public class AddSchemaFieldsUpdateProcessorFactory extends UpdateRequestProcesso
+     
+     @Override
+     public void processAdd(AddUpdateCommand cmd) throws IOException {
+-      if ( ! cmd.getReq().getCore().getLatestSchema().isMutable()) {
++      if ( ! cmd.getReq().getSchema().isMutable()) {
+         final String message = "This IndexSchema is not mutable.";
+         throw new SolrException(BAD_REQUEST, message);
+       }
+       final SolrInputDocument doc = cmd.getSolrInputDocument();
+       final SolrCore core = cmd.getReq().getCore();
++      // use the cmd's schema rather than the latest, because the schema
++      // can be updated during processing.  Using the cmd's schema guarantees
++      // this will be detected and the cmd's schema updated.
++      IndexSchema oldSchema = cmd.getReq().getSchema();
+       for (;;) {
+-        final IndexSchema oldSchema = core.getLatestSchema();
+         List<SchemaField> newFields = new ArrayList<>();
++        // build a selector each time through the loop b/c the schema we are
++        // processing may have changed
++        FieldNameSelector selector = buildSelector(oldSchema);
+         for (final String fieldName : doc.getFieldNames()) {
+-          if (selector.shouldMutate(fieldName)) { // returns false if the field already exists in the latest schema
++          if (selector.shouldMutate(fieldName)) { // returns false if the field already exists in the current schema
+             String fieldTypeName = mapValueClassesToFieldType(doc.getField(fieldName));
+             newFields.add(oldSchema.newField(fieldName, fieldTypeName, Collections.<String,Object>emptyMap()));
+           }
+@@ -314,28 +301,32 @@ public class AddSchemaFieldsUpdateProcessorFactory extends UpdateRequestProcesso
+           builder.append("]");
+           log.debug(builder.toString());
+         }
+-        try {
+-          synchronized (oldSchema.getSchemaUpdateLock()) {
++        // Need to hold the lock during the entire attempt to ensure that
++        // the schema on the request is the latest
++        synchronized (oldSchema.getSchemaUpdateLock()) {
++          try {
+             IndexSchema newSchema = oldSchema.addFields(newFields);
+             if (null != newSchema) {
+-              cmd.getReq().getCore().setLatestSchema(newSchema);
++              core.setLatestSchema(newSchema);
+               cmd.getReq().updateSchemaToLatest();
+               log.debug("Successfully added field(s) to the schema.");
+               break; // success - exit from the retry loop
+             } else {
+               throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Failed to add fields.");
+             }
++          } catch (ManagedIndexSchema.FieldExistsException e) {
++            log.error("At least one field to be added already exists in the schema - retrying.");
++            oldSchema = core.getLatestSchema();
++            cmd.getReq().updateSchemaToLatest();
++          } catch (ManagedIndexSchema.SchemaChangedInZkException e) {
++            log.debug("Schema changed while processing request - retrying.");
++            oldSchema = core.getLatestSchema();
++            cmd.getReq().updateSchemaToLatest();
+           }
+-        } catch(ManagedIndexSchema.FieldExistsException e) {
+-          log.debug("At least one field to be added already exists in the schema - retrying.");
+-          // No action: at least one field to be added already exists in the schema, so retry 
+-          // We should never get here, since selector.shouldMutate(field) will exclude already existing fields
+-        } catch(ManagedIndexSchema.SchemaChangedInZkException e) {
+-          log.debug("Schema changed while processing request - retrying.");
+         }
+       }
+       super.processAdd(cmd);
+-    }                          
++    }
+ 
+     private String mapValueClassesToFieldType(SolrInputField field) {
+       NEXT_TYPE_MAPPING: for (TypeMapping typeMapping : typeMappings) {
+@@ -354,5 +345,25 @@ public class AddSchemaFieldsUpdateProcessorFactory extends UpdateRequestProcesso
+       // At least one of this field's values is not an instance of any configured fieldType's valueClass-s
+       return defaultFieldType;
+     }
++
++    private FieldNameSelector getDefaultSelector(final IndexSchema schema) {
++      return new FieldNameSelector() {
++        @Override
++        public boolean shouldMutate(final String fieldName) {
++          return null == schema.getFieldTypeNoEx(fieldName);
++        }
++      };
++    }
++
++    private FieldNameSelector buildSelector(IndexSchema schema) {
++      FieldNameSelector selector = FieldMutatingUpdateProcessor.createFieldNameSelector
++        (solrResourceLoader, schema, inclusions, getDefaultSelector(schema));
++
++      for (SelectorParams exc : exclusions) {
++        selector = FieldMutatingUpdateProcessor.wrap(selector, FieldMutatingUpdateProcessor.createFieldNameSelector
++          (solrResourceLoader, schema, exc, FieldMutatingUpdateProcessor.SELECT_NO_FIELDS));
++      }
++      return selector;
++    }
+   }
+ }
+diff --git a/solr/core/src/java/org/apache/solr/update/processor/FieldMutatingUpdateProcessor.java b/solr/core/src/java/org/apache/solr/update/processor/FieldMutatingUpdateProcessor.java
+index 042d387..1fa3c5d 100644
+--- a/solr/core/src/java/org/apache/solr/update/processor/FieldMutatingUpdateProcessor.java
++++ b/solr/core/src/java/org/apache/solr/update/processor/FieldMutatingUpdateProcessor.java
+@@ -32,7 +32,7 @@ import org.apache.solr.common.SolrException;
+ import org.apache.solr.core.SolrCore;
+ import org.apache.solr.core.SolrResourceLoader;
+ import org.apache.solr.schema.FieldType;
+-
++import org.apache.solr.schema.IndexSchema;
+ import org.apache.solr.update.AddUpdateCommand;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -184,37 +184,66 @@ public abstract class FieldMutatingUpdateProcessor
+ 
+   /**
+    * Utility method that can be used to define a FieldNameSelector
++   * using the same types of rules as the FieldMutatingUpdateProcessor init
++   * code.  This may be useful for Factories that wish to define default
++   * selectors in similar terms to what the configuration would look like.
++   * @lucene.internal
++   */
++  public static FieldNameSelector createFieldNameSelector
++    (final SolrResourceLoader loader,
++     final SolrCore core,
++     final SelectorParams params,
++     final FieldNameSelector defSelector) {
++
++    if (params.noSelectorsSpecified()) {
++      return defSelector;
++    }
++
++    final ConfigurableFieldNameSelectorHelper helper =
++      new ConfigurableFieldNameSelectorHelper(loader, params);
++    return new FieldNameSelector() {
++      @Override
++      public boolean shouldMutate(String fieldName) {
++        return helper.shouldMutateBasedOnSchema(fieldName, core.getLatestSchema());
++      }
++    };
++  }
++
++  /**
++   * Utility method that can be used to define a FieldNameSelector
+    * using the same types of rules as the FieldMutatingUpdateProcessor init 
+    * code.  This may be useful for Factories that wish to define default 
+    * selectors in similar terms to what the configuration would look like.
++   * Uses {@code schema} for checking field existence.
+    * @lucene.internal
+    */
+   public static FieldNameSelector createFieldNameSelector
+     (final SolrResourceLoader loader,
+-     final SolrCore core,
++     final IndexSchema schema,
+      final SelectorParams params,
+      final FieldNameSelector defSelector) {
+ 
+     if (params.noSelectorsSpecified()) {
+       return defSelector;
+     }
+-    
+-    return new ConfigurableFieldNameSelector(loader, core, params); 
++
++    final ConfigurableFieldNameSelectorHelper helper =
++      new ConfigurableFieldNameSelectorHelper(loader, params);
++    return new FieldNameSelector() {
++      @Override
++      public boolean shouldMutate(String fieldName) {
++        return helper.shouldMutateBasedOnSchema(fieldName, schema);
++      }
++    };
+   }
+   
+-  
+-  
+-  private static final class ConfigurableFieldNameSelector 
+-    implements FieldNameSelector {
++  private static final class ConfigurableFieldNameSelectorHelper {
+ 
+-    final SolrCore core;
+     final SelectorParams params;
+     final Collection<Class> classes;
+ 
+-    private ConfigurableFieldNameSelector(final SolrResourceLoader loader,
+-                                          final SolrCore core,
++    private ConfigurableFieldNameSelectorHelper(final SolrResourceLoader loader,
+                                           final SelectorParams params) {
+-      this.core = core;
+       this.params = params;
+ 
+       final Collection<Class> classes = new ArrayList<>(params.typeClass.size());
+@@ -229,9 +258,7 @@ public abstract class FieldMutatingUpdateProcessor
+       this.classes = classes;
+     }
+ 
+-    @Override
+-    public boolean shouldMutate(final String fieldName) {
+-      
++    public boolean shouldMutateBasedOnSchema(final String fieldName, IndexSchema schema) {
+       // order of checks is based on what should be quicker
+       // (ie: set lookups faster the looping over instanceOf / matches tests
+       
+@@ -241,7 +268,7 @@ public abstract class FieldMutatingUpdateProcessor
+       
+       // do not consider it an error if the fieldName has no type
+       // there might be another processor dealing with it later
+-      FieldType t =  core.getLatestSchema().getFieldTypeNoEx(fieldName);
++      FieldType t =  schema.getFieldTypeNoEx(fieldName);
+       final boolean fieldExists = (null != t);
+ 
+       if ( (null != params.fieldNameMatchesSchemaField) &&
+diff --git a/solr/core/src/test-files/solr/collection1/conf/solrconfig-add-schema-fields-update-processor-chains.xml b/solr/core/src/test-files/solr/collection1/conf/solrconfig-add-schema-fields-update-processor-chains.xml
+index 9a59d90..5cd0cbf 100644
+--- a/solr/core/src/test-files/solr/collection1/conf/solrconfig-add-schema-fields-update-processor-chains.xml
++++ b/solr/core/src/test-files/solr/collection1/conf/solrconfig-add-schema-fields-update-processor-chains.xml
+@@ -66,6 +66,8 @@
+   </updateRequestProcessorChain>
+ 
+   <updateRequestProcessorChain name="add-fields">
++    <processor class="solr.LogUpdateProcessorFactory" />
++    <processor class="solr.DistributedUpdateProcessorFactory" />
+     <processor class="solr.AddSchemaFieldsUpdateProcessorFactory">
+       <str name="defaultFieldType">text</str>
+       <lst name="typeMapping">
+@@ -98,6 +100,8 @@
+   </updateRequestProcessorChain>
+ 
+   <updateRequestProcessorChain name="parse-and-add-fields">
++    <processor class="solr.LogUpdateProcessorFactory" />
++    <processor class="solr.DistributedUpdateProcessorFactory" />
+     <processor class="solr.ParseBooleanFieldUpdateProcessorFactory"/>
+     <processor class="solr.ParseLongFieldUpdateProcessorFactory"/>
+     <processor class="solr.ParseDoubleFieldUpdateProcessorFactory"/>
+diff --git a/solr/core/src/test-files/solr/collection1/conf/solrconfig-schemaless.xml b/solr/core/src/test-files/solr/collection1/conf/solrconfig-schemaless.xml
+new file mode 100644
+index 0000000..29264c8
+--- /dev/null
++++ b/solr/core/src/test-files/solr/collection1/conf/solrconfig-schemaless.xml
+@@ -0,0 +1,121 @@
++<?xml version="1.0" ?>
++
++<!--
++ Licensed to the Apache Software Foundation (ASF) under one or more
++ contributor license agreements.  See the NOTICE file distributed with
++ this work for additional information regarding copyright ownership.
++ The ASF licenses this file to You under the Apache License, Version 2.0
++ (the "License"); you may not use this file except in compliance with
++ the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++ Unless required by applicable law or agreed to in writing, software
++ distributed under the License is distributed on an "AS IS" BASIS,
++ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ See the License for the specific language governing permissions and
++ limitations under the License.
++-->
++                                                           
++<config>
++  <luceneMatchVersion>${tests.luceneMatchVersion:LUCENE_CURRENT}</luceneMatchVersion>
++
++  <xi:include href="solrconfig.snippet.randomindexconfig.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
++
++  <schemaFactory class="ManagedIndexSchemaFactory">
++    <bool name="mutable">${managed.schema.mutable}</bool>
++    <str name="managedSchemaResourceName">managed-schema</str>
++  </schemaFactory>
++
++  <codecFactory class="solr.SchemaCodecFactory"/>
++
++  <updateHandler>
++    <updateLog enable="${enable.update.log}">
++      <str name="dir">${solr.ulog.dir:}</str>
++    </updateLog> 
++  </updateHandler>
++
++  <requestHandler name="standard" class="solr.StandardRequestHandler">
++    <bool name="httpCaching">true</bool>
++  </requestHandler>
++
++  <requestHandler name="/get" class="solr.RealTimeGetHandler">
++    <lst name="defaults">
++      <str name="omitHeader">true</str>
++    </lst>
++  </requestHandler>
++  <requestHandler name="/admin/" class="org.apache.solr.handler.admin.AdminHandlers" />
++  <requestHandler name="/update" class="solr.UpdateRequestHandler">
++    <lst name="defaults">
++      <str name="update.chain">add-unknown-fields-to-the-schema</str>
++    </lst>
++  </requestHandler>
++
++  <requestHandler name="/replication" class="solr.ReplicationHandler" startup="lazy" />
++
++  <!-- Add unknown fields to the schema 
++  
++       An example field type guessing update processor that will
++       attempt to parse string-typed field values as Booleans, Longs,
++       Doubles, or Dates, and then add schema fields with the guessed
++       field types.  
++       
++       This requires that the schema is both managed and mutable, by
++       declaring schemaFactory as ManagedIndexSchemaFactory, with
++       mutable specified as true. 
++       
++       See http://wiki.apache.org/solr/GuessingFieldTypes
++    -->
++  <updateRequestProcessorChain name="add-unknown-fields-to-the-schema">
++    <processor class="solr.LogUpdateProcessorFactory"/>
++    <processor class="solr.DistributedUpdateProcessorFactory" />
++    <processor class="solr.RemoveBlankFieldUpdateProcessorFactory"/>
++    <processor class="solr.ParseBooleanFieldUpdateProcessorFactory"/>
++    <processor class="solr.ParseLongFieldUpdateProcessorFactory"/>
++    <processor class="solr.ParseDoubleFieldUpdateProcessorFactory"/>
++    <processor class="solr.ParseDateFieldUpdateProcessorFactory">
++      <arr name="format">
++        <str>yyyy-MM-dd'T'HH:mm:ss.SSSZ</str>
++        <str>yyyy-MM-dd'T'HH:mm:ss,SSSZ</str>
++        <str>yyyy-MM-dd'T'HH:mm:ss.SSS</str>
++        <str>yyyy-MM-dd'T'HH:mm:ss,SSS</str>
++        <str>yyyy-MM-dd'T'HH:mm:ssZ</str>
++        <str>yyyy-MM-dd'T'HH:mm:ss</str>
++        <str>yyyy-MM-dd'T'HH:mmZ</str>
++        <str>yyyy-MM-dd'T'HH:mm</str>
++        <str>yyyy-MM-dd HH:mm:ss.SSSZ</str>
++        <str>yyyy-MM-dd HH:mm:ss,SSSZ</str>
++        <str>yyyy-MM-dd HH:mm:ss.SSS</str>
++        <str>yyyy-MM-dd HH:mm:ss,SSS</str>
++        <str>yyyy-MM-dd HH:mm:ssZ</str>
++        <str>yyyy-MM-dd HH:mm:ss</str>
++        <str>yyyy-MM-dd HH:mmZ</str>
++        <str>yyyy-MM-dd HH:mm</str>
++        <str>yyyy-MM-dd</str>
++      </arr>
++    </processor>
++     
++    <processor class="solr.AddSchemaFieldsUpdateProcessorFactory">
++      <str name="defaultFieldType">text_general</str>
++      <lst name="typeMapping">
++        <str name="valueClass">java.lang.Boolean</str>
++        <str name="fieldType">boolean</str>
++      </lst>
++      <lst name="typeMapping">
++        <str name="valueClass">java.util.Date</str>
++        <str name="fieldType">tdate</str>
++      </lst>
++      <lst name="typeMapping">
++        <str name="valueClass">java.lang.Long</str>
++        <str name="valueClass">java.lang.Integer</str>
++        <str name="fieldType">tlong</str>
++      </lst>
++      <lst name="typeMapping">
++        <str name="valueClass">java.lang.Number</str>
++        <str name="fieldType">tdouble</str>
++      </lst>
++    </processor>
++    <processor class="solr.RunUpdateProcessorFactory"/>
++  </updateRequestProcessorChain>
++
++</config>
+diff --git a/solr/core/src/test/org/apache/solr/schema/TestCloudSchemaless.java b/solr/core/src/test/org/apache/solr/schema/TestCloudSchemaless.java
+new file mode 100644
+index 0000000..eadc31e
+--- /dev/null
++++ b/solr/core/src/test/org/apache/solr/schema/TestCloudSchemaless.java
+@@ -0,0 +1,184 @@
++package org.apache.solr.schema;
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.solr.client.solrj.SolrServer;
++import org.apache.solr.client.solrj.impl.HttpSolrServer;
++import org.apache.solr.cloud.AbstractFullDistribZkTestBase;
++import org.apache.solr.common.SolrException;
++import org.apache.solr.common.SolrException.ErrorCode;
++import org.apache.solr.common.SolrInputDocument;
++import org.apache.solr.util.BaseTestHarness;
++import org.apache.solr.util.RESTfulServerProvider;
++import org.apache.solr.util.RestTestHarness;
++import org.eclipse.jetty.servlet.ServletHolder;
++import org.junit.BeforeClass;
++import org.junit.Before;
++import org.restlet.ext.servlet.ServerServlet;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.lang.Math;
++import java.util.Arrays;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.SortedMap;
++import java.util.TreeMap;
++
++/**
++ * Tests a schemaless collection configuration with SolrCloud
++ */
++public class TestCloudSchemaless extends AbstractFullDistribZkTestBase {
++  private static final Logger log = LoggerFactory.getLogger(TestCloudManagedSchemaConcurrent.class);
++  private static final String SUCCESS_XPATH = "/response/lst[@name='responseHeader']/int[@name='status'][.='0']";
++
++  @Before
++  @Override
++  public void setUp() throws Exception {
++
++    super.setUp();
++
++    useJettyDataDir = false;
++
++    System.setProperty("numShards", Integer.toString(sliceCount));
++  }
++
++  public TestCloudSchemaless() {
++    schemaString = "schema-add-schema-fields-update-processor.xml";
++    fixShardCount = true;
++
++    sliceCount = 4;
++    shardCount = 8;
++  }
++
++  @BeforeClass
++  public static void initSysProperties() {
++    System.setProperty("managed.schema.mutable", "true");
++    System.setProperty("enable.update.log", "true");
++  }
++
++  @Override
++  protected String getCloudSolrConfig() {
++    return "solrconfig-schemaless.xml";
++  }
++
++  @Override
++  public SortedMap<ServletHolder,String> getExtraServlets() {
++    final SortedMap<ServletHolder,String> extraServlets = new TreeMap<>();
++    final ServletHolder solrRestApi = new ServletHolder("SolrSchemaRestApi", ServerServlet.class);
++    solrRestApi.setInitParameter("org.restlet.application", "org.apache.solr.rest.SolrSchemaRestApi");
++    extraServlets.put(solrRestApi, "/schema/*");  // '/schema/*' matches '/schema', '/schema/', and '/schema/whatever...'
++    return extraServlets;
++  }
++
++  private List<RestTestHarness> restTestHarnesses = new ArrayList<>();
++
++  private void setupHarnesses() {
++    for (final SolrServer client : clients) {
++      RestTestHarness harness = new RestTestHarness(new RESTfulServerProvider() {
++        @Override
++        public String getBaseURL() {
++          return ((HttpSolrServer)client).getBaseURL();
++        }
++      });
++      restTestHarnesses.add(harness);
++    }
++  }
++
++  private String[] getExpectedFieldResponses(int numberOfDocs) {
++    String[] expectedAddFields = new String[1 + numberOfDocs];
++    expectedAddFields[0] = SUCCESS_XPATH;
++
++    for (int i = 0; i < numberOfDocs; ++i) {
++      String newFieldName = "newTestFieldInt" + i;
++      expectedAddFields[1 + i] =
++        "/response/arr[@name='fields']/lst/str[@name='name'][.='" + newFieldName + "']";
++    }
++    return expectedAddFields;
++  }
++
++  @Override
++  public void doTest() throws Exception {
++    setupHarnesses();
++
++    // First, add a bunch of documents in a single update with the same new field.
++    // This tests that the replicas properly handle schema additions.
++
++    int slices =  getCommonCloudSolrServer().getZkStateReader().getClusterState()
++      .getActiveSlices("collection1").size();
++    int trials = 50;
++    // generate enough docs so that we can expect at least a doc per slice
++    int numDocsPerTrial = (int)(slices * (Math.log(slices) + 1));
++    SolrServer ss = clients.get(random().nextInt(clients.size() + 1));
++    int docNumber = 0;
++    for (int i = 0; i < trials; ++i) {
++      List<SolrInputDocument> docs = new ArrayList<>();
++      for (int j =0; j < numDocsPerTrial; ++j) {
++        SolrInputDocument doc = new SolrInputDocument();
++        doc.addField("id", Long.toHexString(Double.doubleToLongBits(random().nextDouble())));
++        doc.addField("newTestFieldInt" + docNumber++, "123");
++        doc.addField("constantField", "3.14159");
++        docs.add(doc);
++      }
++
++      ss.add(docs);
++    }
++    ss.commit();
++
++    String [] expectedFields = getExpectedFieldResponses(docNumber);
++    // Check that all the fields were added
++    for (RestTestHarness client : restTestHarnesses) {
++      String request = "/schema/fields?wt=xml";
++      String response = client.query(request);
++      String result = BaseTestHarness.validateXPath(response, expectedFields);
++      if (result != null) {
++        String msg = "QUERY FAILED: xpath=" + result + "  request=" + request + "  response=" + response;
++        log.error(msg);
++        fail(msg);
++      }
++    }
++
++    // Now, let's ensure that writing the same field with two different types fails
++    int failTrials = 50;
++    for (int i = 0; i < failTrials; ++i) {
++      List<SolrInputDocument> docs = null;
++
++      SolrInputDocument intDoc = new SolrInputDocument();
++      intDoc.addField("id", Long.toHexString(Double.doubleToLongBits(random().nextDouble())));
++      intDoc.addField("longOrDateField" + i, "123");
++
++      SolrInputDocument dateDoc = new SolrInputDocument();
++      dateDoc.addField("id", Long.toHexString(Double.doubleToLongBits(random().nextDouble())));
++      dateDoc.addField("longOrDateField" + i, "1995-12-31T23:59:59Z");
++
++      // randomize the order of the docs
++      if (random().nextBoolean()) {
++        docs = Arrays.asList(intDoc, dateDoc);
++      } else {
++        docs = Arrays.asList(dateDoc, intDoc);
++      }
++
++      try {
++        ss.add(docs);
++        ss.commit();
++        fail("Expected Bad Request Exception");
++      } catch (SolrException se) {
++        assertEquals(ErrorCode.BAD_REQUEST, ErrorCode.getErrorCode(se.code()));
++      }
++    }
++  }
++}
+diff --git a/solr/example/example-schemaless/solr/collection1/conf/solrconfig.xml b/solr/example/example-schemaless/solr/collection1/conf/solrconfig.xml
+index 817973a..98850fe 100755
+--- a/solr/example/example-schemaless/solr/collection1/conf/solrconfig.xml
++++ b/solr/example/example-schemaless/solr/collection1/conf/solrconfig.xml
+@@ -1549,6 +1549,8 @@
+        See http://wiki.apache.org/solr/GuessingFieldTypes
+     -->
+   <updateRequestProcessorChain name="add-unknown-fields-to-the-schema">
++    <processor class="solr.LogUpdateProcessorFactory"/>
++    <processor class="solr.DistributedUpdateProcessorFactory"/>
+     <processor class="solr.RemoveBlankFieldUpdateProcessorFactory"/>
+     <processor class="solr.ParseBooleanFieldUpdateProcessorFactory"/>
+     <processor class="solr.ParseLongFieldUpdateProcessorFactory"/>
+@@ -1594,7 +1596,6 @@
+         <str name="fieldType">tdoubles</str>
+       </lst>
+     </processor>
+-    <processor class="solr.LogUpdateProcessorFactory"/>
+     <processor class="solr.RunUpdateProcessorFactory"/>
+   </updateRequestProcessorChain>
+ 
+

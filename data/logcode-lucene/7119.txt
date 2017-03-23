@@ -1,0 +1,533 @@
+GitDiffStart: b27fe755d10a4d9eea2d073b0950afb15d71e85d | Sat Jan 25 21:49:20 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 1856066..8d1d06b 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -195,6 +195,12 @@ Bug fixes
+ * SOLR-5661: PriorityQueue now refuses to allocate itself if the
+   incoming maxSize is too large (Raintung Li via Mike McCandless)
+ 
++* LUCENE-5228: IndexWriter.addIndexes(Directory[]) now acquires a
++  write lock in each Directory, to ensure that no open IndexWriter is
++  changing the incoming indices.  This also means that you cannot pass
++  the same Directory to multiple concurrent addIndexes calls (which is
++  anyways unusual).  (Robert Muir, Mike McCandless)
++
+ API Changes
+ 
+ * LUCENE-5339: The facet module was simplified/reworked to make the
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+index 93b7732..cbfc17e 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -795,11 +795,7 @@ public class IndexWriter implements Closeable, TwoPhaseCommit{
+         if (infoStream.isEnabled("IW")) {
+           infoStream.message("IW", "init: hit exception on init; releasing write lock");
+         }
+-        try {
+-          writeLock.release();
+-        } catch (Throwable t) {
+-          // don't mask the original exception
+-        }
++        IOUtils.closeWhileHandlingException(writeLock);
+         writeLock = null;
+       }
+     }
+@@ -1052,7 +1048,7 @@ public class IndexWriter implements Closeable, TwoPhaseCommit{
+       }
+ 
+       if (writeLock != null) {
+-        writeLock.release();                          // release write lock
++        writeLock.close();                          // release write lock
+         writeLock = null;
+       }
+       synchronized(this) {
+@@ -2362,6 +2358,28 @@ public class IndexWriter implements Closeable, TwoPhaseCommit{
+     }
+   }
+ 
++  /** Acquires write locks on all the directories; be sure
++   *  to match with a call to {@link IOUtils#close} in a
++   *  finally clause. */
++  private List<Lock> acquireWriteLocks(Directory... dirs) throws IOException {
++    List<Lock> locks = new ArrayList<Lock>();
++    for(int i=0;i<dirs.length;i++) {
++      boolean success = false;
++      try {
++        Lock lock = dirs[i].makeLock(WRITE_LOCK_NAME);
++        locks.add(lock);
++        lock.obtain(config.getWriteLockTimeout());
++        success = true;
++      } finally {
++        if (success == false) {
++          // Release all previously acquired locks:
++          IOUtils.closeWhileHandlingException(locks);
++        }
++      }
++    }
++    return locks;
++  }
++
+   /**
+    * Adds all segments from an array of indexes into this index.
+    *
+@@ -2372,11 +2390,10 @@ public class IndexWriter implements Closeable, TwoPhaseCommit{
+    * with this method.
+    *
+    * <p>
+-   * <b>NOTE:</b> the index in each {@link Directory} must not be
+-   * changed (opened by a writer) while this method is
+-   * running.  This method does not acquire a write lock in
+-   * each input Directory, so it is up to the caller to
+-   * enforce this.
++   * <b>NOTE:</b> this method acquires the write lock in
++   * each directory, to ensure that no {@code IndexWriter}
++   * is currently open or tries to open while this is
++   * running.
+    *
+    * <p>This method is transactional in how Exceptions are
+    * handled: it does not commit a new segments_N file until
+@@ -2405,12 +2422,18 @@ public class IndexWriter implements Closeable, TwoPhaseCommit{
+    *
+    * @throws CorruptIndexException if the index is corrupt
+    * @throws IOException if there is a low-level IO error
++   * @throws LockObtainFailedException if we were unable to
++   *   acquire the write lock in at least one directory
+    */
+   public void addIndexes(Directory... dirs) throws IOException {
+     ensureOpen();
+ 
+     noDupDirs(dirs);
+ 
++    List<Lock> locks = acquireWriteLocks(dirs);
++
++    boolean successTop = false;
++
+     try {
+       if (infoStream.isEnabled("IW")) {
+         infoStream.message("IW", "flush at addIndexes(Directory...)");
+@@ -2481,8 +2504,16 @@ public class IndexWriter implements Closeable, TwoPhaseCommit{
+         checkpoint();
+       }
+ 
++      successTop = true;
++
+     } catch (OutOfMemoryError oom) {
+       handleOOM(oom, "addIndexes(Directory...)");
++    } finally {
++      if (successTop) {
++        IOUtils.close(locks);
++      } else {
++        IOUtils.closeWhileHandlingException(locks);
++      }
+     }
+   }
+   
+@@ -4415,7 +4446,7 @@ public class IndexWriter implements Closeable, TwoPhaseCommit{
+    * currently accessing this index.
+    */
+   public static void unlock(Directory directory) throws IOException {
+-    directory.makeLock(IndexWriter.WRITE_LOCK_NAME).release();
++    directory.makeLock(IndexWriter.WRITE_LOCK_NAME).close();
+   }
+ 
+   /** If {@link DirectoryReader#open(IndexWriter,boolean)} has
+diff --git a/lucene/core/src/java/org/apache/lucene/store/Lock.java b/lucene/core/src/java/org/apache/lucene/store/Lock.java
+index 9eb5c8a..2c23d84 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/Lock.java
++++ b/lucene/core/src/java/org/apache/lucene/store/Lock.java
+@@ -17,9 +17,11 @@ package org.apache.lucene.store;
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.util.ThreadInterruptedException;
++import java.io.Closeable;
+ import java.io.IOException;
+ 
++import org.apache.lucene.util.ThreadInterruptedException;
++
+ /** An interprocess mutex lock.
+  * <p>Typical use might look like:<pre class="prettyprint">
+  * new Lock.With(directory.makeLock("my.lock")) {
+@@ -30,8 +32,10 @@ import java.io.IOException;
+  * </pre>
+  *
+  * @see Directory#makeLock(String)
++ *
++ * @lucene.internal
+  */
+-public abstract class Lock {
++public abstract class Lock implements Closeable {
+ 
+   /** How long {@link #obtain(long)} waits, in milliseconds,
+    *  in between attempts to acquire the lock. */
+@@ -42,7 +46,8 @@ public abstract class Lock {
+   public static final long LOCK_OBTAIN_WAIT_FOREVER = -1;
+ 
+   /** Attempts to obtain exclusive access and immediately return
+-   *  upon success or failure.
++   *  upon success or failure.  Use {@link #close} to
++   *  release the lock.
+    * @return true iff exclusive access is obtained
+    */
+   public abstract boolean obtain() throws IOException;
+@@ -98,7 +103,7 @@ public abstract class Lock {
+   }
+ 
+   /** Releases exclusive access. */
+-  public abstract void release() throws IOException;
++  public abstract void close() throws IOException;
+ 
+   /** Returns true if the resource is currently locked.  Note that one must
+    * still call {@link #obtain()} before using the resource. */
+@@ -134,8 +139,9 @@ public abstract class Lock {
+          locked = lock.obtain(lockWaitTimeout);
+          return doBody();
+       } finally {
+-        if (locked)
+-          lock.release();
++        if (locked) {
++          lock.close();
++        }
+       }
+     }
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/LockReleaseFailedException.java b/lucene/core/src/java/org/apache/lucene/store/LockReleaseFailedException.java
+index a5dd380..fe43e73 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/LockReleaseFailedException.java
++++ b/lucene/core/src/java/org/apache/lucene/store/LockReleaseFailedException.java
+@@ -22,7 +22,7 @@ import java.io.IOException;
+ /**
+  * This exception is thrown when the <code>write.lock</code>
+  * could not be released.
+- * @see Lock#release()
++ * @see Lock#close()
+  */
+ public class LockReleaseFailedException extends IOException {
+   public LockReleaseFailedException(String message) {
+diff --git a/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java b/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java
+index d4f2c86..ba53fa2 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java
++++ b/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java
+@@ -102,7 +102,7 @@ public class LockStressTest {
+ 
+       if (obtained) {
+         System.out.print("l");
+-        l.release();
++        l.close();
+       }
+       Thread.sleep(sleepTimeMS);
+     }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java b/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java
+index 9d55ee8..60c6bf58 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java
+@@ -107,7 +107,7 @@ public class NativeFSLockFactory extends FSLockFactory {
+       // NOTE: makeLock fixes the lock name by prefixing it w/ lockPrefix.
+       // Therefore it should be called before the code block next which prefixes
+       // the given name.
+-      makeLock(lockName).release();
++      makeLock(lockName).close();
+ 
+       if (lockPrefix != null) {
+         lockName = lockPrefix + "-" + lockName;
+@@ -259,7 +259,7 @@ class NativeFSLock extends Lock {
+   }
+ 
+   @Override
+-  public synchronized void release() throws IOException {
++  public synchronized void close() throws IOException {
+     if (lockExists()) {
+       try {
+         lock.release();
+@@ -298,7 +298,7 @@ class NativeFSLock extends Lock {
+         }
+       } finally {
+         if (obtained) {
+-          release();
++          close();
+         }
+       }
+     }
+@@ -317,7 +317,7 @@ class NativeFSLock extends Lock {
+     // Try to obtain and release (if was locked) the lock
+     try {
+       boolean obtained = obtain();
+-      if (obtained) release();
++      if (obtained) close();
+       return !obtained;
+     } catch (IOException ioe) {
+       return false;
+diff --git a/lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java b/lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java
+index bd1378d..dbf07f3 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java
+@@ -55,7 +55,7 @@ class NoLock extends Lock {
+   }
+ 
+   @Override
+-  public void release() {
++  public void close() {
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java b/lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java
+index 92f5893..df6f8d7 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java
+@@ -128,9 +128,10 @@ class SimpleFSLock extends Lock {
+   }
+ 
+   @Override
+-  public void release() throws LockReleaseFailedException {
+-    if (lockFile.exists() && !lockFile.delete())
++  public void close() throws LockReleaseFailedException {
++    if (lockFile.exists() && !lockFile.delete()) {
+       throw new LockReleaseFailedException("failed to delete " + lockFile);
++    }
+   }
+ 
+   @Override
+diff --git a/lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java b/lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java
+index 7e56999..29a8f19 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java
+@@ -71,7 +71,7 @@ class SingleInstanceLock extends Lock {
+   }
+ 
+   @Override
+-  public void release() {
++  public void close() {
+     synchronized(locks) {
+       locks.remove(lockName);
+     }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java b/lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java
+index 9bc5e32..47747b9 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java
+@@ -87,10 +87,10 @@ public class VerifyingLockFactory extends LockFactory {
+     }
+ 
+     @Override
+-    public synchronized void release() throws IOException {
++    public synchronized void close() throws IOException {
+       if (isLocked()) {
+         verify((byte) 0);
+-        lock.release();
++        lock.close();
+       }
+     }
+   }
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java b/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java
+index 7dfe9b3..0a5a7c6 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java
+@@ -41,8 +41,10 @@ import org.apache.lucene.search.PhraseQuery;
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.BaseDirectoryWrapper;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.LockObtainFailedException;
+ import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.store.RAMDirectory;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util._TestUtil;
+ 
+@@ -1244,4 +1246,27 @@ public class TestAddIndexes extends LuceneTestCase {
+     dest.close();
+   }
+ 
++  /** Make sure an open IndexWriter on an incoming Directory
++   *  causes a LockObtainFailedException */
++  public void testLocksBlock() throws Exception {
++    Directory src = newDirectory();
++    RandomIndexWriter w1 = new RandomIndexWriter(random(), src);
++    w1.addDocument(new Document());
++    w1.commit();
++
++    Directory dest = newDirectory();
++
++    IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    iwc.setWriteLockTimeout(1);
++    RandomIndexWriter w2 = new RandomIndexWriter(random(), dest, iwc);
++
++    try {
++      w2.addIndexes(src);
++      fail("did not hit expected exception");
++    } catch (LockObtainFailedException lofe) {
++      // expected
++    }
++
++    IOUtils.close(w1, w2, src, dest);
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
+index 6304f52..45ec544 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
+@@ -730,8 +730,10 @@ public class TestIndexWriterReader extends LuceneTestCase {
+     final long endTime = (long) (System.currentTimeMillis() + 1000.*SECONDS);
+     final List<Throwable> excs = Collections.synchronizedList(new ArrayList<Throwable>());
+ 
+-    final Thread[] threads = new Thread[numThreads];
+-    for(int i=0;i<numThreads;i++) {
++    // Only one thread can addIndexes at a time, because
++    // IndexWriter acquires a write lock in each directory:
++    final Thread[] threads = new Thread[1];
++    for(int i=0;i<threads.length;i++) {
+       threads[i] = new Thread() {
+           @Override
+           public void run() {
+@@ -764,7 +766,7 @@ public class TestIndexWriterReader extends LuceneTestCase {
+       lastCount = count;
+     }
+ 
+-    for(int i=0;i<numThreads;i++) {
++    for(int i=0;i<threads.length;i++) {
+       threads[i].join();
+     }
+     // final check
+diff --git a/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java b/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java
+index d8d3309..e7c4e2c 100644
+--- a/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java
++++ b/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java
+@@ -202,12 +202,12 @@ public class TestDirectory extends LuceneTestCase {
+         }
+       }
+ 
+-      lock.release();
++      lock.close();
+       
+       // now lock with different dir
+       lock = dirs[(i+1)%dirs.length].makeLock(lockname);
+       assertTrue(lock.obtain());
+-      lock.release();
++      lock.close();
+     }
+ 
+     for (int i=0; i<dirs.length; i++) {
+diff --git a/lucene/core/src/test/org/apache/lucene/store/TestLock.java b/lucene/core/src/test/org/apache/lucene/store/TestLock.java
+index 42fac34..e66b4fa 100644
+--- a/lucene/core/src/test/org/apache/lucene/store/TestLock.java
++++ b/lucene/core/src/test/org/apache/lucene/store/TestLock.java
+@@ -44,7 +44,7 @@ public class TestLock extends LuceneTestCase {
+             return false;
+         }
+         @Override
+-        public void release() {
++        public void close() {
+             // do nothing
+         }
+         @Override
+diff --git a/lucene/core/src/test/org/apache/lucene/store/TestLockFactory.java b/lucene/core/src/test/org/apache/lucene/store/TestLockFactory.java
+index 2eeba2f..6f8345d 100644
+--- a/lucene/core/src/test/org/apache/lucene/store/TestLockFactory.java
++++ b/lucene/core/src/test/org/apache/lucene/store/TestLockFactory.java
+@@ -184,16 +184,16 @@ public class TestLockFactory extends LuceneTestCase {
+ 
+       assertTrue("failed to obtain lock", l.obtain());
+       assertTrue("succeeded in obtaining lock twice", !l2.obtain());
+-      l.release();
++      l.close();
+ 
+       assertTrue("failed to obtain 2nd lock after first one was freed", l2.obtain());
+-      l2.release();
++      l2.close();
+ 
+       // Make sure we can obtain first one again, test isLocked():
+       assertTrue("failed to obtain lock", l.obtain());
+       assertTrue(l.isLocked());
+       assertTrue(l2.isLocked());
+-      l.release();
++      l.close();
+       assertFalse(l.isLocked());
+       assertFalse(l2.isLocked());
+     }
+@@ -207,7 +207,7 @@ public class TestLockFactory extends LuceneTestCase {
+       
+       Lock l = new NativeFSLockFactory(TEMP_DIR).makeLock("test.lock");
+       assertTrue("failed to obtain lock", l.obtain());
+-      l.release();
++      l.close();
+       assertFalse("failed to release lock", l.isLocked());
+       if (lockFile.exists()) {
+         lockFile.delete();
+@@ -225,12 +225,12 @@ public class TestLockFactory extends LuceneTestCase {
+       assertTrue("failed to obtain lock", l.obtain());
+       try {
+         assertTrue(l2.isLocked());
+-        l2.release();
++        l2.close();
+         fail("should not have reached here. LockReleaseFailedException should have been thrown");
+       } catch (LockReleaseFailedException e) {
+         // expected
+       } finally {
+-        l.release();
++        l.close();
+       }
+     }
+ 
+@@ -409,7 +409,7 @@ public class TestLockFactory extends LuceneTestCase {
+                 return true;
+             }
+             @Override
+-            public void release() {
++            public void close() {
+                 // do nothing
+             }
+             @Override
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/store/MockLockFactoryWrapper.java b/lucene/test-framework/src/java/org/apache/lucene/store/MockLockFactoryWrapper.java
+index 0795cbe..2375968 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/store/MockLockFactoryWrapper.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/store/MockLockFactoryWrapper.java
+@@ -78,8 +78,8 @@ public class MockLockFactoryWrapper extends LockFactory {
+     }
+ 
+     @Override
+-    public void release() throws IOException {
+-      delegateLock.release();
++    public void close() throws IOException {
++      delegateLock.close();
+       dir.openLocks.remove(name);
+     }
+ 
+diff --git a/solr/core/src/java/org/apache/solr/handler/SnapShooter.java b/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
+index ecd074a..ba88a3f 100644
+--- a/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
++++ b/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
+@@ -122,7 +122,7 @@ public class SnapShooter {
+       replicationHandler.snapShootDetails = details;
+       if (lock != null) {
+         try {
+-          lock.release();
++          lock.close();
+         } catch (IOException e) {
+           LOG.error("Unable to release snapshoot lock: " + directoryName + ".lock");
+         }
+diff --git a/solr/core/src/java/org/apache/solr/store/hdfs/HdfsLockFactory.java b/solr/core/src/java/org/apache/solr/store/hdfs/HdfsLockFactory.java
+index 23b4bc3..41c4318 100644
+--- a/solr/core/src/java/org/apache/solr/store/hdfs/HdfsLockFactory.java
++++ b/solr/core/src/java/org/apache/solr/store/hdfs/HdfsLockFactory.java
+@@ -161,7 +161,7 @@ public class HdfsLockFactory extends LockFactory {
+     }
+     
+     @Override
+-    public void release() throws IOException {
++    public void close() throws IOException {
+       FileSystem fs = FileSystem.newInstance(lockPath.toUri(), conf);
+       try {
+         if (fs.exists(new Path(lockPath, lockName))
+diff --git a/solr/core/src/test/org/apache/solr/store/hdfs/HdfsLockFactoryTest.java b/solr/core/src/test/org/apache/solr/store/hdfs/HdfsLockFactoryTest.java
+index 39493db..65ce202 100644
+--- a/solr/core/src/test/org/apache/solr/store/hdfs/HdfsLockFactoryTest.java
++++ b/solr/core/src/test/org/apache/solr/store/hdfs/HdfsLockFactoryTest.java
+@@ -75,7 +75,7 @@ public class HdfsLockFactoryTest extends SolrTestCaseJ4 {
+     assertTrue("We could not get the lock when it should be available", success);
+     success = lock.obtain();
+     assertFalse("We got the lock but it should be unavailble", success);
+-    lock.release();
++    lock.close();
+     success = lock.obtain();
+     assertTrue("We could not get the lock when it should be available", success);
+     success = lock.obtain();
+

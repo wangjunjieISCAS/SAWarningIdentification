@@ -1,0 +1,294 @@
+GitDiffStart: 678758ae5702ca45eed0c0ef61bb7f8bfa89862f | Tue Apr 22 21:23:31 2014 +0000
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 6f1ccdf..a8c44d4 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -117,6 +117,10 @@ Bug Fixes
+ * SOLR-5993: ZkController can warn about shard leader conflict even after the conflict
+   is resolved. (Gregory Chanan via shalin)
+ 
++* SOLR-6002: Fix a couple of ugly issues around SolrIndexWriter close and 
++  rollback as well as how SolrIndexWriter manages it's ref counted directory
++  instance. (Mark Miller)
++
+ Other Changes
+ ---------------------
+ 
+diff --git a/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java b/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
+index c77af49..69984bb 100644
+--- a/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
++++ b/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
+@@ -173,6 +173,7 @@ public abstract class CachingDirectoryFactory extends DirectoryFactory {
+                   this.getClass().getSimpleName(), val);
+         try {
+           // if there are still refs out, we have to wait for them
++          assert val.refCnt > -1 : val.refCnt;
+           int cnt = 0;
+           while(val.refCnt != 0) {
+             wait(100);
+diff --git a/solr/core/src/java/org/apache/solr/core/SolrCore.java b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index 32a021a..567fc30 100644
+--- a/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -17,7 +17,6 @@
+ 
+ package org.apache.solr.core;
+ 
+-import org.apache.commons.io.IOUtils;
+ import org.apache.lucene.codecs.Codec;
+ import org.apache.lucene.index.DirectoryReader;
+ import org.apache.lucene.index.IndexDeletionPolicy;
+@@ -89,6 +88,7 @@ import org.apache.solr.update.processor.RunUpdateProcessorFactory;
+ import org.apache.solr.update.processor.UpdateRequestProcessorChain;
+ import org.apache.solr.update.processor.UpdateRequestProcessorFactory;
+ import org.apache.solr.util.DefaultSolrThreadFactory;
++import org.apache.solr.util.IOUtils;
+ import org.apache.solr.util.PropertiesInputStream;
+ import org.apache.solr.util.RefCounted;
+ import org.apache.solr.util.plugin.NamedListInitializedPlugin;
+@@ -418,8 +418,8 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+       ParserConfigurationException, SAXException {
+     
+     solrCoreState.increfSolrCoreState();
+-    
+-    if (!getNewIndexDir().equals(getIndexDir())) {
++    boolean indexDirChange = !getNewIndexDir().equals(getIndexDir());
++    if (indexDirChange || !coreConfig.getSolrConfig().nrtMode) {
+       // the directory is changing, don't pass on state
+       prev = null;
+     }
+@@ -428,6 +428,8 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+         coreConfig.getIndexSchema(), coreDescriptor, updateHandler, this.solrDelPolicy, prev);
+     core.solrDelPolicy = this.solrDelPolicy;
+     
++
++    // we open a new indexwriter to pick up the latest config
+     core.getUpdateHandler().getSolrCoreState().newIndexWriter(core, false);
+     
+     core.getSearcher(true, false, null, true);
+@@ -518,7 +520,7 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+ 
+         SolrIndexWriter writer = SolrIndexWriter.create("SolrCore.initIndex", indexDir, getDirectoryFactory(), true, 
+                                                         getLatestSchema(), solrConfig.indexConfig, solrDelPolicy, codec);
+-        writer.close();
++        writer.shutdown();
+       }
+ 
+  
+@@ -854,7 +856,15 @@ public final class SolrCore implements SolrInfoMBean, Closeable {
+       if (e instanceof OutOfMemoryError) {
+         throw (OutOfMemoryError)e;
+       }
+-      close();
++      
++      try {
++       this.close();
++      } catch (Throwable t) {
++        if (t instanceof OutOfMemoryError) {
++          throw (OutOfMemoryError)t;
++        }
++        log.error("Error while closing", t);
++      }
+       
+       throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, 
+                               e.getMessage(), e);
+diff --git a/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java b/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+index 9dd0d52..358d36f 100644
+--- a/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
++++ b/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+@@ -68,7 +68,7 @@ public final class DefaultSolrCoreState extends SolrCoreState implements Recover
+         closer.closeWriter(indexWriter);
+       } else if (indexWriter != null) {
+         log.info("closing IndexWriter...");
+-        indexWriter.close();
++        indexWriter.shutdown();
+       }
+       indexWriter = null;
+     } catch (Exception e) {
+@@ -161,7 +161,7 @@ public final class DefaultSolrCoreState extends SolrCoreState implements Recover
+           if (!rollback) {
+             try {
+               log.info("Closing old IndexWriter... core=" + coreName);
+-              indexWriter.close();
++              indexWriter.shutdown();
+             } catch (Exception e) {
+               SolrException.log(log, "Error closing old IndexWriter. core="
+                   + coreName, e);
+diff --git a/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java b/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+index f894fa3..25468ae 100644
+--- a/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
++++ b/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+@@ -745,7 +745,7 @@ public class DirectUpdateHandler2 extends UpdateHandler implements SolrCoreState
+ 
+       try {
+         if (tryToCommit) {
+-
++          log.info("Committing on IndexWriter close.");
+           CommitUpdateCommand cmd = new CommitUpdateCommand(req, false);
+           cmd.openSearcher = false;
+           cmd.waitSearcher = false;
+@@ -786,7 +786,7 @@ public class DirectUpdateHandler2 extends UpdateHandler implements SolrCoreState
+         }
+       }
+ 
+-      if (writer != null) writer.shutdown();
++      if (writer != null) writer.close();
+ 
+     } finally {
+       solrCoreState.getCommitLock().unlock();
+diff --git a/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java b/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
+index 3211a17..a048a1f 100644
+--- a/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
++++ b/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
+@@ -17,10 +17,7 @@
+ 
+ package org.apache.solr.update;
+ 
+-import java.io.File;
+-import java.io.FileOutputStream;
+ import java.io.IOException;
+-import java.io.PrintStream;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import org.apache.lucene.codecs.Codec;
+@@ -29,11 +26,10 @@ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.InfoStream;
+-import org.apache.lucene.util.PrintStreamInfoStream;
+-import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.solr.core.DirectoryFactory;
+ import org.apache.solr.core.DirectoryFactory.DirContext;
+ import org.apache.solr.schema.IndexSchema;
++import org.apache.solr.util.IOUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -48,13 +44,17 @@ public class SolrIndexWriter extends IndexWriter {
+   // These should *only* be used for debugging or monitoring purposes
+   public static final AtomicLong numOpens = new AtomicLong();
+   public static final AtomicLong numCloses = new AtomicLong();
+-
++  
+   /** Stored into each Lucene commit to record the
+    *  System.currentTimeMillis() when commit was called. */
+   public static final String COMMIT_TIME_MSEC_KEY = "commitTimeMSec";
+ 
++  private static final Object CLOSE_LOCK = new Object();
++  
+   String name;
+   private DirectoryFactory directoryFactory;
++  private InfoStream infoStream;
++  private Directory directory;
+ 
+   public static SolrIndexWriter create(String name, String path, DirectoryFactory directoryFactory, boolean create, IndexSchema schema, SolrIndexConfig config, IndexDeletionPolicy delPolicy, Codec codec) throws IOException {
+ 
+@@ -81,6 +81,8 @@ public class SolrIndexWriter extends IndexWriter {
+           );
+     log.debug("Opened Writer " + name);
+     this.name = name;
++    infoStream = getConfig().getInfoStream();
++    this.directory = directory;
+     numOpens.incrementAndGet();
+   }
+   
+@@ -120,65 +122,54 @@ public class SolrIndexWriter extends IndexWriter {
+    */
+   private volatile boolean isClosed = false;
+ 
+-  
+   @Override
+   public void close() throws IOException {
+     log.debug("Closing Writer " + name);
+-    Directory directory = getDirectory();
+-    final InfoStream infoStream = isClosed ? null : getConfig().getInfoStream();
+     try {
+-      while (true) {
+-        try {
+-          flush(true, true);
+-          waitForMerges();
+-          commit();
+-          super.rollback();
+-        } catch (ThreadInterruptedException e) {
+-          // don't allow interruption
+-          continue;
+-        } catch (Throwable t) {
+-          if (t instanceof OutOfMemoryError) {
+-            throw (OutOfMemoryError) t;
+-          }
+-          log.error("Error closing IndexWriter, trying rollback", t);
+-          super.rollback();
+-        }
+-        if (IndexWriter.isLocked(directory)) {
+-          try {
+-            IndexWriter.unlock(directory);
+-          } catch (Exception e) {
+-            log.error("Coud not unlock directory after seemingly failed IndexWriter#close()", e);
+-          }
+-        }
+-        break;
++      super.close();
++    } catch (Throwable t) {
++      if (t instanceof OutOfMemoryError) {
++        throw (OutOfMemoryError) t;
+       }
++      log.error("Error closing IndexWriter", t);
+     } finally {
+-      if (infoStream != null) {
+-        infoStream.close();
+-      }
+-      isClosed = true;
+-      directoryFactory.release(directory);
+-      numCloses.incrementAndGet();
++      cleanup();
+     }
+   }
+ 
+   @Override
+   public void rollback() throws IOException {
+-    Directory dir = getDirectory();
++    log.debug("Rollback Writer " + name);
+     try {
+-      while (true) {
+-        try {
+-          super.rollback();
+-        } catch (ThreadInterruptedException e) {
+-          // don't allow interruption
+-          continue;
+-        }
+-        break;
++      super.rollback();
++    } catch (Throwable t) {
++      if (t instanceof OutOfMemoryError) {
++        throw (OutOfMemoryError) t;
+       }
++      log.error("Exception rolling back IndexWriter", t);
+     } finally {
+-      isClosed = true;
+-      directoryFactory.release(dir);
++      cleanup();
++    }
++  }
++
++  private void cleanup() throws IOException {
++    // It's kind of an implementation detail whether
++    // or not IndexWriter#close calls rollback, so
++    // we assume it may or may not
++    boolean doClose = false;
++    synchronized (CLOSE_LOCK) {
++      if (!isClosed) {
++        doClose = true;
++        isClosed = true;
++      }
++    }
++    if (doClose) {
++      
++      if (infoStream != null) {
++        IOUtils.closeQuietly(infoStream);
++      }
+       numCloses.incrementAndGet();
++      directoryFactory.release(directory);
+     }
+   }
+ 
+

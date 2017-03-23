@@ -1,0 +1,1213 @@
+GitDiffStart: 63fa645aa80028b4a0efd39ba274b89bec0d6aa5 | Mon Jul 15 17:06:33 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index d031b88..96087b0 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -320,6 +320,10 @@ New Features
+ * LUCENE-5013: Added ScandinavianFoldingFilterFactory and
+   ScandinavianNormalizationFilterFactory (Karl Wettin via janhoy)
+ 
++* LUCENE-4845: AnalyzingInfixSuggester finds suggestions based on
++  matches to any tokens in the suggestion, not just based on pure
++  prefix matching.  (Mike McCandless, Robert Muir)
++
+ API Changes
+ 
+ * LUCENE-5077: Make it easier to use compressed norms. Lucene42NormsFormat takes
+diff --git a/lucene/suggest/build.xml b/lucene/suggest/build.xml
+index f820374..6d822db 100755
+--- a/lucene/suggest/build.xml
++++ b/lucene/suggest/build.xml
+@@ -25,5 +25,15 @@
+ 	
+   <!-- just a list of words for testing suggesters -->
+   <property name="rat.excludes" value="**/Top50KWiki.utf8"/>
++
+   <import file="../module-build.xml"/>
++
++  <path id="classpath">
++    <pathelement path="${analyzers-common.jar}"/>
++    <pathelement path="${misc.jar}"/>
++    <path refid="base.classpath"/>
++  </path>
++
++  <target name="compile-core" depends="jar-misc, jar-analyzers-common, common.compile-core" />
++
+ </project>
+diff --git a/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java
+new file mode 100644
+index 0000000..214f162
+--- /dev/null
++++ b/lucene/suggest/src/java/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java
+@@ -0,0 +1,569 @@
++package org.apache.lucene.search.suggest.analyzing;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.Closeable;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.StringReader;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.AnalyzerWrapper;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.ngram.EdgeNGramTokenFilter;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.codecs.lucene42.Lucene42Codec;
++import org.apache.lucene.document.BinaryDocValuesField;
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field;
++import org.apache.lucene.document.FieldType;
++import org.apache.lucene.document.NumericDocValuesField;
++import org.apache.lucene.document.TextField;
++import org.apache.lucene.index.AtomicReader;
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.BinaryDocValues;
++import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.FieldInfo.IndexOptions;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexWriter;
++import org.apache.lucene.index.IndexWriterConfig;
++import org.apache.lucene.index.MultiDocValues;
++import org.apache.lucene.index.NumericDocValues;
++import org.apache.lucene.index.SlowCompositeReaderWrapper;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.index.sorter.Sorter;
++import org.apache.lucene.index.sorter.SortingAtomicReader;
++import org.apache.lucene.search.BooleanClause;
++import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.Collector;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.PrefixQuery;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.ScoreDoc;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.search.spell.TermFreqIterator;
++import org.apache.lucene.search.spell.TermFreqPayloadIterator;
++import org.apache.lucene.search.suggest.Lookup;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.FSDirectory;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.IOUtils;
++import org.apache.lucene.util.Version;
++
++// TODO:
++//   - a PostingsFormat that stores super-high-freq terms as
++//     a bitset should be a win for the prefix terms?
++//     (LUCENE-5052)
++//   - we could allow NRT here, if we sort index as we go
++//     (SortingMergePolicy) -- http://svn.apache.org/viewvc?view=revision&revision=1459808
++
++/** Analyzes the input text and then suggests matches based
++ *  on prefix matches to any tokens in the indexed text.
++ *  This also highlights the tokens that match.
++ *
++ *  <p>This just uses an ordinary Lucene index.  It
++ *  supports payloads, and records these as a
++ *  {@link BinaryDocValues} field.  Matches are sorted only
++ *  by the suggest weight; it would be nice to support
++ *  blended score + weight sort in the future.  This means
++ *  this suggester best applies when there is a strong
++ *  apriori ranking of all the suggestions. */
++
++public class AnalyzingInfixSuggester extends Lookup implements Closeable {
++
++  /** Field name used for the indexed text. */
++  protected final static String TEXT_FIELD_NAME = "text";
++
++  private final Analyzer queryAnalyzer;
++  private final Analyzer indexAnalyzer;
++  private final Directory dir;
++  private final Version matchVersion;
++  private final File indexPath;
++  private final int minPrefixChars;
++
++  /** {@link IndexSearcher} used for lookups. */
++  protected IndexSearcher searcher;
++
++  /** null if payloads were not indexed: */
++  private BinaryDocValues payloadsDV;
++  private BinaryDocValues textDV;
++  private NumericDocValues weightsDV;
++
++  /** Default minimum number of leading characters before
++   *  PrefixQuery is used (4). */
++  public static final int DEFAULT_MIN_PREFIX_CHARS = 4;
++
++  /** Create a new instance, loading from a previously built
++   *  directory, if it exists. */
++  public AnalyzingInfixSuggester(Version matchVersion, File indexPath, Analyzer analyzer) throws IOException {
++    this(matchVersion, indexPath, analyzer, analyzer, DEFAULT_MIN_PREFIX_CHARS);
++  }
++
++  /** Create a new instance, loading from a previously built
++   *  directory, if it exists.
++   *
++   *  @param minPrefixChars Minimum number of leading characters
++   *     before PrefixQuery is used (default 4).
++   *     Prefixes shorter than this are indexed as character
++   *     ngrams (increasing index size but making lookups
++   *     faster).
++   */
++  public AnalyzingInfixSuggester(Version matchVersion, File indexPath, Analyzer indexAnalyzer, Analyzer queryAnalyzer, int minPrefixChars) throws IOException {
++
++    if (minPrefixChars < 0) {
++      throw new IllegalArgumentException("minPrefixChars must be >= 0; got: " + minPrefixChars);
++    }
++
++    this.queryAnalyzer = queryAnalyzer;
++    this.indexAnalyzer = indexAnalyzer;
++    this.matchVersion = matchVersion;
++    this.indexPath = indexPath;
++    this.minPrefixChars = minPrefixChars;
++    dir = FSDirectory.open(indexPath);
++
++    if (DirectoryReader.indexExists(dir)) {
++      // Already built; open it:
++      searcher = new IndexSearcher(DirectoryReader.open(dir));
++      // This will just be null if app didn't pass payloads to build():
++      // TODO: maybe just stored fields?  they compress...
++      payloadsDV = MultiDocValues.getBinaryValues(searcher.getIndexReader(), "payloads");
++      weightsDV = MultiDocValues.getNumericValues(searcher.getIndexReader(), "weight");
++      textDV = MultiDocValues.getBinaryValues(searcher.getIndexReader(), TEXT_FIELD_NAME);
++      assert textDV != null;
++    }
++  }
++
++  /** Override this to customize index settings, e.g. which
++   *  codec to use. */
++  protected IndexWriterConfig getIndexWriterConfig(Version matchVersion, Analyzer indexAnalyzer) {
++    IndexWriterConfig iwc = new IndexWriterConfig(matchVersion, indexAnalyzer);
++    iwc.setCodec(new Lucene42Codec());
++    iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
++    return iwc;
++  }
++
++  @Override
++  public void build(TermFreqIterator iter) throws IOException {
++
++    TermFreqPayloadIterator payloads;
++    if (iter instanceof TermFreqPayloadIterator) {
++      payloads = (TermFreqPayloadIterator) iter;
++    } else {
++      payloads = null;
++    }
++    Directory dirTmp = FSDirectory.open(new File(indexPath.toString() + ".tmp"));
++
++    Analyzer gramAnalyzer = new AnalyzerWrapper() {
++        @Override
++        protected Analyzer getWrappedAnalyzer(String fieldName) {
++          return indexAnalyzer;
++        }
++
++        @Override
++        protected TokenStreamComponents wrapComponents(String fieldName, TokenStreamComponents components) {
++          if (fieldName.equals("textgrams") && minPrefixChars > 0) {
++            return new TokenStreamComponents(components.getTokenizer(),
++                                             new EdgeNGramTokenFilter(matchVersion,
++                                                                      components.getTokenStream(),
++                                                                      1, minPrefixChars));
++          } else {
++            return components;
++          }
++        }
++      };
++
++    IndexWriter w = new IndexWriter(dirTmp,
++                                    getIndexWriterConfig(matchVersion, gramAnalyzer));
++    IndexWriter w2 = null;
++    AtomicReader r = null;
++    boolean success = false;
++    try {
++      
++      BytesRef text;
++      Document doc = new Document();
++      FieldType ft = new FieldType(TextField.TYPE_NOT_STORED);
++      ft.setIndexOptions(IndexOptions.DOCS_ONLY);
++      ft.setOmitNorms(true);
++      Field textField = new Field(TEXT_FIELD_NAME, "", ft);
++      doc.add(textField);
++
++      Field textGramField = new Field("textgrams", "", ft);
++      doc.add(textGramField);
++
++      Field textDVField = new BinaryDocValuesField(TEXT_FIELD_NAME, new BytesRef());
++      doc.add(textDVField);
++
++      // TODO: use threads...?
++      Field weightField = new NumericDocValuesField("weight", 0);
++      doc.add(weightField);
++
++      Field payloadField;
++      if (payloads != null) {
++        payloadField = new BinaryDocValuesField("payloads", new BytesRef());
++        doc.add(payloadField);
++      } else {
++        payloadField = null;
++      }
++
++      //long t0 = System.nanoTime();
++      while ((text = iter.next()) != null) {
++        String textString = text.utf8ToString();
++        textField.setStringValue(textString);
++        textGramField.setStringValue(textString);
++        textDVField.setBytesValue(text);
++        weightField.setLongValue(iter.weight());
++        if (payloads != null) {
++          payloadField.setBytesValue(payloads.payload());
++        }
++        w.addDocument(doc);
++      }
++      //System.out.println("initial indexing time: " + ((System.nanoTime()-t0)/1000000) + " msec");
++
++      r = new SlowCompositeReaderWrapper(DirectoryReader.open(w, false));
++      //long t1 = System.nanoTime();
++      w.rollback();
++
++      final int maxDoc = r.maxDoc();
++
++      final NumericDocValues weights = r.getNumericDocValues("weight");
++
++      final Sorter.DocComparator comparator = new Sorter.DocComparator() {
++          @Override
++          public int compare(int docID1, int docID2) {
++            final long v1 = weights.get(docID1);
++            final long v2 = weights.get(docID2);
++            // Reverse sort (highest weight first);
++            // java7 only:
++            //return Long.compare(v2, v1);
++            if (v1 > v2) {
++              return -1;
++            } else if (v1 < v2) {
++              return 1;
++            } else {
++              return 0;
++            }
++          }
++        };
++
++      r = SortingAtomicReader.wrap(r, new Sorter() {
++          @Override
++          public Sorter.DocMap sort(AtomicReader reader) throws IOException {
++            return Sorter.sort(maxDoc, comparator);
++          }
++
++          @Override
++          public String getID() {
++            return "Weight";
++          }
++        });
++      
++      w2 = new IndexWriter(dir,
++                           getIndexWriterConfig(matchVersion, indexAnalyzer));
++      w2.addIndexes(new IndexReader[] {r});
++      r.close();
++
++      //System.out.println("sort time: " + ((System.nanoTime()-t1)/1000000) + " msec");
++
++      searcher = new IndexSearcher(DirectoryReader.open(w2, false));
++      w2.close();
++
++      payloadsDV = MultiDocValues.getBinaryValues(searcher.getIndexReader(), "payloads");
++      weightsDV = MultiDocValues.getNumericValues(searcher.getIndexReader(), "weight");
++      textDV = MultiDocValues.getBinaryValues(searcher.getIndexReader(), TEXT_FIELD_NAME);
++      assert textDV != null;
++      success = true;
++    } finally {
++      if (success) {
++        IOUtils.close(w, w2, r);
++      } else {
++        IOUtils.closeWhileHandlingException(w, w2, r);
++      }
++    }
++  }
++
++  @Override
++  public List<LookupResult> lookup(CharSequence key, boolean onlyMorePopular, int num) {
++    return lookup(key, num, true, true);
++  }
++
++  /** This is called if the last token isn't ended
++   *  (e.g. user did not type a space after it).  Return an
++   *  appropriate Query clause to add to the BooleanQuery. */
++  protected Query getLastTokenQuery(String token) throws IOException {
++    if (token.length() < minPrefixChars) {
++      // The leading ngram was directly indexed:
++      return new TermQuery(new Term("textgrams", token));
++    }
++
++    return new PrefixQuery(new Term(TEXT_FIELD_NAME, token));
++  }
++
++  /** Retrieve suggestions, specifying whether all terms
++   *  must match ({@code allTermsRequired}) and whether the hits
++   *  should be highlighted ({@code doHighlight}). */
++  public List<LookupResult> lookup(CharSequence key, int num, boolean allTermsRequired, boolean doHighlight) {
++
++    final BooleanClause.Occur occur;
++    if (allTermsRequired) {
++      occur = BooleanClause.Occur.MUST;
++    } else {
++      occur = BooleanClause.Occur.SHOULD;
++    }
++
++    try {
++      //long t0 = System.currentTimeMillis();
++      TokenStream ts = queryAnalyzer.tokenStream("", new StringReader(key.toString()));
++      ts.reset();
++      final CharTermAttribute termAtt = ts.addAttribute(CharTermAttribute.class);
++      final OffsetAttribute offsetAtt = ts.addAttribute(OffsetAttribute.class);
++      String lastToken = null;
++      BooleanQuery query = new BooleanQuery();
++      int maxEndOffset = -1;
++      final Set<String> matchedTokens = new HashSet<String>();
++      while (ts.incrementToken()) {
++        if (lastToken != null) {  
++          matchedTokens.add(lastToken);
++          query.add(new TermQuery(new Term(TEXT_FIELD_NAME, lastToken)), occur);
++        }
++        lastToken = termAtt.toString();
++        if (lastToken != null) {
++          maxEndOffset = Math.max(maxEndOffset, offsetAtt.endOffset());
++        }
++      }
++      ts.end();
++
++      String prefixToken = null;
++      if (lastToken != null) {
++        Query lastQuery;
++        if (maxEndOffset == offsetAtt.endOffset()) {
++          // Use PrefixQuery (or the ngram equivalent) when
++          // there was no trailing discarded chars in the
++          // string (e.g. whitespace), so that if query does
++          // not end with a space we show prefix matches for
++          // that token:
++          lastQuery = getLastTokenQuery(lastToken);
++          prefixToken = lastToken;
++        } else {
++          // Use TermQuery for an exact match if there were
++          // trailing discarded chars (e.g. whitespace), so
++          // that if query ends with a space we only show
++          // exact matches for that term:
++          matchedTokens.add(lastToken);
++          lastQuery = new TermQuery(new Term(TEXT_FIELD_NAME, lastToken));
++        }
++        if (lastQuery != null) {
++          query.add(lastQuery, occur);
++        }
++      }
++      ts.close();
++
++      // TODO: we could allow blended sort here, combining
++      // weight w/ score.  Now we ignore score and sort only
++      // by weight:
++
++      //System.out.println("INFIX query=" + query);
++
++      Query finalQuery = finishQuery(query, allTermsRequired);
++
++      // We sorted postings by weight during indexing, so we
++      // only retrieve the first num hits now:
++      FirstNDocsCollector c = new FirstNDocsCollector(num);
++      try {
++        searcher.search(finalQuery, c);
++      } catch (FirstNDocsCollector.DoneException done) {
++      }
++      TopDocs hits = c.getHits();
++
++      // Slower way if postings are not pre-sorted by weight:
++      // hits = searcher.search(query, null, num, new Sort(new SortField("weight", SortField.Type.LONG, true)));
++
++      List<LookupResult> results = new ArrayList<LookupResult>();
++      BytesRef scratch = new BytesRef();
++      for (int i=0;i<hits.scoreDocs.length;i++) {
++        ScoreDoc sd = hits.scoreDocs[i];
++        textDV.get(sd.doc, scratch);
++        String text = scratch.utf8ToString();
++        if (doHighlight) {
++          text = highlight(text, matchedTokens, prefixToken);
++        }
++        long score = weightsDV.get(sd.doc);
++
++        BytesRef payload;
++        if (payloadsDV != null) {
++          payload = new BytesRef();
++          payloadsDV.get(sd.doc, payload);
++        } else {
++          payload = null;
++        }
++
++        results.add(new LookupResult(text, score, payload));
++      }
++      //System.out.println((System.currentTimeMillis() - t0) + " msec for infix suggest");
++      //System.out.println(results);
++      return results;
++    } catch (IOException ioe) {
++      throw new RuntimeException(ioe);
++    }
++  }
++
++  /** Subclass can override this to tweak the Query before
++   *  searching. */
++  protected Query finishQuery(BooleanQuery in, boolean allTermsRequired) {
++    return in;
++  }
++
++  private String highlight(String text, Set<String> matchedTokens, String prefixToken) throws IOException {
++    TokenStream ts = queryAnalyzer.tokenStream("text", new StringReader(text));
++    CharTermAttribute termAtt = ts.addAttribute(CharTermAttribute.class);
++    OffsetAttribute offsetAtt = ts.addAttribute(OffsetAttribute.class);
++    ts.reset();
++    StringBuilder sb = new StringBuilder();
++    int upto = 0;
++    while (ts.incrementToken()) {
++      String token = termAtt.toString();
++      int startOffset = offsetAtt.startOffset();
++      int endOffset = offsetAtt.endOffset();
++      if (upto < startOffset) {
++        sb.append(text.substring(upto, startOffset));
++        upto = startOffset;
++      } else if (upto > startOffset) {
++        continue;
++      }
++
++      if (matchedTokens.contains(token)) {
++        // Token matches.
++        addWholeMatch(sb, text.substring(startOffset, endOffset), token);
++        upto = endOffset;
++      } else if (prefixToken != null && token.startsWith(prefixToken)) {
++        addPrefixMatch(sb, text.substring(startOffset, endOffset), token, prefixToken);
++        upto = endOffset;
++      }
++    }
++    ts.end();
++    int endOffset = offsetAtt.endOffset();
++    if (upto < endOffset) {
++      sb.append(text.substring(upto));
++    }
++    ts.close();
++
++    return sb.toString();
++  }
++
++  /** Appends the whole matched token to the provided {@code
++   *  StringBuilder}. */
++  protected void addWholeMatch(StringBuilder sb, String surface, String analyzed) {
++    sb.append("<b>");
++    sb.append(surface);
++    sb.append("</b>");
++  }
++
++  /** Append a matched prefix token, to the provided
++   *  {@code StringBuilder}. 
++   *  @param sb {@code StringBuilder} to append to
++   *  @param surface The fragment of the surface form
++   *        (indexed during {@link #build}, corresponding to
++   *        this match
++   *  @param analyzed The analyzed token that matched
++   *  @param prefixToken The prefix of the token that matched
++   */
++  protected void addPrefixMatch(StringBuilder sb, String surface, String analyzed, String prefixToken) {
++    // TODO: apps can try to invert their analysis logic
++    // here, e.g. downcase the two before checking prefix:
++    sb.append("<b>");
++    if (surface.startsWith(prefixToken)) {
++      sb.append(surface.substring(0, prefixToken.length()));
++      sb.append("</b>");
++      sb.append(surface.substring(prefixToken.length()));
++    } else {
++      sb.append(surface);
++      sb.append("</b>");
++    }
++  }
++
++  private static class FirstNDocsCollector extends Collector {
++    private int docBase;
++    private final int[] hits;
++    private int hitCount;
++
++    private static class DoneException extends RuntimeException {
++    }
++
++    public TopDocs getHits() {
++      ScoreDoc[] scoreDocs = new ScoreDoc[hitCount];
++      for(int i=0;i<hitCount;i++) {
++        scoreDocs[i] = new ScoreDoc(hits[i], Float.NaN);
++      }
++      return new TopDocs(hitCount, scoreDocs, Float.NaN);
++    }
++
++    public FirstNDocsCollector(int topN) {
++      hits = new int[topN];
++    }
++
++    @Override
++    public void collect(int doc) {
++      //System.out.println("collect doc=" + doc);
++      hits[hitCount++] = doc;
++      if (hitCount == hits.length) {
++        throw new DoneException();
++      }
++    }
++
++    @Override
++    public void setScorer(Scorer scorer) {
++    }
++
++    @Override
++    public boolean acceptsDocsOutOfOrder() {
++      return false;
++    }
++
++    @Override
++    public void setNextReader(AtomicReaderContext cxt) {
++      docBase = cxt.docBase;
++    }
++  }
++
++  @Override
++  public boolean store(OutputStream out) {
++    return false;
++  }
++
++  @Override
++  public boolean load(InputStream out) {
++    return false;
++  }
++
++  @Override
++  public void close() throws IOException {
++    if (searcher != null) {
++      searcher.getIndexReader().close();
++      searcher = null;
++      dir.close();
++    }
++  }
++};
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java
+index 909235e..f71318c 100644
+--- a/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/LookupBenchmarkTest.java
+@@ -30,18 +30,18 @@ import java.util.Locale;
+ import java.util.Random;
+ import java.util.concurrent.Callable;
+ 
+-import org.apache.lucene.util.*;
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.analysis.MockTokenizer;
+ import org.apache.lucene.search.suggest.Lookup; // javadocs
++import org.apache.lucene.search.suggest.analyzing.AnalyzingInfixSuggester;
+ import org.apache.lucene.search.suggest.analyzing.AnalyzingSuggester;
+ import org.apache.lucene.search.suggest.analyzing.FuzzySuggester;
+ import org.apache.lucene.search.suggest.fst.FSTCompletionLookup;
+ import org.apache.lucene.search.suggest.fst.WFSTCompletionLookup;
+ import org.apache.lucene.search.suggest.jaspell.JaspellLookup;
+ import org.apache.lucene.search.suggest.tst.TSTLookup;
+-
++import org.apache.lucene.util.*;
+ import org.junit.BeforeClass;
+ import org.junit.Ignore;
+ 
+@@ -54,11 +54,11 @@ public class LookupBenchmarkTest extends LuceneTestCase {
+   private final List<Class<? extends Lookup>> benchmarkClasses = Arrays.asList(
+       FuzzySuggester.class,
+       AnalyzingSuggester.class,
++      AnalyzingInfixSuggester.class,
+       JaspellLookup.class, 
+       TSTLookup.class,
+       FSTCompletionLookup.class,
+       WFSTCompletionLookup.class
+-      
+       );
+ 
+   private final static int rounds = 15;
+@@ -168,8 +168,13 @@ public class LookupBenchmarkTest extends LuceneTestCase {
+     try {
+       lookup = cls.newInstance();
+     } catch (InstantiationException e) {
+-      Constructor<? extends Lookup> ctor = cls.getConstructor(Analyzer.class);
+-      lookup = ctor.newInstance(new MockAnalyzer(random, MockTokenizer.KEYWORD, false));
++      Analyzer a = new MockAnalyzer(random, MockTokenizer.KEYWORD, false);
++      if (cls == AnalyzingInfixSuggester.class) {
++        lookup = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, _TestUtil.getTempDir("LookupBenchmarkTest"), a);
++      } else {
++        Constructor<? extends Lookup> ctor = cls.getConstructor(Analyzer.class);
++        lookup = ctor.newInstance(a);
++      }
+     }
+     lookup.build(new TermFreqArrayIterator(input));
+     return lookup;
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggesterTest.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggesterTest.java
+new file mode 100644
+index 0000000..2d65861
+--- /dev/null
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggesterTest.java
+@@ -0,0 +1,309 @@
++package org.apache.lucene.search.suggest.analyzing;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.File;
++import java.io.Reader;
++import java.util.List;
++import java.util.Locale;
++
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.MockAnalyzer;
++import org.apache.lucene.analysis.MockTokenizer;
++import org.apache.lucene.search.BooleanClause;
++import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.PrefixQuery;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.suggest.Lookup.LookupResult;
++import org.apache.lucene.search.suggest.TermFreqPayload;
++import org.apache.lucene.search.suggest.TermFreqPayloadArrayIterator;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
++
++// Test requires postings offsets:
++@SuppressCodecs({"Lucene3x","MockFixedIntBlock","MockVariableIntBlock","MockSep","MockRandom"})
++public class AnalyzingInfixSuggesterTest extends LuceneTestCase {
++
++  public void testBasic() throws Exception {
++    TermFreqPayload keys[] = new TermFreqPayload[] {
++      new TermFreqPayload("lend me your ear", 8, new BytesRef("foobar")),
++      new TermFreqPayload("a penny saved is a penny earned", 10, new BytesRef("foobaz")),
++    };
++
++    File tempDir = _TestUtil.getTempDir("AnalyzingInfixSuggesterTest");
++
++    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3);
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++
++    List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("ear", random()), 10, true, true);
++    assertEquals(2, results.size());
++    assertEquals("a penny saved is a penny <b>ear</b>ned", results.get(0).key);
++    assertEquals(10, results.get(0).value);
++    assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++
++    assertEquals("lend me your <b>ear</b>", results.get(1).key);
++    assertEquals(8, results.get(1).value);
++    assertEquals(new BytesRef("foobar"), results.get(1).payload);
++
++    results = suggester.lookup(_TestUtil.stringToCharSequence("ear ", random()), 10, true, true);
++    assertEquals(1, results.size());
++    assertEquals("lend me your <b>ear</b>", results.get(0).key);
++    assertEquals(8, results.get(0).value);
++    assertEquals(new BytesRef("foobar"), results.get(0).payload);
++
++    results = suggester.lookup(_TestUtil.stringToCharSequence("pen", random()), 10, true, true);
++    assertEquals(1, results.size());
++    assertEquals("a <b>pen</b>ny saved is a <b>pen</b>ny earned", results.get(0).key);
++    assertEquals(10, results.get(0).value);
++    assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++
++    results = suggester.lookup(_TestUtil.stringToCharSequence("p", random()), 10, true, true);
++    assertEquals(1, results.size());
++    assertEquals("a <b>p</b>enny saved is a <b>p</b>enny earned", results.get(0).key);
++    assertEquals(10, results.get(0).value);
++    assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++
++    suggester.close();
++  }
++
++  public void testAfterLoad() throws Exception {
++    TermFreqPayload keys[] = new TermFreqPayload[] {
++      new TermFreqPayload("lend me your ear", 8, new BytesRef("foobar")),
++      new TermFreqPayload("a penny saved is a penny earned", 10, new BytesRef("foobaz")),
++    };
++
++    File tempDir = _TestUtil.getTempDir("AnalyzingInfixSuggesterTest");
++
++    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3);
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++    suggester.close();
++
++    suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3);
++    List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("ear", random()), 10, true, true);
++    assertEquals(2, results.size());
++    assertEquals("a penny saved is a penny <b>ear</b>ned", results.get(0).key);
++    assertEquals(10, results.get(0).value);
++    assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++    suggester.close();
++  }
++
++  public void testRandomMinPrefixLength() throws Exception {
++    TermFreqPayload keys[] = new TermFreqPayload[] {
++      new TermFreqPayload("lend me your ear", 8, new BytesRef("foobar")),
++      new TermFreqPayload("a penny saved is a penny earned", 10, new BytesRef("foobaz")),
++    };
++
++    File tempDir = _TestUtil.getTempDir("AnalyzingInfixSuggesterTest");
++
++    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
++    int minPrefixLength = random().nextInt(10);
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, minPrefixLength);
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++
++    for(int i=0;i<2;i++) {
++      for(int j=0;j<2;j++) {
++        boolean doHighlight = j == 0;
++
++        List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("ear", random()), 10, true, doHighlight);
++        assertEquals(2, results.size());
++        if (doHighlight) {
++          assertEquals("a penny saved is a penny <b>ear</b>ned", results.get(0).key);
++        } else {
++          assertEquals("a penny saved is a penny earned", results.get(0).key);
++        }
++        assertEquals(10, results.get(0).value);
++        if (doHighlight) {
++          assertEquals("lend me your <b>ear</b>", results.get(1).key);
++        } else {
++          assertEquals("lend me your ear", results.get(1).key);
++        }
++        assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++        assertEquals(8, results.get(1).value);
++        assertEquals(new BytesRef("foobar"), results.get(1).payload);
++
++        results = suggester.lookup(_TestUtil.stringToCharSequence("ear ", random()), 10, true, doHighlight);
++        assertEquals(1, results.size());
++        if (doHighlight) {
++          assertEquals("lend me your <b>ear</b>", results.get(0).key);
++        } else {
++          assertEquals("lend me your ear", results.get(0).key);
++        }
++        assertEquals(8, results.get(0).value);
++        assertEquals(new BytesRef("foobar"), results.get(0).payload);
++
++        results = suggester.lookup(_TestUtil.stringToCharSequence("pen", random()), 10, true, doHighlight);
++        assertEquals(1, results.size());
++        if (doHighlight) {
++          assertEquals("a <b>pen</b>ny saved is a <b>pen</b>ny earned", results.get(0).key);
++        } else {
++          assertEquals("a penny saved is a penny earned", results.get(0).key);
++        }
++        assertEquals(10, results.get(0).value);
++        assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++
++        results = suggester.lookup(_TestUtil.stringToCharSequence("p", random()), 10, true, doHighlight);
++        assertEquals(1, results.size());
++        if (doHighlight) {
++          assertEquals("a <b>p</b>enny saved is a <b>p</b>enny earned", results.get(0).key);
++        } else {
++          assertEquals("a penny saved is a penny earned", results.get(0).key);
++        }
++        assertEquals(10, results.get(0).value);
++        assertEquals(new BytesRef("foobaz"), results.get(0).payload);
++      }
++
++      // Make sure things still work after close and reopen:
++      suggester.close();
++      suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, minPrefixLength);
++    }
++  }
++
++  public void testHighlight() throws Exception {
++    TermFreqPayload keys[] = new TermFreqPayload[] {
++      new TermFreqPayload("a penny saved is a penny earned", 10, new BytesRef("foobaz")),
++    };
++
++    File tempDir = _TestUtil.getTempDir("AnalyzingInfixSuggesterTest");
++
++    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3);
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++    List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("penn", random()), 10, true, true);
++    assertEquals(1, results.size());
++    assertEquals("a <b>penn</b>y saved is a <b>penn</b>y earned", results.get(0).key);
++    suggester.close();
++  }
++
++  public void testHighlightCaseChange() throws Exception {
++    TermFreqPayload keys[] = new TermFreqPayload[] {
++      new TermFreqPayload("a Penny saved is a penny earned", 10, new BytesRef("foobaz")),
++    };
++
++    File tempDir = _TestUtil.getTempDir("AnalyzingInfixSuggesterTest");
++
++    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, true);
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3);
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++    List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("penn", random()), 10, true, true);
++    assertEquals(1, results.size());
++    assertEquals("a <b>Penny</b> saved is a <b>penn</b>y earned", results.get(0).key);
++    suggester.close();
++
++    // Try again, but overriding addPrefixMatch to normalize case:
++    suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3) {
++        @Override
++        protected void addPrefixMatch(StringBuilder sb, String surface, String analyzed, String prefixToken) {
++          prefixToken = prefixToken.toLowerCase(Locale.ROOT);
++          String surfaceLower = surface.toLowerCase(Locale.ROOT);
++          sb.append("<b>");
++          if (surfaceLower.startsWith(prefixToken)) {
++            sb.append(surface.substring(0, prefixToken.length()));
++            sb.append("</b>");
++            sb.append(surface.substring(prefixToken.length()));
++          } else {
++            sb.append(surface);
++            sb.append("</b>");
++          }
++        }
++      };
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++    results = suggester.lookup(_TestUtil.stringToCharSequence("penn", random()), 10, true, true);
++    assertEquals(1, results.size());
++    assertEquals("a <b>Penn</b>y saved is a <b>penn</b>y earned", results.get(0).key);
++    suggester.close();
++  }
++
++  public void testDoubleClose() throws Exception {
++    TermFreqPayload keys[] = new TermFreqPayload[] {
++      new TermFreqPayload("a penny saved is a penny earned", 10, new BytesRef("foobaz")),
++    };
++
++    File tempDir = _TestUtil.getTempDir("AnalyzingInfixSuggesterTest");
++
++    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3);
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++    suggester.close();
++    suggester.close();
++  }
++
++  public void testForkLastToken() throws Exception {
++    Analyzer a = new Analyzer() {
++        @Override
++        protected TokenStreamComponents createComponents(String fieldName, Reader reader) {
++          MockTokenizer tokens = new MockTokenizer(reader);
++          // ForkLastTokenFilter is a bit evil:
++          tokens.setEnableChecks(false);
++          return new TokenStreamComponents(tokens,
++                                           new StopKeywordFilter(TEST_VERSION_CURRENT,
++                                                                 new ForkLastTokenFilter(tokens), StopKeywordFilter.makeStopSet(TEST_VERSION_CURRENT, "a")));
++        }
++      };
++
++    TermFreqPayload keys[] = new TermFreqPayload[] {
++      new TermFreqPayload("a bob for apples", 10, new BytesRef("foobaz")),
++    };
++
++    File tempDir = _TestUtil.getTempDir("AnalyzingInfixSuggesterTest");
++
++    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(TEST_VERSION_CURRENT, tempDir, a, a, 3) {
++        @Override
++        protected Query finishQuery(BooleanQuery in, boolean allTermsRequired) {
++          List<BooleanClause> clauses = in.clauses();
++          if (clauses.size() >= 2 && allTermsRequired) {
++            String t1 = getTerm(clauses.get(clauses.size()-2).getQuery());
++            String t2 = getTerm(clauses.get(clauses.size()-1).getQuery());
++            if (t1.equals(t2)) {
++              // The last 2 tokens came from
++              // ForkLastTokenFilter; we remove them and
++              // replace them with a MUST BooleanQuery that
++              // SHOULDs the two of them together:
++              BooleanQuery sub = new BooleanQuery();
++              BooleanClause other = clauses.get(clauses.size()-2);
++              sub.add(new BooleanClause(clauses.get(clauses.size()-2).getQuery(), BooleanClause.Occur.SHOULD));
++              sub.add(new BooleanClause(clauses.get(clauses.size()-1).getQuery(), BooleanClause.Occur.SHOULD));
++              clauses.subList(clauses.size()-2, clauses.size()).clear();
++              clauses.add(new BooleanClause(sub, BooleanClause.Occur.MUST));
++            }
++          }
++          return in;
++        }
++
++        private String getTerm(Query query) {
++          if (query instanceof TermQuery) {
++            return ((TermQuery) query).getTerm().text();
++          } else if (query instanceof PrefixQuery) {
++            return ((PrefixQuery) query).getPrefix().text();
++          } else {
++            return null;
++          }
++        }
++      };
++
++    suggester.build(new TermFreqPayloadArrayIterator(keys));
++    List<LookupResult> results = suggester.lookup(_TestUtil.stringToCharSequence("a", random()), 10, true, true);
++    assertEquals(1, results.size());
++    assertEquals("a bob for <b>a</b>pples", results.get(0).key);
++    suggester.close();
++  }
++}
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/ForkLastTokenFilter.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/ForkLastTokenFilter.java
+new file mode 100644
+index 0000000..13614ec
+--- /dev/null
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/ForkLastTokenFilter.java
+@@ -0,0 +1,89 @@
++package org.apache.lucene.search.suggest.analyzing;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++
++import org.apache.lucene.analysis.TokenFilter;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.KeywordAttribute;
++import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
++import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
++
++/** Repeats the last token, if the endOffset indicates that
++ *  the token didn't have any characters after it (i.e. it
++ *  is not "done").  This is useful in analyzing
++ *  suggesters along with StopKeywordFilter: imagine the
++ *  user has typed 'a', but your stop filter would normally
++ *  remove that.  This token filter will repeat that last a
++ *  token, setting {@link KeywordAttribute}, so that the
++ *  {@link StopKeywordFilter} won't remove it, and then
++ *  suggestions starting with a will be shown.  */
++
++final class ForkLastTokenFilter extends TokenFilter {
++
++  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
++  private final KeywordAttribute keywordAtt = addAttribute(KeywordAttribute.class);
++  private final PositionIncrementAttribute posIncAtt = addAttribute(PositionIncrementAttribute.class);
++
++  State lastToken;
++  int maxEndOffset;
++  boolean stop = false;
++
++  public ForkLastTokenFilter(TokenStream in) {
++    super(in);
++  }
++
++  @Override
++  public boolean incrementToken() throws IOException {
++    if (stop) {
++      return false;
++    } else if (input.incrementToken()) {
++      lastToken = captureState();
++      maxEndOffset = Math.max(maxEndOffset, offsetAtt.endOffset());
++      return true;
++    } else if (lastToken == null) {
++      return false;
++    } else {
++
++      // TODO: this is iffy!!!  maybe somehow instead caller
++      // could tell us endOffset up front?
++      input.end();
++
++      if (offsetAtt.endOffset() == maxEndOffset) {
++        // Text did not see end of token char:
++        restoreState(lastToken);
++        keywordAtt.setKeyword(true);
++        posIncAtt.setPositionIncrement(0);
++        lastToken = null;
++        stop = true;
++        return true;
++      } else {
++        return false;
++      }
++    }
++  }
++
++  @Override
++  public void reset() throws IOException {
++    super.reset();
++    lastToken = null;
++    maxEndOffset = -1;
++    stop = false;
++  }
++}
+diff --git a/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/StopKeywordFilter.java b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/StopKeywordFilter.java
+new file mode 100644
+index 0000000..1ac1ede
+--- /dev/null
++++ b/lucene/suggest/src/test/org/apache/lucene/search/suggest/analyzing/StopKeywordFilter.java
+@@ -0,0 +1,131 @@
++package org.apache.lucene.search.suggest.analyzing;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.Arrays;
++import java.util.List;
++
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
++import org.apache.lucene.analysis.tokenattributes.KeywordAttribute;
++import org.apache.lucene.analysis.util.CharArraySet;
++import org.apache.lucene.analysis.util.FilteringTokenFilter;
++import org.apache.lucene.util.Version;
++
++/**
++ * Removes stop words from a token stream, if
++ * {@link KeywordAttribute} is set then does not remove the
++ * word.
++ * 
++ * <a name="version"/>
++ * <p>You must specify the required {@link Version}
++ * compatibility when creating StopFilter:
++ * <ul>
++ *   <li> As of 3.1, StopFilter correctly handles Unicode 4.0
++ *         supplementary characters in stopwords and position
++ *         increments are preserved
++ * </ul>
++ */
++final class StopKeywordFilter extends FilteringTokenFilter {
++
++  private final CharArraySet stopWords;
++  private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
++  private final KeywordAttribute keywordAtt = addAttribute(KeywordAttribute.class);
++  
++  /**
++   * Constructs a filter which removes words from the input TokenStream that are
++   * named in the Set.
++   * 
++   * @param matchVersion
++   *          Lucene version to enable correct Unicode 4.0 behavior in the stop
++   *          set if Version > 3.0.  See <a href="#version">above</a> for details.
++   * @param in
++   *          Input stream
++   * @param stopWords
++   *          A {@link CharArraySet} representing the stopwords.
++   * @see #makeStopSet(Version, java.lang.String...)
++   */
++  public StopKeywordFilter(Version matchVersion, TokenStream in, CharArraySet stopWords) {
++    super(matchVersion, in);
++    this.stopWords = stopWords;
++  }
++
++  /**
++   * Builds a Set from an array of stop words,
++   * appropriate for passing into the StopFilter constructor.
++   * This permits this stopWords construction to be cached once when
++   * an Analyzer is constructed.
++   * 
++   * @param matchVersion Lucene version to enable correct Unicode 4.0 behavior in the returned set if Version > 3.0
++   * @param stopWords An array of stopwords
++   * @see #makeStopSet(Version, java.lang.String[], boolean) passing false to ignoreCase
++   */
++  public static CharArraySet makeStopSet(Version matchVersion, String... stopWords) {
++    return makeStopSet(matchVersion, stopWords, false);
++  }
++  
++  /**
++   * Builds a Set from an array of stop words,
++   * appropriate for passing into the StopFilter constructor.
++   * This permits this stopWords construction to be cached once when
++   * an Analyzer is constructed.
++   * 
++   * @param matchVersion Lucene version to enable correct Unicode 4.0 behavior in the returned set if Version > 3.0
++   * @param stopWords A List of Strings or char[] or any other toString()-able list representing the stopwords
++   * @return A Set ({@link CharArraySet}) containing the words
++   * @see #makeStopSet(Version, java.lang.String[], boolean) passing false to ignoreCase
++   */
++  public static CharArraySet makeStopSet(Version matchVersion, List<?> stopWords) {
++    return makeStopSet(matchVersion, stopWords, false);
++  }
++    
++  /**
++   * Creates a stopword set from the given stopword array.
++   * 
++   * @param matchVersion Lucene version to enable correct Unicode 4.0 behavior in the returned set if Version > 3.0
++   * @param stopWords An array of stopwords
++   * @param ignoreCase If true, all words are lower cased first.  
++   * @return a Set containing the words
++   */    
++  public static CharArraySet makeStopSet(Version matchVersion, String[] stopWords, boolean ignoreCase) {
++    CharArraySet stopSet = new CharArraySet(matchVersion, stopWords.length, ignoreCase);
++    stopSet.addAll(Arrays.asList(stopWords));
++    return stopSet;
++  }
++  
++  /**
++   * Creates a stopword set from the given stopword list.
++   * @param matchVersion Lucene version to enable correct Unicode 4.0 behavior in the returned set if Version > 3.0
++   * @param stopWords A List of Strings or char[] or any other toString()-able list representing the stopwords
++   * @param ignoreCase if true, all words are lower cased first
++   * @return A Set ({@link CharArraySet}) containing the words
++   */
++  public static CharArraySet makeStopSet(Version matchVersion, List<?> stopWords, boolean ignoreCase){
++    CharArraySet stopSet = new CharArraySet(matchVersion, stopWords.size(), ignoreCase);
++    stopSet.addAll(stopWords);
++    return stopSet;
++  }
++  
++  /**
++   * Returns the next input Token whose term() is not a stop word.
++   */
++  @Override
++  protected boolean accept() {
++    return keywordAtt.isKeyword() || !stopWords.contains(termAtt.buffer(), 0, termAtt.length());
++  }
++}
+

@@ -1,0 +1,434 @@
+GitDiffStart: e50b392f467cf1e3dea3999b5449c48742cf2084 | Thu Mar 20 11:30:31 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index a7a4899..8c6d238 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -115,6 +115,10 @@ New Features
+ * LUCENE-4072: Add ICUNormalizer2CharFilter, which lets you do unicode normalization
+   with offset correction before the tokenizer. (David Goldfarb, Ippei UKAI via Robert Muir)
+ 
++* LUCENE-5476: Add RandomSamplingFacetsCollector for computing facets on a sampled
++  set of matching hits, in cases where there are millions of hits.
++  (Rob Audenaerde, Gilad Barkai, Shai Erera)
++
+ API Changes
+ 
+ * LUCENE-5454: Add RandomAccessOrds, an optional extension of SortedSetDocValues
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/RandomSamplingFacetsCollector.java b/lucene/facet/src/java/org/apache/lucene/facet/RandomSamplingFacetsCollector.java
+new file mode 100644
+index 0000000..58c0696
+--- /dev/null
++++ b/lucene/facet/src/java/org/apache/lucene/facet/RandomSamplingFacetsCollector.java
+@@ -0,0 +1,264 @@
++package org.apache.lucene.facet;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.lucene.facet.FacetsConfig.DimConfig;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.util.FixedBitSet;
++
++/**
++ * Collects hits for subsequent faceting, using sampling if needed. Once you've
++ * run a search and collect hits into this, instantiate one of the
++ * {@link Facets} subclasses to do the facet counting. Note that this collector
++ * does not collect the scores of matching docs (i.e.
++ * {@link FacetsCollector.MatchingDocs#scores}) is {@code null}.
++ * <p>
++ * If you require the original set of hits, you can call
++ * {@link #getOriginalMatchingDocs()}. Also, since the counts of the top-facets
++ * is based on the sampled set, you can amortize the counts by calling
++ * {@link #amortizeFacetCounts}.
++ */
++public class RandomSamplingFacetsCollector extends FacetsCollector {
++  
++  /**
++   * Faster alternative for java.util.Random, inspired by
++   * http://dmurphy747.wordpress.com/2011/03/23/xorshift-vs-random-
++   * performance-in-java/
++   * <p>
++   * Has a period of 2^64-1
++   */
++  private static class XORShift64Random {
++    
++    private long x;
++    
++    /** Creates a xorshift random generator using the provided seed */
++    public XORShift64Random(long seed) {
++      x = seed == 0 ? 0xdeadbeef : seed;
++    }
++    
++    /** Get the next random long value */
++    public long randomLong() {
++      x ^= (x << 21);
++      x ^= (x >>> 35);
++      x ^= (x << 4);
++      return x;
++    }
++    
++    /** Get the next random int, between 0 (inclusive) and n (exclusive) */
++    public int nextInt(int n) {
++      int res = (int) (randomLong() % n);
++      return (res < 0) ? -res : res;
++    }
++    
++  }
++  
++  private final static int NOT_CALCULATED = -1;
++  
++  private final int sampleSize;
++  private final XORShift64Random random;
++  
++  private double samplingRate;
++  private List<MatchingDocs> sampledDocs;
++  private int totalHits = NOT_CALCULATED;
++  private int leftoverBin = NOT_CALCULATED;
++  private int leftoverIndex = NOT_CALCULATED;
++  
++  /**
++   * Constructor with the given sample size and default seed.
++   * 
++   * @see #RandomSamplingFacetsCollector(int, long)
++   */
++  public RandomSamplingFacetsCollector(int sampleSize) {
++    this(sampleSize, 0);
++  }
++  
++  /**
++   * Constructor with the given sample size and seed.
++   * 
++   * @param sampleSize
++   *          The preferred sample size. If the number of hits is greater than
++   *          the size, sampling will be done using a sample ratio of sampling
++   *          size / totalN. For example: 1000 hits, sample size = 10 results in
++   *          samplingRatio of 0.01. If the number of hits is lower, no sampling
++   *          is done at all
++   * @param seed
++   *          The random seed. If {@code 0} then a seed will be chosen for you.
++   */
++  public RandomSamplingFacetsCollector(int sampleSize, long seed) {
++    super(false);
++    this.sampleSize = sampleSize;
++    this.random = new XORShift64Random(seed);
++    this.sampledDocs = null;
++  }
++  
++  /**
++   * Returns the sampled list of the matching documents. Note that a
++   * {@link FacetsCollector.MatchingDocs} instance is returned per segment, even
++   * if no hits from that segment are included in the sampled set.
++   * <p>
++   * Note: One or more of the MatchingDocs might be empty (not containing any
++   * hits) as result of sampling.
++   * <p>
++   * Note: {@code MatchingDocs.totalHits} is copied from the original
++   * MatchingDocs, scores is set to {@code null}
++   */
++  @Override
++  public List<MatchingDocs> getMatchingDocs() {
++    List<MatchingDocs> matchingDocs = super.getMatchingDocs();
++    
++    if (totalHits == NOT_CALCULATED) {
++      totalHits = 0;
++      for (MatchingDocs md : matchingDocs) {
++        totalHits += md.totalHits;
++      }
++    }
++    
++    if (totalHits <= sampleSize) {
++      return matchingDocs;
++    }
++    
++    if (sampledDocs == null) {
++      samplingRate = (1.0 * sampleSize) / totalHits;
++      sampledDocs = createSampledDocs(matchingDocs);
++    }
++    return sampledDocs;
++  }
++  
++  /** Returns the original matching documents. */
++  public List<MatchingDocs> getOriginalMatchingDocs() {
++    return super.getMatchingDocs();
++  }
++  
++  /** Create a sampled copy of the matching documents list. */
++  private List<MatchingDocs> createSampledDocs(List<MatchingDocs> matchingDocsList) {
++    List<MatchingDocs> sampledDocsList = new ArrayList<MatchingDocs>(matchingDocsList.size());
++    for (MatchingDocs docs : matchingDocsList) {
++      sampledDocsList.add(createSample(docs));
++    }
++    return sampledDocsList;
++  }
++  
++  /** Create a sampled of the given hits. */
++  private MatchingDocs createSample(MatchingDocs docs) {
++    int maxdoc = docs.context.reader().maxDoc();
++    
++    // TODO: we could try the WAH8DocIdSet here as well, as the results will be sparse
++    FixedBitSet sampleDocs = new FixedBitSet(maxdoc);
++    
++    int binSize = (int) (1.0 / samplingRate);
++    
++    try {
++      int counter = 0;
++      int limit, randomIndex;
++      if (leftoverBin != NOT_CALCULATED) {
++        limit = leftoverBin;
++        // either NOT_CALCULATED, which means we already sampled from that bin,
++        // or the next document to sample
++        randomIndex = leftoverIndex;
++      } else {
++        limit = binSize;
++        randomIndex = random.nextInt(binSize);
++      }
++      final DocIdSetIterator it = docs.bits.iterator();
++      for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
++        if (counter == randomIndex) {
++          sampleDocs.set(doc);
++        }
++        counter++;
++        if (counter >= limit) {
++          counter = 0;
++          limit = binSize;
++          randomIndex = random.nextInt(binSize);
++        }
++      }
++      
++      if (counter == 0) {
++        // we either exhausted the bin and the iterator at the same time, or
++        // this segment had no results. in the latter case we might want to
++        // carry leftover to the next segment as is, but that complicates the
++        // code and doesn't seem so important.
++        leftoverBin = leftoverIndex = NOT_CALCULATED;
++      } else {
++        leftoverBin = limit - counter;
++        if (randomIndex > counter) {
++          // the document to sample is in the next bin
++          leftoverIndex = randomIndex - counter;
++        } else if (randomIndex < counter) {
++          // we sampled a document from the bin, so just skip over remaining
++          // documents in the bin in the next segment.
++          leftoverIndex = NOT_CALCULATED;
++        }
++      }
++      
++      return new MatchingDocs(docs.context, sampleDocs, docs.totalHits, null);
++    } catch (IOException e) {
++      throw new RuntimeException();
++    }
++  }
++  
++  /**
++   * Note: if you use a counting {@link Facets} implementation, you can amortize the
++   * sampled counts by calling this method. Uses the {@link FacetsConfig} and
++   * the {@link IndexSearcher} to determine the upper bound for each facet value.
++   */
++  public FacetResult amortizeFacetCounts(FacetResult res, FacetsConfig config, IndexSearcher searcher) throws IOException {
++    if (res == null || totalHits <= sampleSize) {
++      return res;
++    }
++    
++    LabelAndValue[] fixedLabelValues = new LabelAndValue[res.labelValues.length];
++    IndexReader reader = searcher.getIndexReader();
++    DimConfig dimConfig = config.getDimConfig(res.dim);
++    
++    // +2 to prepend dimension, append child label
++    String[] childPath = new String[res.path.length + 2];
++    childPath[0] = res.dim;
++    
++    System.arraycopy(res.path, 0, childPath, 1, res.path.length); // reuse
++    
++    for (int i = 0; i < res.labelValues.length; i++) {
++      childPath[res.path.length + 1] = res.labelValues[i].label;
++      String fullPath = FacetsConfig.pathToString(childPath, childPath.length);
++      int max = reader.docFreq(new Term(dimConfig.indexFieldName, fullPath));
++      int correctedCount = (int) (res.labelValues[i].value.doubleValue() / samplingRate);
++      correctedCount = Math.min(max, correctedCount);
++      fixedLabelValues[i] = new LabelAndValue(res.labelValues[i].label, correctedCount);
++    }
++    
++    // cap the total count on the total number of non-deleted documents in the reader
++    int correctedTotalCount = res.value.intValue();
++    if (correctedTotalCount > 0) {
++      correctedTotalCount = Math.min(reader.numDocs(), (int) (res.value.doubleValue() / samplingRate));
++    }
++    
++    return new FacetResult(res.dim, res.path, correctedTotalCount, fixedLabelValues, res.childCount);
++  }
++  
++  /** Returns the sampling rate that was used. */
++  public double getSamplingRate() {
++    return samplingRate;
++  }
++  
++}
+diff --git a/lucene/facet/src/test/org/apache/lucene/facet/TestRandomSamplingFacetsCollector.java b/lucene/facet/src/test/org/apache/lucene/facet/TestRandomSamplingFacetsCollector.java
+new file mode 100644
+index 0000000..ce283a0
+--- /dev/null
++++ b/lucene/facet/src/test/org/apache/lucene/facet/TestRandomSamplingFacetsCollector.java
+@@ -0,0 +1,141 @@
++package org.apache.lucene.facet;
++
++import java.util.Random;
++
++import org.apache.lucene.document.Document;
++import org.apache.lucene.document.Field.Store;
++import org.apache.lucene.document.StringField;
++import org.apache.lucene.facet.FacetsCollector.MatchingDocs;
++import org.apache.lucene.facet.taxonomy.FastTaxonomyFacetCounts;
++import org.apache.lucene.facet.taxonomy.TaxonomyReader;
++import org.apache.lucene.facet.taxonomy.directory.DirectoryTaxonomyReader;
++import org.apache.lucene.facet.taxonomy.directory.DirectoryTaxonomyWriter;
++import org.apache.lucene.index.RandomIndexWriter;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.MultiCollector;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.store.Directory;
++import org.apache.lucene.util.IOUtils;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++public class TestRandomSamplingFacetsCollector extends FacetTestCase {
++  
++  public void testRandomSampling() throws Exception {
++    Directory dir = newDirectory();
++    Directory taxoDir = newDirectory();
++    
++    DirectoryTaxonomyWriter taxoWriter = new DirectoryTaxonomyWriter(taxoDir);
++    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
++    
++    FacetsConfig config = new FacetsConfig();
++    
++    int numDocs = atLeast(10000);
++    for (int i = 0; i < numDocs; i++) {
++      Document doc = new Document();
++      doc.add(new StringField("EvenOdd", (i % 2 == 0) ? "even" : "odd", Store.NO));
++      doc.add(new FacetField("iMod10", String.valueOf(i % 10)));
++      writer.addDocument(config.build(taxoWriter, doc));
++    }
++    Random random = random();
++    
++    // NRT open
++    IndexSearcher searcher = newSearcher(writer.getReader());
++    TaxonomyReader taxoReader = new DirectoryTaxonomyReader(taxoWriter);
++    IOUtils.close(writer, taxoWriter);
++    
++    // Test empty results
++    RandomSamplingFacetsCollector collectRandomZeroResults = new RandomSamplingFacetsCollector(numDocs / 10, random.nextLong());
++    
++    // There should be no divisions by zero
++    searcher.search(new TermQuery(new Term("EvenOdd", "NeverMatches")), collectRandomZeroResults);
++    
++    // There should be no divisions by zero and no null result
++    assertNotNull(collectRandomZeroResults.getMatchingDocs());
++    
++    // There should be no results at all
++    for (MatchingDocs doc : collectRandomZeroResults.getMatchingDocs()) {
++      assertEquals(0, doc.totalHits);
++    }
++    
++    // Now start searching and retrieve results.
++    
++    // Use a query to select half of the documents.
++    TermQuery query = new TermQuery(new Term("EvenOdd", "even"));
++    
++    // there will be 5 facet values (0, 2, 4, 6 and 8), as only the even (i %
++    // 10) are hits.
++    // there is a REAL small chance that one of the 5 values will be missed when
++    // sampling.
++    // but is that 0.8 (chance not to take a value) ^ 2000 * 5 (any can be
++    // missing) ~ 10^-193
++    // so that is probably not going to happen.
++    int maxNumChildren = 5;
++    
++    RandomSamplingFacetsCollector random100Percent = new RandomSamplingFacetsCollector(numDocs, random.nextLong()); // no sampling
++    RandomSamplingFacetsCollector random10Percent = new RandomSamplingFacetsCollector(numDocs / 10, random.nextLong()); // 10 % of total docs, 20% of the hits
++
++    FacetsCollector fc = new FacetsCollector();
++    
++    searcher.search(query, MultiCollector.wrap(fc, random100Percent, random10Percent));
++    
++    FastTaxonomyFacetCounts random10FacetCounts = new FastTaxonomyFacetCounts(taxoReader, config, random10Percent);
++    FastTaxonomyFacetCounts random100FacetCounts = new FastTaxonomyFacetCounts(taxoReader, config, random100Percent);
++    FastTaxonomyFacetCounts exactFacetCounts = new FastTaxonomyFacetCounts(taxoReader, config, fc);
++    
++    FacetResult random10Result = random10Percent.amortizeFacetCounts(random10FacetCounts.getTopChildren(10, "iMod10"), config, searcher);
++    FacetResult random100Result = random100FacetCounts.getTopChildren(10, "iMod10");
++    FacetResult exactResult = exactFacetCounts.getTopChildren(10, "iMod10");
++    
++    assertEquals(random100Result, exactResult);
++    
++    // we should have five children, but there is a small chance we have less.
++    // (see above).
++    assertTrue(random10Result.childCount <= maxNumChildren);
++    // there should be one child at least.
++    assertTrue(random10Result.childCount >= 1);
++    
++    // now calculate some statistics to determine if the sampled result is 'ok'.
++    // because random sampling is used, the results will vary each time.
++    int sum = 0;
++    for (LabelAndValue lav : random10Result.labelValues) {
++      sum += lav.value.intValue();
++    }
++    float mu = (float) sum / (float) maxNumChildren;
++    
++    float variance = 0;
++    for (LabelAndValue lav : random10Result.labelValues) {
++      variance += Math.pow((mu - lav.value.intValue()), 2);
++    }
++    variance = variance / maxNumChildren;
++    float sigma = (float) Math.sqrt(variance);
++    
++    // we query only half the documents and have 5 categories. The average
++    // number of docs in a category will thus be the total divided by 5*2
++    float targetMu = numDocs / (5.0f * 2.0f);
++    
++    // the average should be in the range and the standard deviation should not
++    // be too great
++    assertTrue(sigma < 200);
++    assertTrue(targetMu - 3 * sigma < mu && mu < targetMu + 3 * sigma);
++    
++    IOUtils.close(searcher.getIndexReader(), taxoReader, dir, taxoDir);
++  }
++  
++}
+

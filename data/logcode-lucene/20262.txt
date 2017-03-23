@@ -1,0 +1,314 @@
+GitDiffStart: 764b7989a80e9529a7034e61c04b07f1f814117a | Thu May 14 22:05:40 2009 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 31d92a1..6a1d680 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -247,6 +247,10 @@ Optimizations
+  9. SOLR-1108: Remove un-needed synchronization in SolrCore constructor.
+     (Noble Paul via shalin)
+ 
++10. SOLR-1166: Speed up docset/filter generation by avoiding top-level
++    score() call and iterating over leaf readers with TermDocs. (yonik)
++
++
+ Bug Fixes
+ ----------------------
+  1. SOLR-774: Fixed logging level display (Sean Timm via Otis Gospodnetic)
+diff --git a/src/java/org/apache/solr/search/DocSetHitCollector.java b/src/java/org/apache/solr/search/DocSetHitCollector.java
+index f45a40e..5ed383e 100644
+--- a/src/java/org/apache/solr/search/DocSetHitCollector.java
++++ b/src/java/org/apache/solr/search/DocSetHitCollector.java
+@@ -18,7 +18,12 @@
+ package org.apache.solr.search;
+ 
+ import org.apache.lucene.search.HitCollector;
++import org.apache.lucene.search.Collector;
++import org.apache.lucene.search.Scorer;
+ import org.apache.lucene.util.OpenBitSet;
++import org.apache.lucene.index.IndexReader;
++
++import java.io.IOException;
+ 
+ /**
+  * @version $Id$
+@@ -76,3 +81,66 @@ final class DocSetHitCollector extends HitCollector {
+     }
+   }
+ }
++
++
++class DocSetCollector extends Collector {
++
++  final float HASHSET_INVERSE_LOAD_FACTOR;
++  final int HASHDOCSET_MAXSIZE;
++
++  int pos=0;
++  OpenBitSet bits;
++  final int maxDoc;
++  int base=0;
++
++  // in case there aren't that many hits, we may not want a very sparse
++  // bit array.  Optimistically collect the first few docs in an array
++  // in case there are only a few.
++  final int[] scratch;
++
++  // todo - could pass in bitset and an operation also...
++  DocSetCollector(float inverseLoadFactor, int maxSize, int maxDoc) {
++    this.maxDoc = maxDoc;
++    HASHSET_INVERSE_LOAD_FACTOR = inverseLoadFactor;
++    HASHDOCSET_MAXSIZE = maxSize;
++    scratch = new int[HASHDOCSET_MAXSIZE];
++  }
++
++  public void collect(int doc) {
++    doc += base;
++    // optimistically collect the first docs in an array
++    // in case the total number will be small enough to represent
++    // as a HashDocSet() instead...
++    // Storing in this array will be quicker to convert
++    // than scanning through a potentially huge bit vector.
++    // FUTURE: when search methods all start returning docs in order, maybe
++    // we could have a ListDocSet() and use the collected array directly.
++    if (pos < scratch.length) {
++      scratch[pos]=doc;
++    } else {
++      // this conditional could be removed if BitSet was preallocated, but that
++      // would take up more memory, and add more GC time...
++      if (bits==null) bits = new OpenBitSet(maxDoc);
++      bits.fastSet(doc);
++    }
++
++    pos++;
++  }
++
++  public DocSet getDocSet() {
++    if (pos<=scratch.length) {
++      return new HashDocSet(scratch,0,pos,HASHSET_INVERSE_LOAD_FACTOR);
++    } else {
++      // set the bits for ids that were collected in the array
++      for (int i=0; i<scratch.length; i++) bits.fastSet(scratch[i]);
++      return new BitDocSet(bits,pos);
++    }
++  }
++
++  public void setScorer(Scorer scorer) throws IOException {
++  }
++
++  public void setNextReader(IndexReader reader, int docBase) throws IOException {
++    this.base = docBase;
++  }
++}
+\ No newline at end of file
+diff --git a/src/java/org/apache/solr/search/SolrIndexSearcher.java b/src/java/org/apache/solr/search/SolrIndexSearcher.java
+index 4fe19ad..26db44f 100644
+--- a/src/java/org/apache/solr/search/SolrIndexSearcher.java
++++ b/src/java/org/apache/solr/search/SolrIndexSearcher.java
+@@ -628,15 +628,26 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+   // query must be positive
+   protected DocSet getDocSetNC(Query query, DocSet filter) throws IOException {
+     if (filter==null) {
+-      DocSetHitCollector hc = new DocSetHitCollector(HASHSET_INVERSE_LOAD_FACTOR, HASHDOCSET_MAXSIZE, maxDoc());
++      DocSetCollector hc = new DocSetCollector(HASHSET_INVERSE_LOAD_FACTOR, HASHDOCSET_MAXSIZE, maxDoc());
+       if (query instanceof TermQuery) {
+         Term t = ((TermQuery)query).getTerm();
+-        TermDocs tdocs = null;
+-        try {
+-          tdocs = reader.termDocs(t);
+-          while (tdocs.next()) hc.collect(tdocs.doc(),0.0f);
+-        } finally {
+-          if (tdocs!=null) tdocs.close();
++        SolrIndexReader[] readers = reader.getLeafReaders();
++        int[] offsets = reader.getLeafOffsets();
++        int[] arr = new int[256];
++        int[] freq = new int[256];
++        for (int i=0; i<readers.length; i++) {
++          SolrIndexReader sir = readers[i];
++          int offset = offsets[i];
++          hc.setNextReader(sir, offset);
++          TermDocs tdocs = sir.termDocs(t);
++          for(;;) {
++            int num = tdocs.read(arr, freq);
++            if (num==0) break;
++            while (--num>=0) {
++              hc.collect(arr[num]);
++            }
++          }
++          tdocs.close();
+         }
+       } else {
+         super.search(query,null,hc);
+@@ -645,11 +656,20 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+ 
+     } else {
+       // FUTURE: if the filter is sorted by docid, could use skipTo (SkipQueryFilter)
+-      final DocSetHitCollector hc = new DocSetHitCollector(HASHSET_INVERSE_LOAD_FACTOR, HASHDOCSET_MAXSIZE, maxDoc());
++      final DocSetCollector hc = new DocSetCollector(HASHSET_INVERSE_LOAD_FACTOR, HASHDOCSET_MAXSIZE, maxDoc());
+       final DocSet filt = filter;
+-      super.search(query, null, new HitCollector() {
+-        public void collect(int doc, float score) {
+-          if (filt.exists(doc)) hc.collect(doc,score);
++      super.search(query, null, new Collector() {
++        int base = 0;
++        public void collect(int doc) {
++          doc += base;
++          if (filt.exists(doc)) hc.collect(doc);
++        }
++
++        public void setNextReader(IndexReader reader, int docBase) throws IOException {
++          this.base = docBase;  
++        }
++
++        public void setScorer(Scorer scorer) throws IOException {
+         }
+       }
+       );
+@@ -1112,7 +1132,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+     int[] ids;
+     float[] scores;
+     final DocSetHitCollector setHC = new DocSetHitCollector(HASHSET_INVERSE_LOAD_FACTOR, HASHDOCSET_MAXSIZE, maxDoc());
+-    final HitCollector hitCollector = ( cmd.getTimeAllowed() > 0 ) ? new TimeLimitedCollector( setHC, cmd.getTimeAllowed() ) : setHC;
++    final HitCollector collector = ( cmd.getTimeAllowed() > 0 ) ? new TimeLimitedCollector( setHC, cmd.getTimeAllowed() ) : setHC;
+ 
+     Query query = QueryUtils.makeQueryable(cmd.getQuery());
+ 
+@@ -1137,7 +1157,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+       try {
+         super.search(query, new HitCollector() {
+           public void collect(int doc, float score) {
+-            hitCollector.collect(doc,score);
++            collector.collect(doc,score);
+             if (filt!=null && !filt.exists(doc)) return;
+             numHits[0]++;
+             if (score > topscore[0]) topscore[0]=score;
+@@ -1168,7 +1188,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+         super.search(query, new HitCollector() {
+           private FieldDoc reusableFD;
+           public void collect(int doc, float score) {
+-            hitCollector.collect(doc,score);
++            collector.collect(doc,score);
+             if (filt!=null && !filt.exists(doc)) return;
+             numHits[0]++;
+             if (reusableFD == null)
+@@ -1212,7 +1232,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
+         super.search(query, new HitCollector() {
+           private ScoreDoc reusableSD;
+           public void collect(int doc, float score) {
+-            hitCollector.collect(doc,score);
++            collector.collect(doc,score);
+             if (filt!=null && !filt.exists(doc)) return;
+               // if docs are always delivered in order, we could use "score>minScore"
+               // but might BooleanScorer14 might still be used and deliver docs out-of-order?
+diff --git a/src/test/org/apache/solr/search/TestSearchPerf.java b/src/test/org/apache/solr/search/TestSearchPerf.java
+new file mode 100755
+index 0000000..1d24a32
+--- /dev/null
++++ b/src/test/org/apache/solr/search/TestSearchPerf.java
+@@ -0,0 +1,106 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.solr.search;
++
++import org.apache.lucene.index.Term;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.BooleanQuery;
++import org.apache.lucene.search.BooleanClause;
++import org.apache.solr.util.AbstractSolrTestCase;
++import org.apache.solr.request.SolrQueryRequest;
++
++import java.util.Random;
++
++/**
++ * @version $Id$
++ */
++public class TestSearchPerf extends AbstractSolrTestCase {
++
++  public String getSchemaFile() { return "schema11.xml"; }
++  public String getSolrConfigFile() { return "solrconfig.xml"; }
++
++  public void setUp() throws Exception {
++    super.setUp();
++  }
++  public void tearDown() throws Exception {
++    close();
++    super.tearDown();
++  }
++
++  String t(int tnum) {
++    return String.format("%08d", tnum);
++  }
++
++  Random r = new Random(0);
++  int nDocs;
++  void createIndex(int nDocs) {
++    this.nDocs = nDocs;
++    assertU(delQ("*:*"));
++    for (int i=0; i<nDocs; i++) {
++      assertU(adoc("id", Float.toString(i)
++              ,"foo1_s",t(0)
++              ,"foo2_s",t(r.nextInt(2))
++              ,"foo4_s",t(r.nextInt(3))
++      ));
++    }
++    // assertU(optimize()); // squeeze out any possible deleted docs
++    assertU(commit());
++  }
++
++  SolrQueryRequest req; // used to get a searcher
++  void close() {
++    if (req!=null) req.close();
++    req = null;
++  }
++
++  int doSetGen(int iter, Query q) throws Exception {
++    close();
++    req = lrf.makeRequest("q","*:*");
++
++    SolrIndexSearcher searcher = req.getSearcher();
++
++    long start = System.currentTimeMillis();
++
++    int ret = 0;
++    for (int i=0; i<iter; i++) {
++      DocSet set = searcher.getDocSetNC(q, null);
++      ret += set.size();
++    }
++
++    long end = System.currentTimeMillis();
++    System.out.println("ret="+ret+ " time="+(end-start)+" throughput="+iter*1000/(end-start));
++
++    return ret;
++  }
++
++  // prevent complaints by junit
++  public void testEmpty() {
++  }
++
++  public void XtestSetGenerationPerformance() throws Exception {
++    createIndex(49999);
++    doSetGen(10000, new TermQuery(new Term("foo1_s",t(0))) );
++
++    BooleanQuery bq = new BooleanQuery();
++    bq.add(new TermQuery(new Term("foo2_s",t(0))), BooleanClause.Occur.SHOULD);
++    bq.add(new TermQuery(new Term("foo2_s",t(1))), BooleanClause.Occur.SHOULD);
++    doSetGen(5000, bq); 
++  }
++
++}
+\ No newline at end of file
+

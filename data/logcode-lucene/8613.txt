@@ -1,0 +1,486 @@
+GitDiffStart: 6b1cbc2907afc245a9744f70596e3ec5cc5103b8 | Mon Jun 3 14:36:13 2013 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index fb478bc..d919829 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -172,6 +172,10 @@ New Features
+ * LUCENE-5022: Added FacetResult.mergeHierarchies to merge multiple
+   FacetResult of the same dimension into a single one with the reconstructed
+   hierarchy. (Shai Erera)
++
++* LUCENE-5026: Added PagedGrowableWriter, a new internal packed-ints structure
++  that grows the number of bits per value on demand, can store more than 2B
++  values and supports random write and read access. (Adrien Grand)
+   
+ Build
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/packed/AbstractBlockPackedWriter.java b/lucene/core/src/java/org/apache/lucene/util/packed/AbstractBlockPackedWriter.java
+index 6b16c86..67c8d4b 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/packed/AbstractBlockPackedWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/packed/AbstractBlockPackedWriter.java
+@@ -17,6 +17,8 @@ package org.apache.lucene.util.packed;
+  * limitations under the License.
+  */
+ 
++import static org.apache.lucene.util.packed.PackedInts.checkBlockSize;
++
+ import java.io.IOException;
+ import java.util.Arrays;
+ 
+@@ -24,22 +26,11 @@ import org.apache.lucene.store.DataOutput;
+ 
+ abstract class AbstractBlockPackedWriter {
+ 
++  static final int MIN_BLOCK_SIZE = 64;
+   static final int MAX_BLOCK_SIZE = 1 << (30 - 3);
+   static final int MIN_VALUE_EQUALS_0 = 1 << 0;
+   static final int BPV_SHIFT = 1;
+ 
+-  static void checkBlockSize(int blockSize) {
+-    if (blockSize <= 0 || blockSize > MAX_BLOCK_SIZE) {
+-      throw new IllegalArgumentException("blockSize must be > 0 and < " + MAX_BLOCK_SIZE + ", got " + blockSize);
+-    }
+-    if (blockSize < 64) {
+-      throw new IllegalArgumentException("blockSize must be >= 64, got " + blockSize);
+-    }
+-    if ((blockSize & (blockSize - 1)) != 0) {
+-      throw new IllegalArgumentException("blockSize must be a power of two, got " + blockSize);
+-    }
+-  }
+-
+   static long zigZagEncode(long n) {
+     return (n >> 63) ^ (n << 1);
+   }
+@@ -66,7 +57,7 @@ abstract class AbstractBlockPackedWriter {
+    * @param blockSize the number of values of a single block, must be a multiple of <tt>64</tt>
+    */
+   public AbstractBlockPackedWriter(DataOutput out, int blockSize) {
+-    checkBlockSize(blockSize);
++    checkBlockSize(blockSize, MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+     reset(out);
+     values = new long[blockSize];
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReader.java b/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReader.java
+index a33da95..ff35ec1 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReader.java
++++ b/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReader.java
+@@ -17,11 +17,14 @@ package org.apache.lucene.util.packed;
+  * limitations under the License.
+  */
+ 
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.BPV_SHIFT;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MAX_BLOCK_SIZE;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MIN_BLOCK_SIZE;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MIN_VALUE_EQUALS_0;
+ import static org.apache.lucene.util.packed.BlockPackedReaderIterator.readVLong;
+ import static org.apache.lucene.util.packed.BlockPackedReaderIterator.zigZagDecode;
+-import static org.apache.lucene.util.packed.BlockPackedWriter.BPV_SHIFT;
+-import static org.apache.lucene.util.packed.BlockPackedWriter.MIN_VALUE_EQUALS_0;
+-import static org.apache.lucene.util.packed.BlockPackedWriter.checkBlockSize;
++import static org.apache.lucene.util.packed.PackedInts.checkBlockSize;
++import static org.apache.lucene.util.packed.PackedInts.numBlocks;
+ 
+ import java.io.IOException;
+ 
+@@ -40,14 +43,10 @@ public final class BlockPackedReader {
+ 
+   /** Sole constructor. */
+   public BlockPackedReader(IndexInput in, int packedIntsVersion, int blockSize, long valueCount, boolean direct) throws IOException {
+-    checkBlockSize(blockSize);
+     this.valueCount = valueCount;
+-    blockShift = Integer.numberOfTrailingZeros(blockSize);
++    blockShift = checkBlockSize(blockSize, MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+     blockMask = blockSize - 1;
+-    final int numBlocks = (int) (valueCount / blockSize) + (valueCount % blockSize == 0 ? 0 : 1);
+-    if ((long) numBlocks * blockSize < valueCount) {
+-      throw new IllegalArgumentException("valueCount is too large for this block size");
+-    }
++    final int numBlocks = numBlocks(valueCount, blockSize);
+     long[] minValues = null;
+     subReaders = new PackedInts.Reader[numBlocks];
+     for (int i = 0; i < numBlocks; ++i) {
+diff --git a/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReaderIterator.java b/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReaderIterator.java
+index 288518d..7d8bbd3 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReaderIterator.java
++++ b/lucene/core/src/java/org/apache/lucene/util/packed/BlockPackedReaderIterator.java
+@@ -17,9 +17,13 @@ package org.apache.lucene.util.packed;
+  * limitations under the License.
+  */
+ 
+-import static org.apache.lucene.util.packed.BlockPackedWriter.BPV_SHIFT;
+-import static org.apache.lucene.util.packed.BlockPackedWriter.MIN_VALUE_EQUALS_0;
+-import static org.apache.lucene.util.packed.BlockPackedWriter.checkBlockSize;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.BPV_SHIFT;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MAX_BLOCK_SIZE;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MIN_BLOCK_SIZE;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MIN_VALUE_EQUALS_0;
++import static org.apache.lucene.util.packed.BlockPackedReaderIterator.readVLong;
++import static org.apache.lucene.util.packed.BlockPackedReaderIterator.zigZagDecode;
++import static org.apache.lucene.util.packed.PackedInts.checkBlockSize;
+ 
+ import java.io.EOFException;
+ import java.io.IOException;
+@@ -87,7 +91,7 @@ public final class BlockPackedReaderIterator {
+    *                  been used to write the stream
+    */
+   public BlockPackedReaderIterator(DataInput in, int packedIntsVersion, int blockSize, long valueCount) {
+-    checkBlockSize(blockSize);
++    checkBlockSize(blockSize, MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+     this.packedIntsVersion = packedIntsVersion;
+     this.blockSize = blockSize;
+     this.values = new long[blockSize];
+diff --git a/lucene/core/src/java/org/apache/lucene/util/packed/MonotonicBlockPackedReader.java b/lucene/core/src/java/org/apache/lucene/util/packed/MonotonicBlockPackedReader.java
+index 27b14dd..f7f6e44 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/packed/MonotonicBlockPackedReader.java
++++ b/lucene/core/src/java/org/apache/lucene/util/packed/MonotonicBlockPackedReader.java
+@@ -17,8 +17,11 @@ package org.apache.lucene.util.packed;
+  * limitations under the License.
+  */
+ 
+-import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.checkBlockSize;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MAX_BLOCK_SIZE;
++import static org.apache.lucene.util.packed.AbstractBlockPackedWriter.MIN_BLOCK_SIZE;
+ import static org.apache.lucene.util.packed.BlockPackedReaderIterator.zigZagDecode;
++import static org.apache.lucene.util.packed.PackedInts.checkBlockSize;
++import static org.apache.lucene.util.packed.PackedInts.numBlocks;
+ 
+ import java.io.IOException;
+ 
+@@ -39,14 +42,10 @@ public final class MonotonicBlockPackedReader {
+ 
+   /** Sole constructor. */
+   public MonotonicBlockPackedReader(IndexInput in, int packedIntsVersion, int blockSize, long valueCount, boolean direct) throws IOException {
+-    checkBlockSize(blockSize);
+     this.valueCount = valueCount;
+-    blockShift = Integer.numberOfTrailingZeros(blockSize);
++    blockShift = checkBlockSize(blockSize, MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+     blockMask = blockSize - 1;
+-    final int numBlocks = (int) (valueCount / blockSize) + (valueCount % blockSize == 0 ? 0 : 1);
+-    if ((long) numBlocks * blockSize < valueCount) {
+-      throw new IllegalArgumentException("valueCount is too large for this block size");
+-    }
++    final int numBlocks = numBlocks(valueCount, blockSize);
+     minValues = new long[numBlocks];
+     averages = new float[numBlocks];
+     subReaders = new PackedInts.Reader[numBlocks];
+diff --git a/lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java b/lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java
+index b6db582..c7224cc 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java
++++ b/lucene/core/src/java/org/apache/lucene/util/packed/PackedInts.java
+@@ -1198,33 +1198,39 @@ public class PackedInts {
+       for (int i = 0; i < len; ++i) {
+         dest.set(destPos++, src.get(srcPos++));
+       }
+-    } else {
++    } else if (len > 0) {
+       // use bulk operations
+-      long[] buf = new long[Math.min(capacity, len)];
+-      int remaining = 0;
+-      while (len > 0) {
+-        final int read = src.get(srcPos, buf, remaining, Math.min(len, buf.length - remaining));
+-        assert read > 0;
+-        srcPos += read;
+-        len -= read;
+-        remaining += read;
+-        final int written = dest.set(destPos, buf, 0, remaining);
+-        assert written > 0;
+-        destPos += written;
+-        if (written < remaining) {
+-          System.arraycopy(buf, written, buf, 0, remaining - written);
+-        }
+-        remaining -= written;
+-      }
+-      while (remaining > 0) {
+-        final int written = dest.set(destPos, buf, 0, remaining);
+-        destPos += written;
+-        remaining -= written;
+-        System.arraycopy(buf, written, buf, 0, remaining);
++      final long[] buf = new long[Math.min(capacity, len)];
++      copy(src, srcPos, dest, destPos, len, buf);
++    }
++  }
++
++  /** Same as {@link #copy(Reader, int, Mutable, int, int, int)} but using a pre-allocated buffer. */
++  static void copy(Reader src, int srcPos, Mutable dest, int destPos, int len, long[] buf) {
++    assert buf.length > 0;
++    int remaining = 0;
++    while (len > 0) {
++      final int read = src.get(srcPos, buf, remaining, Math.min(len, buf.length - remaining));
++      assert read > 0;
++      srcPos += read;
++      len -= read;
++      remaining += read;
++      final int written = dest.set(destPos, buf, 0, remaining);
++      assert written > 0;
++      destPos += written;
++      if (written < remaining) {
++        System.arraycopy(buf, written, buf, 0, remaining - written);
+       }
++      remaining -= written;
++    }
++    while (remaining > 0) {
++      final int written = dest.set(destPos, buf, 0, remaining);
++      destPos += written;
++      remaining -= written;
++      System.arraycopy(buf, written, buf, 0, remaining);
+     }
+   }
+-  
++
+   /**
+    * Expert: reads only the metadata from a stream. This is useful to later
+    * restore a stream or open a direct reader via 
+@@ -1261,4 +1267,26 @@ public class PackedInts {
+     }    
+   }
+ 
+-}
+\ No newline at end of file
++  /** Check that the block size is a power of 2, in the right bounds, and return
++   *  its log in base 2. */
++  static int checkBlockSize(int blockSize, int minBlockSize, int maxBlockSize) {
++    if (blockSize < minBlockSize || blockSize > maxBlockSize) {
++      throw new IllegalArgumentException("blockSize must be >= " + minBlockSize + " and <= " + maxBlockSize + ", got " + blockSize);
++    }
++    if ((blockSize & (blockSize - 1)) != 0) {
++      throw new IllegalArgumentException("blockSize must be a power of two, got " + blockSize);
++    }
++    return Integer.numberOfTrailingZeros(blockSize);
++  }
++
++  /** Return the number of blocks required to store <code>size</code> values on
++   *  <code>blockSize</code>. */
++  static int numBlocks(long size, int blockSize) {
++    final int numBlocks = (int) (size / blockSize) + (size % blockSize == 0 ? 0 : 1);
++    if ((long) numBlocks * blockSize < size) {
++      throw new IllegalArgumentException("size is too large for this block size");
++    }
++    return numBlocks;
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/packed/PagedGrowableWriter.java b/lucene/core/src/java/org/apache/lucene/util/packed/PagedGrowableWriter.java
+new file mode 100644
+index 0000000..b4bcbe7
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/packed/PagedGrowableWriter.java
+@@ -0,0 +1,136 @@
++package org.apache.lucene.util.packed;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import static org.apache.lucene.util.packed.PackedInts.checkBlockSize;
++import static org.apache.lucene.util.packed.PackedInts.numBlocks;
++
++/**
++ * A {@link PagedGrowableWriter}. This class slices data into fixed-size blocks
++ * which have independent numbers of bits per value and grow on-demand.
++ * <p>You should use this class instead of {@link AppendingLongBuffer} only when
++ * you need random write-access. Otherwise this class will likely be slower and
++ * less memory-efficient.
++ * @lucene.internal
++ */
++public final class PagedGrowableWriter {
++
++  static final int MIN_BLOCK_SIZE = 1 << 6;
++  static final int MAX_BLOCK_SIZE = 1 << 30;
++
++  final long size;
++  final int pageShift;
++  final int pageMask;
++  final GrowableWriter[] subWriters;
++  final int startBitsPerValue;
++  final float acceptableOverheadRatio;
++
++  /**
++   * Create a new {@link PagedGrowableWriter} instance.
++   *
++   * @param size the number of values to store.
++   * @param pageSize the number of values per page
++   * @param startBitsPerValue the initial number of bits per value
++   * @param acceptableOverheadRatio an acceptable overhead ratio
++   */
++  public PagedGrowableWriter(long size, int pageSize,
++      int startBitsPerValue, float acceptableOverheadRatio) {
++    this(size, pageSize, startBitsPerValue, acceptableOverheadRatio, true);
++  }
++
++  PagedGrowableWriter(long size, int pageSize,int startBitsPerValue, float acceptableOverheadRatio, boolean fillPages) {
++    this.size = size;
++    this.startBitsPerValue = startBitsPerValue;
++    this.acceptableOverheadRatio = acceptableOverheadRatio;
++    pageShift = checkBlockSize(pageSize, MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
++    pageMask = pageSize - 1;
++    final int numPages = numBlocks(size, pageSize);
++    subWriters = new GrowableWriter[numPages];
++    if (fillPages) {
++      for (int i = 0; i < numPages; ++i) {
++        // do not allocate for more entries than necessary on the last page
++        final int valueCount = i == numPages - 1 ? lastPageSize(size) : pageSize;
++        subWriters[i] = new GrowableWriter(startBitsPerValue, valueCount, acceptableOverheadRatio);
++      }
++    }
++  }
++
++  private int lastPageSize(long size) {
++    final int sz = indexInPage(size);
++    return sz == 0 ? pageSize() : sz;
++  }
++
++  private int pageSize() {
++    return pageMask + 1;
++  }
++
++  /** The number of values. */
++  public long size() {
++    return size;
++  }
++
++  int pageIndex(long index) {
++    return (int) (index >>> pageShift);
++  }
++
++  int indexInPage(long index) {
++    return (int) index & pageMask;
++  }
++
++  /** Get value at <code>index</code>. */
++  public long get(long index) {
++    assert index >= 0 && index < size;
++    final int pageIndex = pageIndex(index);
++    final int indexInPage = indexInPage(index);
++    return subWriters[pageIndex].get(indexInPage);
++  }
++
++  /** Set value at <code>index</code>. */
++  public void set(long index, long value) {
++    assert index >= 0 && index < size;
++    final int pageIndex = pageIndex(index);
++    final int indexInPage = indexInPage(index);
++    subWriters[pageIndex].set(indexInPage, value);
++  }
++
++  /** Create a new {@link PagedGrowableWriter} of size <code>newSize</code>
++   *  based on the content of this buffer. This method is much more efficient
++   *  than creating a new {@link PagedGrowableWriter} and copying values one by
++   *  one. */
++  public PagedGrowableWriter resize(long newSize) {
++    final PagedGrowableWriter newWriter = new PagedGrowableWriter(newSize, pageSize(), startBitsPerValue, acceptableOverheadRatio, false);
++    final int numCommonPages = Math.min(newWriter.subWriters.length, subWriters.length);
++    final long[] copyBuffer = new long[1024];
++    for (int i = 0; i < newWriter.subWriters.length; ++i) {
++      final int valueCount = i == newWriter.subWriters.length - 1 ? lastPageSize(newSize) : pageSize();
++      final int bpv = i < numCommonPages ? subWriters[i].getBitsPerValue() : startBitsPerValue;
++      newWriter.subWriters[i] = new GrowableWriter(bpv, valueCount, acceptableOverheadRatio);
++      if (i < numCommonPages) {
++        final int copyLength = Math.min(valueCount, subWriters[i].size());
++        PackedInts.copy(subWriters[i], 0, newWriter.subWriters[i].getMutable(), 0, copyLength, copyBuffer);
++      }
++    }
++    return newWriter;
++  }
++
++  @Override
++  public String toString() {
++    return getClass().getSimpleName() + "(size=" + size() + ",pageSize=" + pageSize() + ")";
++  }
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/packed/package.html b/lucene/core/src/java/org/apache/lucene/util/packed/package.html
+index 1696033..50470dd 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/packed/package.html
++++ b/lucene/core/src/java/org/apache/lucene/util/packed/package.html
+@@ -47,6 +47,11 @@
+         <li>Same as PackedInts.Mutable but grows the number of bits per values when needed.</li>
+         <li>Useful to build a PackedInts.Mutable from a read-once stream of longs.</li>
+     </ul></li>
++    <li><b>{@link org.apache.lucene.util.packed.PagedGrowableWriter}</b><ul>
++        <li>Slices data into fixed-size blocks stored in GrowableWriters.</li>
++        <li>Supports more than 2B values.</li>
++        <li>You should use AppendingLongBuffer instead if you don't need random write access.</li>
++    </ul></li>
+     <li><b>{@link org.apache.lucene.util.packed.AppendingLongBuffer}</b><ul>
+         <li>Can store any sequence of longs.</li>
+         <li>Compression is good when values are close to each other.</li>
+diff --git a/lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java b/lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java
+index 10e7b01..b156a60 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java
++++ b/lucene/core/src/test/org/apache/lucene/util/packed/TestPackedInts.java
+@@ -659,6 +659,61 @@ public class TestPackedInts extends LuceneTestCase {
+     assertEquals(1 << 10, wrt.get(valueCount - 1));
+   }
+ 
++  public void testPagedGrowableWriter() {
++    int pageSize = 1 << (_TestUtil.nextInt(random(), 6, 30));
++    // supports 0 values?
++    PagedGrowableWriter writer = new PagedGrowableWriter(0, pageSize, _TestUtil.nextInt(random(), 1, 64), random().nextFloat());
++    assertEquals(0, writer.size());
++
++    // compare against AppendingLongBuffer
++    AppendingLongBuffer buf = new AppendingLongBuffer();
++    int size = random().nextInt(1000000);
++    long max = 5;
++    for (int i = 0; i < size; ++i) {
++      buf.add(_TestUtil.nextLong(random(), 0, max));
++      if (rarely()) {
++        max = PackedInts.maxValue(rarely() ? _TestUtil.nextInt(random(), 0, 63) : _TestUtil.nextInt(random(), 0, 31));
++      }
++    }
++    writer = new PagedGrowableWriter(size, pageSize, _TestUtil.nextInt(random(), 1, 64), random().nextFloat());
++    assertEquals(size, writer.size());
++    for (int i = size - 1; i >= 0; --i) {
++      writer.set(i, buf.get(i));
++    }
++    for (int i = 0; i < size; ++i) {
++      assertEquals(buf.get(i), writer.get(i));
++    }
++
++    // test copy
++    PagedGrowableWriter copy = writer.resize(_TestUtil.nextLong(random(), writer.size() / 2, writer.size() * 3 / 2));
++    for (long i = 0; i < copy.size(); ++i) {
++      if (i < writer.size()) {
++        assertEquals(writer.get(i), copy.get(i));
++      } else {
++        assertEquals(0, copy.get(i));
++      }
++    }
++  }
++
++  // memory hole
++  @Ignore
++  public void testPagedGrowableWriterOverflow() {
++    final long size = _TestUtil.nextLong(random(), 2 * (long) Integer.MAX_VALUE, 3 * (long) Integer.MAX_VALUE);
++    final int pageSize = 1 << (_TestUtil.nextInt(random(), 16, 30));
++    final PagedGrowableWriter writer = new PagedGrowableWriter(size, pageSize, 1, random().nextFloat());
++    final long index = _TestUtil.nextLong(random(), (long) Integer.MAX_VALUE, size - 1);
++    writer.set(index, 2);
++    assertEquals(2, writer.get(index));
++    for (int i = 0; i < 1000000; ++i) {
++      final long idx = _TestUtil.nextLong(random(), 0, size);
++      if (idx == index) {
++        assertEquals(2, writer.get(idx));
++      } else {
++        assertEquals(0, writer.get(idx));
++      }
++    }
++  }
++
+   public void testSave() throws IOException {
+     final int valueCount = _TestUtil.nextInt(random(), 1, 2048);
+     for (int bpv = 1; bpv <= 64; ++bpv) {
+

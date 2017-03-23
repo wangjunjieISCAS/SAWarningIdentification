@@ -1,0 +1,2080 @@
+GitDiffStart: 7a189a3aca620649bd719d214d471ebb8845fa6b | Fri Aug 29 21:14:15 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 163dda1..8b89d66 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -117,6 +117,16 @@ Bug Fixes
+   folder via security manager, and make test temp dirs absolute.
+   (Ryan Ernst, Dawid Weiss)
+ 
++* LUCENE-5904: Fixed a corruption case that can happen when 1)
++  IndexWriter is uncleanly shut-down (OS crash, power loss, etc.), 2)
++  on startup, when a new IndexWriter is created, a virus checker is
++  holding some of the previously written but unused files open and
++  preventing deletion, 3) IndexWriter writes these files again during
++  the course of indexing, then the files can later be deleted, causing
++  corruption.  This case was detected by adding evilness to
++  MockDirectoryWrapper to have it simulate a virus checker holding a
++  file open and preventing deletion (Robert Muir, Mike McCandless)
++
+ ======================= Lucene 4.10.0 ======================
+ 
+ New Features
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/simpletext/SimpleTextSegmentInfoWriter.java b/lucene/codecs/src/java/org/apache/lucene/codecs/simpletext/SimpleTextSegmentInfoWriter.java
+index 3b17c05..9daf4cb 100644
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/simpletext/SimpleTextSegmentInfoWriter.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/simpletext/SimpleTextSegmentInfoWriter.java
+@@ -115,10 +115,7 @@ public class SimpleTextSegmentInfoWriter extends SegmentInfoWriter {
+     } finally {
+       if (!success) {
+         IOUtils.closeWhileHandlingException(output);
+-        try {
+-          dir.deleteFile(segFileName);
+-        } catch (Throwable t) {
+-        }
++        IOUtils.deleteFilesIgnoringExceptions(dir, segFileName);
+       } else {
+         output.close();
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40SegmentInfoWriter.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40SegmentInfoWriter.java
+index b5f182c..61bb7ad 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40SegmentInfoWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene40/Lucene40SegmentInfoWriter.java
+@@ -67,7 +67,8 @@ public class Lucene40SegmentInfoWriter extends SegmentInfoWriter {
+     } finally {
+       if (!success) {
+         IOUtils.closeWhileHandlingException(output);
+-        si.dir.deleteFile(fileName);
++        // TODO: why must we do this? do we not get tracking dir wrapper?
++        IOUtils.deleteFilesIgnoringExceptions(si.dir, fileName);
+       } else {
+         output.close();
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene46/Lucene46SegmentInfoWriter.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene46/Lucene46SegmentInfoWriter.java
+index b56feb5..8d11859 100755
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene46/Lucene46SegmentInfoWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene46/Lucene46SegmentInfoWriter.java
+@@ -65,7 +65,8 @@ public class Lucene46SegmentInfoWriter extends SegmentInfoWriter {
+     } finally {
+       if (!success) {
+         IOUtils.closeWhileHandlingException(output);
+-        si.dir.deleteFile(fileName);
++        // TODO: are we doing this outside of the tracking wrapper? why must SIWriter cleanup like this?
++        IOUtils.deleteFilesIgnoringExceptions(si.dir, fileName);
+       } else {
+         output.close();
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java b/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java
+index 611d4f7..3d94454 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexFileDeleter.java
+@@ -150,7 +150,7 @@ final class IndexFileDeleter implements Closeable {
+       // it means the directory is empty, so ignore it.
+       files = new String[0];
+     }
+-    
++
+     if (currentSegmentsFile != null) {
+       Matcher m = IndexFileNames.CODEC_FILE_PATTERN.matcher("");
+       for (String fileName : files) {
+@@ -236,6 +236,9 @@ final class IndexFileDeleter implements Closeable {
+     // We keep commits list in sorted order (oldest to newest):
+     CollectionUtil.timSort(commits);
+ 
++    // refCounts only includes "normal" filenames (does not include segments.gen, write.lock)
++    inflateGens(segmentInfos, refCounts.keySet(), infoStream);
++
+     // Now delete anything with ref count at 0.  These are
+     // presumably abandoned files eg due to crash of
+     // IndexWriter.
+@@ -263,6 +266,83 @@ final class IndexFileDeleter implements Closeable {
+     deleteCommits();
+   }
+ 
++  /** Set all gens beyond what we currently see in the directory, to avoid double-write in cases where the previous IndexWriter did not
++   *  gracefully close/rollback (e.g. os/machine crashed or lost power). */
++  static void inflateGens(SegmentInfos infos, Collection<String> files, InfoStream infoStream) {
++
++    long maxSegmentGen = Long.MIN_VALUE;
++    int maxSegmentName = Integer.MIN_VALUE;
++
++    // Confusingly, this is the union of liveDocs, field infos, doc values
++    // (and maybe others, in the future) gens.  This is somewhat messy,
++    // since it means DV updates will suddenly write to the next gen after
++    // live docs' gen, for example, but we don't have the APIs to ask the
++    // codec which file is which:
++    Map<String,Long> maxPerSegmentGen = new HashMap<>();
++
++    for(String fileName : files) {
++      if (fileName.equals(IndexFileNames.SEGMENTS_GEN) || fileName.equals(IndexWriter.WRITE_LOCK_NAME)) {
++        // do nothing
++      } else if (fileName.startsWith(IndexFileNames.SEGMENTS)) {
++        try {
++          maxSegmentGen = Math.max(SegmentInfos.generationFromSegmentsFileName(fileName), maxSegmentGen);
++        } catch (NumberFormatException ignore) {
++          // trash file: we have to handle this since we allow anything starting with 'segments' here
++        }
++      } else {
++        String segmentName = IndexFileNames.parseSegmentName(fileName);
++        assert segmentName.startsWith("_"): "wtf? file=" + fileName;
++
++        maxSegmentName = Math.max(maxSegmentName, Integer.parseInt(segmentName.substring(1), Character.MAX_RADIX));
++
++        Long curGen = maxPerSegmentGen.get(segmentName);
++        if (curGen == null) {
++          curGen = 0L;
++        }
++
++        try {
++          curGen = Math.max(curGen, IndexFileNames.parseGeneration(fileName));
++        } catch (NumberFormatException ignore) {
++          // trash file: we have to handle this since codec regex is only so good
++        }
++        maxPerSegmentGen.put(segmentName, curGen);
++      }
++    }
++
++    // Generation is advanced before write:
++    infos.setGeneration(Math.max(infos.getGeneration(), maxSegmentGen));
++    if (infos.counter < 1+maxSegmentName) {
++      if (infoStream.isEnabled("IFD")) {
++        infoStream.message("IFD", "init: inflate infos.counter to " + (1+maxSegmentName) + " vs current=" + infos.counter);
++      }
++      infos.counter = 1+maxSegmentName;
++    }
++
++    for(SegmentCommitInfo info : infos) {
++      Long gen = maxPerSegmentGen.get(info.info.name);
++      assert gen != null;
++      long genLong = gen;
++      if (info.getNextWriteDelGen() < genLong+1) {
++        if (infoStream.isEnabled("IFD")) {
++          infoStream.message("IFD", "init: seg=" + info.info.name + " set nextWriteDelGen=" + (genLong+1) + " vs current=" + info.getNextWriteDelGen());
++        }
++        info.setNextWriteDelGen(genLong+1);
++      }
++      if (info.getNextWriteFieldInfosGen() < genLong+1) {
++        if (infoStream.isEnabled("IFD")) {
++          infoStream.message("IFD", "init: seg=" + info.info.name + " set nextWriteFieldInfosGen=" + (genLong+1) + " vs current=" + info.getNextWriteFieldInfosGen());
++        }
++        info.setNextWriteFieldInfosGen(genLong+1);
++      }
++      if (info.getNextWriteDocValuesGen() < genLong+1) {
++        if (infoStream.isEnabled("IFD")) {
++          infoStream.message("IFD", "init: seg=" + info.info.name + " set nextWriteDocValuesGen=" + (genLong+1) + " vs current=" + info.getNextWriteDocValuesGen());
++        }
++        info.setNextWriteDocValuesGen(genLong+1);
++      }
++    }
++  }
++
+   private void ensureOpen() throws AlreadyClosedException {
+     if (writer == null) {
+       throw new AlreadyClosedException("this IndexWriter is closed");
+@@ -411,10 +491,17 @@ final class IndexFileDeleter implements Closeable {
+       deletable = null;
+       int size = oldDeletable.size();
+       for(int i=0;i<size;i++) {
++        String fileName = oldDeletable.get(i);
+         if (infoStream.isEnabled("IFD")) {
+-          infoStream.message("IFD", "delete pending file " + oldDeletable.get(i));
++          infoStream.message("IFD", "delete pending file " + fileName);
++        }
++        RefCount rc = refCounts.get(fileName);
++        if (rc != null && rc.count > 0) {
++          // LUCENE-5904: should never happen!  This means we are about to pending-delete a referenced index file
++          assert false: "fileName=" + fileName + " is in pending delete list but also has refCount=" + rc.count;
++        } else {
++          deleteFile(fileName);
+         }
+-        deleteFile(oldDeletable.get(i));
+       }
+     }
+   }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/IndexFileNames.java b/lucene/core/src/java/org/apache/lucene/index/IndexFileNames.java
+index 5937e30..fe3cd66 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/IndexFileNames.java
++++ b/lucene/core/src/java/org/apache/lucene/index/IndexFileNames.java
+@@ -172,6 +172,23 @@ public final class IndexFileNames {
+     }
+     return filename;
+   }
++
++  /** Returns the generation from this file name, or 0 if there is no
++   *  generation. */
++  public static long parseGeneration(String filename) {
++    assert filename.startsWith("_");
++    String parts[] = stripExtension(filename).substring(1).split("_");
++    // 4 cases: 
++    // segment.ext
++    // segment_gen.ext
++    // segment_codec_suffix.ext
++    // segment_gen_codec_suffix.ext
++    if (parts.length == 2 || parts.length == 4) {
++      return Long.parseLong(parts[1], Character.MAX_RADIX);
++    } else {
++      return 0;
++    }
++  }
+   
+   /**
+    * Parses the segment name out of the given file name.
+diff --git a/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java b/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java
+index 6bc497b..0464852 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java
++++ b/lucene/core/src/java/org/apache/lucene/index/PersistentSnapshotDeletionPolicy.java
+@@ -192,11 +192,7 @@ public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy {
+     } finally {
+       if (!success) {
+         IOUtils.closeWhileHandlingException(out);
+-        try {
+-          dir.deleteFile(fileName);
+-        } catch (Exception e) {
+-          // Suppress so we keep throwing original exception
+-        }
++        IOUtils.deleteFilesIgnoringExceptions(dir, fileName);
+       } else {
+         IOUtils.close(out);
+       }
+@@ -206,11 +202,8 @@ public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy {
+     
+     if (nextWriteGen > 0) {
+       String lastSaveFile = SNAPSHOTS_PREFIX + (nextWriteGen-1);
+-      try {
+-        dir.deleteFile(lastSaveFile);
+-      } catch (IOException ioe) {
+-        // OK: likely it didn't exist
+-      }
++      // exception OK: likely it didn't exist
++      IOUtils.deleteFilesIgnoringExceptions(dir, lastSaveFile);
+     }
+ 
+     nextWriteGen++;
+@@ -287,7 +280,7 @@ public class PersistentSnapshotDeletionPolicy extends SnapshotDeletionPolicy {
+         String curFileName = SNAPSHOTS_PREFIX + genLoaded;
+         for(String file : snapshotFiles) {
+           if (!curFileName.equals(file)) {
+-            dir.deleteFile(file);
++            IOUtils.deleteFilesIgnoringExceptions(dir, file);
+           }
+         }
+       }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/ReadersAndUpdates.java b/lucene/core/src/java/org/apache/lucene/index/ReadersAndUpdates.java
+index 6386be2..5fb50a5 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/ReadersAndUpdates.java
++++ b/lucene/core/src/java/org/apache/lucene/index/ReadersAndUpdates.java
+@@ -39,6 +39,7 @@ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.TrackingDirectoryWrapper;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.MutableBits;
+ 
+ // Used by IndexWriter to hold open SegmentReaders (for
+@@ -278,11 +279,7 @@ class ReadersAndUpdates {
+         
+         // Delete any partially created file(s):
+         for (String fileName : trackingDir.getCreatedFiles()) {
+-          try {
+-            dir.deleteFile(fileName);
+-          } catch (Throwable t) {
+-            // Ignore so we throw only the first exc
+-          }
++          IOUtils.deleteFilesIgnoringExceptions(dir, fileName);
+         }
+       }
+     }
+@@ -534,11 +531,7 @@ class ReadersAndUpdates {
+         
+         // Delete any partially created file(s):
+         for (String fileName : trackingDir.getCreatedFiles()) {
+-          try {
+-            dir.deleteFile(fileName);
+-          } catch (Throwable t) {
+-            // Ignore so we throw only the first exc
+-          }
++          IOUtils.deleteFilesIgnoringExceptions(dir, fileName);
+         }
+       }
+     }
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SegmentCommitInfo.java b/lucene/core/src/java/org/apache/lucene/index/SegmentCommitInfo.java
+index 772eab4..c4972bd 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SegmentCommitInfo.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SegmentCommitInfo.java
+@@ -148,6 +148,16 @@ public class SegmentCommitInfo {
+     nextWriteDelGen++;
+   }
+   
++  /** Gets the nextWriteDelGen. */
++  long getNextWriteDelGen() {
++    return nextWriteDelGen;
++  }
++  
++  /** Sets the nextWriteDelGen. */
++  void setNextWriteDelGen(long v) {
++    nextWriteDelGen = v;
++  }
++  
+   /** Called when we succeed in writing a new FieldInfos generation. */
+   void advanceFieldInfosGen() {
+     fieldInfosGen = nextWriteFieldInfosGen;
+@@ -163,6 +173,16 @@ public class SegmentCommitInfo {
+     nextWriteFieldInfosGen++;
+   }
+   
++  /** Gets the nextWriteFieldInfosGen. */
++  long getNextWriteFieldInfosGen() {
++    return nextWriteFieldInfosGen;
++  }
++  
++  /** Sets the nextWriteFieldInfosGen. */
++  void setNextWriteFieldInfosGen(long v) {
++    nextWriteFieldInfosGen = v;
++  }
++
+   /** Called when we succeed in writing a new DocValues generation. */
+   void advanceDocValuesGen() {
+     docValuesGen = nextWriteDocValuesGen;
+@@ -178,6 +198,16 @@ public class SegmentCommitInfo {
+     nextWriteDocValuesGen++;
+   }
+ 
++  /** Gets the nextWriteDocValuesGen. */
++  long getNextWriteDocValuesGen() {
++    return nextWriteDocValuesGen;
++  }
++  
++  /** Sets the nextWriteDocValuesGen. */
++  void setNextWriteDocValuesGen(long v) {
++    nextWriteDocValuesGen = v;
++  }
++  
+   /** Returns total size in bytes of all files for this
+    *  segment. */
+   public long sizeInBytes() throws IOException {
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java b/lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java
+index 6365e27..13bc4d5 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java
+@@ -150,6 +150,7 @@ public final class SegmentInfos implements Cloneable, Iterable<SegmentCommitInfo
+   public static final int FORMAT_SEGMENTS_GEN_CURRENT = FORMAT_SEGMENTS_GEN_CHECKSUM;
+ 
+   /** Used to name new segments. */
++  // TODO: should this be a long ...?
+   public int counter;
+   
+   /** Counts how often the index has been changed.  */
+@@ -299,12 +300,7 @@ public final class SegmentInfos implements Cloneable, Iterable<SegmentCommitInfo
+     } catch (Throwable t) {
+       // It's OK if we fail to write this file since it's
+       // used only as one of the retry fallbacks.
+-      try {
+-        dir.deleteFile(IndexFileNames.SEGMENTS_GEN);
+-      } catch (Throwable t2) {
+-        // Ignore; this file is only used in a retry
+-        // fallback on init.
+-      }
++      IOUtils.deleteFilesIgnoringExceptions(dir, IndexFileNames.SEGMENTS_GEN);
+     }
+   }
+ 
+@@ -520,14 +516,9 @@ public final class SegmentInfos implements Cloneable, Iterable<SegmentCommitInfo
+         // We hit an exception above; try to close the file
+         // but suppress any exception:
+         IOUtils.closeWhileHandlingException(segnOutput);
+-
+-        try {
+-          // Try not to leave a truncated segments_N file in
+-          // the index:
+-          directory.deleteFile(segmentFileName);
+-        } catch (Throwable t) {
+-          // Suppress so we keep throwing the original exception
+-        }
++        // Try not to leave a truncated segments_N file in
++        // the index:
++        IOUtils.deleteFilesIgnoringExceptions(directory, segmentFileName);
+       }
+     }
+   }
+@@ -636,7 +627,7 @@ public final class SegmentInfos implements Cloneable, Iterable<SegmentCommitInfo
+    * commit finishing.
+    */
+   public abstract static class FindSegmentsFile {
+-    
++
+     final Directory directory;
+ 
+     /** Sole constructor. */ 
+@@ -808,6 +799,9 @@ public final class SegmentInfos implements Cloneable, Iterable<SegmentCommitInfo
+           return v;
+         } catch (IOException err) {
+ 
++          // TODO: we should use the new IO apis in Java7 to get better exceptions on why the open failed.  E.g. we don't want to fall back
++          // if the open failed for a "different" reason (too many open files, access denied) than "the commit was in progress"
++
+           // Save the original root cause:
+           if (exc == null) {
+             exc = err;
+@@ -873,6 +867,11 @@ public final class SegmentInfos implements Cloneable, Iterable<SegmentCommitInfo
+     generation = other.generation;
+   }
+ 
++  void setGeneration(long generation) {
++    this.generation = generation;
++    this.lastGeneration = generation;
++  }
++
+   final void rollbackCommit(Directory dir) {
+     if (pendingSegnOutput != null) {
+       // Suppress so we keep throwing the original exception
+@@ -978,11 +977,7 @@ public final class SegmentInfos implements Cloneable, Iterable<SegmentCommitInfo
+       success = true;
+     } finally {
+       if (!success) {
+-        try {
+-          dir.deleteFile(fileName);
+-        } catch (Throwable t) {
+-          // Suppress so we keep throwing the original exception
+-        }
++        IOUtils.deleteFilesIgnoringExceptions(dir, fileName);
+       }
+     }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/index/SegmentWriteState.java b/lucene/core/src/java/org/apache/lucene/index/SegmentWriteState.java
+index 5ae23f8..a6926b0 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/SegmentWriteState.java
++++ b/lucene/core/src/java/org/apache/lucene/index/SegmentWriteState.java
+@@ -65,7 +65,9 @@ public class SegmentWriteState {
+    *  each of the postings formats it wraps.  If you create
+    *  a new {@link PostingsFormat} then any files you
+    *  write/read must be derived using this suffix (use
+-   *  {@link IndexFileNames#segmentFileName(String,String,String)}). */
++   *  {@link IndexFileNames#segmentFileName(String,String,String)}).
++   *  
++   *  Note: the suffix must be either empty, or be a textual suffix contain exactly two parts (separated by underscore), or be a base36 generation. */
+   public final String segmentSuffix;
+   
+   /** {@link IOContext} for all writes; you should pass this
+@@ -91,6 +93,7 @@ public class SegmentWriteState {
+     this.directory = directory;
+     this.segmentInfo = segmentInfo;
+     this.fieldInfos = fieldInfos;
++    assert assertSegmentSuffix(segmentSuffix);
+     this.segmentSuffix = segmentSuffix;
+     this.context = context;
+   }
+@@ -107,4 +110,23 @@ public class SegmentWriteState {
+     delCountOnFlush = state.delCountOnFlush;
+     liveDocs = state.liveDocs;
+   }
++  
++  // currently only used by assert? clean up and make real check?
++  // either its a segment suffix (_X_Y) or its a parseable generation
++  // TODO: this is very confusing how ReadersAndUpdates passes generations via
++  // this mechanism, maybe add 'generation' explicitly to ctor create the 'actual suffix' here?
++  private boolean assertSegmentSuffix(String segmentSuffix) {
++    assert segmentSuffix != null;
++    if (!segmentSuffix.isEmpty()) {
++      int numParts = segmentSuffix.split("_").length;
++      if (numParts == 2) {
++        return true;
++      } else if (numParts == 1) {
++        Long.parseLong(segmentSuffix, Character.MAX_RADIX);
++        return true;
++      }
++      return false; // invalid
++    }
++    return true;
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/CompoundFileWriter.java b/lucene/core/src/java/org/apache/lucene/store/CompoundFileWriter.java
+index b9f1642..f556871 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/CompoundFileWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/store/CompoundFileWriter.java
+@@ -197,7 +197,8 @@ final class CompoundFileWriter implements Closeable{
+       if (success) {
+         IOUtils.close(is);
+         // copy successful - delete file
+-        fileEntry.dir.deleteFile(fileEntry.file);
++        // if we can't we rely on IFD to pick up and retry
++        IOUtils.deleteFilesIgnoringExceptions(fileEntry.dir, fileEntry.file);
+       } else {
+         IOUtils.closeWhileHandlingException(is);
+       }
+diff --git a/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java b/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java
+index fccc78a..9b1ee8c 100644
+--- a/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java
++++ b/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java
+@@ -30,6 +30,7 @@ import org.apache.lucene.index.BaseStoredFieldsFormatTestCase;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.junit.Test;
+ 
+ import com.carrotsearch.randomizedtesting.annotations.Repeat;
+@@ -46,6 +47,10 @@ public class TestCompressingStoredFieldsFormat extends BaseStoredFieldsFormatTes
+   @Test(expected=IllegalArgumentException.class)
+   public void testDeletePartiallyWrittenFilesIfAbort() throws IOException {
+     Directory dir = newDirectory();
++    // test explicitly needs files to always be actually deleted
++    if (dir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriterConfig iwConf = newIndexWriterConfig(new MockAnalyzer(random()));
+     iwConf.setMaxBufferedDocs(RandomInts.randomIntBetween(random(), 2, 30));
+     iwConf.setCodec(CompressingCodec.randomInstance(random()));
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java b/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java
+index ad4a461..f7aa566 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestAddIndexes.java
+@@ -1104,7 +1104,8 @@ public class TestAddIndexes extends LuceneTestCase {
+     
+     IndexReader[] readers = new IndexReader[] { DirectoryReader.open(dirs[0]), DirectoryReader.open(dirs[1]) };
+     
+-    Directory dir = new MockDirectoryWrapper(random(), new RAMDirectory());
++    MockDirectoryWrapper dir = new MockDirectoryWrapper(random(), new RAMDirectory());
++    dir.setEnableVirusScanner(false); // we check for specific list of files
+     IndexWriterConfig conf = new IndexWriterConfig(new MockAnalyzer(random())).setMergePolicy(newLogMergePolicy(true));
+     MergePolicy lmp = conf.getMergePolicy();
+     // Force creation of CFS:
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveChecksumFooter.java b/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveChecksumFooter.java
+index 893ec89..8c2ecf6 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveChecksumFooter.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveChecksumFooter.java
+@@ -28,6 +28,7 @@ import org.apache.lucene.document.NumericDocValuesField;
+ import org.apache.lucene.store.CompoundFileDirectory;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+@@ -38,6 +39,10 @@ import org.apache.lucene.util.TestUtil;
+ public class TestAllFilesHaveChecksumFooter extends LuceneTestCase {
+   public void test() throws Exception {
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // Else we might remove .cfe but not the corresponding .cfs, causing false exc when trying to verify headers:
++      ((MockDirectoryWrapper) dir).setEnableVirusScanner(false);
++    }
+     IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()));
+     conf.setCodec(new Lucene410Codec());
+     RandomIndexWriter riw = new RandomIndexWriter(random(), dir, conf);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveCodecHeader.java b/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveCodecHeader.java
+index 9b94498..10d35ab 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveCodecHeader.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestAllFilesHaveCodecHeader.java
+@@ -28,6 +28,7 @@ import org.apache.lucene.document.NumericDocValuesField;
+ import org.apache.lucene.store.CompoundFileDirectory;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+@@ -38,6 +39,12 @@ import org.apache.lucene.util.TestUtil;
+ public class TestAllFilesHaveCodecHeader extends LuceneTestCase {
+   public void test() throws Exception {
+     Directory dir = newDirectory();
++
++    if (dir instanceof MockDirectoryWrapper) {
++      // Else we might remove .cfe but not the corresponding .cfs, causing false exc when trying to verify headers:
++      ((MockDirectoryWrapper) dir).setEnableVirusScanner(false);
++    }
++
+     IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()));
+     conf.setCodec(new Lucene410Codec());
+     RandomIndexWriter riw = new RandomIndexWriter(random(), dir, conf);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java b/lucene/core/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java
+index e8b3537..ee9a19f 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java
+@@ -53,6 +53,7 @@ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.store.BaseDirectoryWrapper;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.FSDirectory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.store.NIOFSDirectory;
+ import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.store.SimpleFSDirectory;
+@@ -1003,6 +1004,11 @@ public class TestBackwardsCompatibility extends LuceneTestCase {
+         System.out.println("testUpgradeOldSingleSegmentIndexWithAdditions: index=" +name);
+       }
+       Directory dir = newDirectory(oldIndexDirs.get(name));
++      if (dir instanceof MockDirectoryWrapper) {
++        // we need to ensure we delete old commits for this test,
++        // otherwise IndexUpgrader gets angry
++        ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++      }
+ 
+       assertEquals("Original index must be single segment", 1, getNumberOfSegments(dir));
+ 
+@@ -1042,6 +1048,8 @@ public class TestBackwardsCompatibility extends LuceneTestCase {
+       // determine count of segments in modified index
+       final int origSegCount = getNumberOfSegments(dir);
+       
++      // ensure there is only one commit
++      assertEquals(1, DirectoryReader.listCommits(dir).size());
+       newIndexUpgrader(dir).upgrade();
+ 
+       final int segCount = checkAllSegmentsUpgraded(dir);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java b/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java
+index ac4ed29..7df11e1 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestBinaryDocValuesUpdates.java
+@@ -26,6 +26,7 @@ import org.apache.lucene.document.SortedDocValuesField;
+ import org.apache.lucene.document.SortedSetDocValuesField;
+ import org.apache.lucene.document.StringField;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.store.NRTCachingDirectory;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+@@ -1164,6 +1165,10 @@ public class TestBinaryDocValuesUpdates extends LuceneTestCase {
+ 
+   public void testDeleteUnusedUpdatesFiles() throws Exception {
+     Directory dir = newDirectory();
++    // test explicitly needs files to always be actually deleted
++    if (dir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()));
+     IndexWriter writer = new IndexWriter(dir, conf);
+     
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestCodecHoldsOpenFiles.java b/lucene/core/src/test/org/apache/lucene/index/TestCodecHoldsOpenFiles.java
+index 908d366..b5bd50d 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestCodecHoldsOpenFiles.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestCodecHoldsOpenFiles.java
+@@ -21,13 +21,16 @@ import java.io.IOException;
+ 
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.TextField;
++import org.apache.lucene.store.BaseDirectoryWrapper;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+ 
+ public class TestCodecHoldsOpenFiles extends LuceneTestCase {
+   public void test() throws Exception {
+-    Directory d = newDirectory();
++    BaseDirectoryWrapper d = newDirectory();
++    d.setCheckIndexOnClose(false);
++    // we nuke files, but verify the reader still works
+     RandomIndexWriter w = new RandomIndexWriter(random(), d);
+     int numDocs = atLeast(100);
+     for(int i=0;i<numDocs;i++) {
+@@ -37,11 +40,13 @@ public class TestCodecHoldsOpenFiles extends LuceneTestCase {
+     }
+ 
+     IndexReader r = w.getReader();
++    w.commit();
+     w.close();
+ 
+     for(String fileName : d.listAll()) {
+       try {
+         d.deleteFile(fileName);
++        // may succeed, e.g. if the file is completely read into RAM.
+       } catch (IOException ioe) {
+         // ignore: this means codec (correctly) is holding
+         // the file open
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestCompoundFile.java b/lucene/core/src/test/org/apache/lucene/index/TestCompoundFile.java
+index a7465ef..d07f271 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestCompoundFile.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestCompoundFile.java
+@@ -24,6 +24,7 @@ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.store.IndexOutput;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.store.SimpleFSDirectory;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.LuceneTestCase;
+@@ -709,6 +710,10 @@ public class TestCompoundFile extends LuceneTestCase
+   
+   public void testReadNestedCFP() throws IOException {
+     Directory newDir = newDirectory();
++    // manually manipulates directory
++    if (newDir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)newDir).setEnableVirusScanner(false);
++    }
+     CompoundFileDirectory csw = new CompoundFileDirectory(newDir, "d.cfs", newIOContext(random()), true);
+     CompoundFileDirectory nested = new CompoundFileDirectory(newDir, "b.cfs", newIOContext(random()), true);
+     IndexOutput out = nested.createOutput("b.xyz", newIOContext(random()));
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java b/lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java
+index 61173ac..f0883ca 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestConcurrentMergeScheduler.java
+@@ -177,6 +177,10 @@ public class TestConcurrentMergeScheduler extends LuceneTestCase {
+ 
+   public void testNoExtraFiles() throws IOException {
+     Directory directory = newDirectory();
++    if (directory instanceof MockDirectoryWrapper) {
++      // test uses IW unref'ed helper which is unaware of retries
++      ((MockDirectoryWrapper)directory).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(directory, newIndexWriterConfig(new MockAnalyzer(random()))
+                                                       .setMaxBufferedDocs(2));
+ 
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java b/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java
+index deffdf0..6d6c50b 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDeletionPolicy.java
+@@ -34,6 +34,7 @@ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.ScoreDoc;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+ 
+@@ -221,6 +222,10 @@ public class TestDeletionPolicy extends LuceneTestCase {
+     final double SECONDS = 2.0;
+ 
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // test manually deletes files
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()))
+         .setIndexDeletionPolicy(new ExpirationTimeDeletionPolicy(dir, SECONDS));
+     MergePolicy mp = conf.getMergePolicy();
+@@ -314,6 +319,10 @@ public class TestDeletionPolicy extends LuceneTestCase {
+       boolean useCompoundFile = (pass % 2) != 0;
+ 
+       Directory dir = newDirectory();
++      if (dir instanceof MockDirectoryWrapper) {
++        // test manually deletes files
++        ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++      }
+ 
+       IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()))
+           .setIndexDeletionPolicy(new KeepAllDeletionPolicy(dir))
+@@ -562,6 +571,10 @@ public class TestDeletionPolicy extends LuceneTestCase {
+       boolean useCompoundFile = (pass % 2) != 0;
+ 
+       Directory dir = newDirectory();
++      if (dir instanceof MockDirectoryWrapper) {
++        // test manually deletes files
++        ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++      }
+ 
+       KeepLastNDeletionPolicy policy = new KeepLastNDeletionPolicy(N);
+       for(int j=0;j<N+1;j++) {
+@@ -623,6 +636,10 @@ public class TestDeletionPolicy extends LuceneTestCase {
+       boolean useCompoundFile = (pass % 2) != 0;
+ 
+       Directory dir = newDirectory();
++      if (dir instanceof MockDirectoryWrapper) {
++        // test manually deletes files
++        ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++      }
+       IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()))
+           .setOpenMode(OpenMode.CREATE)
+           .setIndexDeletionPolicy(new KeepLastNDeletionPolicy(N))
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java b/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
+index aac961b..be23190 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDirectoryReaderReopen.java
+@@ -624,6 +624,10 @@ public class TestDirectoryReaderReopen extends LuceneTestCase {
+ 
+   public void testOverDecRefDuringReopen() throws Exception {
+     MockDirectoryWrapper dir = newMockDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // ensure we produce enough of our exceptions
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+ 
+     IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
+     iwc.setCodec(Codec.forName("Lucene410"));
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestDoc.java b/lucene/core/src/test/org/apache/lucene/index/TestDoc.java
+index 9dbb756..25da299 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestDoc.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestDoc.java
+@@ -119,6 +119,8 @@ public class TestDoc extends LuceneTestCase {
+         // We create unreferenced files (we don't even write
+         // a segments file):
+         ((MockDirectoryWrapper) directory).setAssertNoUnrefencedFilesOnClose(false);
++        // this test itself deletes files (has no retry mechanism)
++        ((MockDirectoryWrapper) directory).setEnableVirusScanner(false);
+       }
+ 
+       IndexWriter writer = new IndexWriter(
+@@ -161,6 +163,8 @@ public class TestDoc extends LuceneTestCase {
+         // We create unreferenced files (we don't even write
+         // a segments file):
+         ((MockDirectoryWrapper) directory).setAssertNoUnrefencedFilesOnClose(false);
++        // this test itself deletes files (has no retry mechanism)
++        ((MockDirectoryWrapper) directory).setEnableVirusScanner(false);
+       }
+ 
+       writer = new IndexWriter(
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexFileDeleter.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexFileDeleter.java
+index 73a05be..79d7730 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexFileDeleter.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexFileDeleter.java
+@@ -19,6 +19,7 @@ package org.apache.lucene.index;
+ 
+ import java.io.*;
+ import java.util.*;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.codecs.Codec;
+@@ -26,9 +27,11 @@ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
+ import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.IndexInput;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.MockDirectoryWrapper;
++import org.apache.lucene.util.InfoStream;
+ import org.apache.lucene.util.LuceneTestCase;
+ 
+ /*
+@@ -42,6 +45,8 @@ public class TestIndexFileDeleter extends LuceneTestCase {
+     Directory dir = newDirectory();
+     if (dir instanceof MockDirectoryWrapper) {
+       ((MockDirectoryWrapper)dir).setPreventDoubleWrite(false);
++      // ensure we actually delete files
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
+     }
+ 
+     MergePolicy mergePolicy = newLogMergePolicy(true, 10);
+@@ -203,4 +208,194 @@ public class TestIndexFileDeleter extends LuceneTestCase {
+     doc.add(newStringField("id", Integer.toString(id), Field.Store.NO));
+     writer.addDocument(doc);
+   }
++  
++  public void testVirusScannerDoesntCorruptIndex() throws IOException {
++    MockDirectoryWrapper dir = newMockDirectory();
++    dir.setPreventDoubleWrite(false); // we arent trying to test this
++    dir.setEnableVirusScanner(false); // we have our own to make test reproduce always
++    
++    // add empty commit
++    new IndexWriter(dir, new IndexWriterConfig(null)).close();
++    // add a trash unreferenced file
++    dir.createOutput("_0.si", IOContext.DEFAULT).close();
++
++    // start virus scanner
++    final AtomicBoolean stopScanning = new AtomicBoolean();
++    dir.failOn(new MockDirectoryWrapper.Failure() {
++      @Override
++      public void eval(MockDirectoryWrapper dir) throws IOException {
++        if (stopScanning.get()) {
++          return;
++        }
++        for (StackTraceElement f : new Exception().getStackTrace()) {
++          if ("deleteFile".equals(f.getMethodName())) {
++            throw new IOException("temporarily cannot delete file");
++          }
++        }
++      }
++    });
++    
++    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(null));
++    iw.addDocument(new Document());
++    // stop virus scanner
++    stopScanning.set(true);
++    iw.commit();
++    iw.close();
++    dir.close();
++  }
++  
++  public void testNoSegmentsDotGenInflation() throws IOException {
++    Directory dir = newMockDirectory();
++    
++    // empty commit
++    new IndexWriter(dir, new IndexWriterConfig(null)).close();   
++    
++    SegmentInfos sis = new SegmentInfos();
++    sis.read(dir);
++    assertEquals(1, sis.getGeneration());
++    
++    // no inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(1, sis.getGeneration());
++
++    dir.close();
++  }
++  
++  public void testSegmentsInflation() throws IOException {
++    MockDirectoryWrapper dir = newMockDirectory();
++    dir.setCheckIndexOnClose(false); // TODO: allow falling back more than one commit
++    
++    // empty commit
++    new IndexWriter(dir, new IndexWriterConfig(null)).close();   
++    
++    SegmentInfos sis = new SegmentInfos();
++    sis.read(dir);
++    assertEquals(1, sis.getGeneration());
++    
++    // add trash commit
++    dir.createOutput(IndexFileNames.SEGMENTS + "_2", IOContext.DEFAULT).close();
++    
++    // ensure inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(2, sis.getGeneration());
++    
++    // add another trash commit
++    dir.createOutput(IndexFileNames.SEGMENTS + "_4", IOContext.DEFAULT).close();
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(4, sis.getGeneration());
++
++    dir.close();
++  }
++  
++  public void testSegmentNameInflation() throws IOException {
++    MockDirectoryWrapper dir = newMockDirectory();
++    
++    // empty commit
++    new IndexWriter(dir, new IndexWriterConfig(null)).close();   
++    
++    SegmentInfos sis = new SegmentInfos();
++    sis.read(dir);
++    assertEquals(0, sis.counter);
++    
++    // no inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(0, sis.counter);
++    
++    // add trash per-segment file
++    dir.createOutput(IndexFileNames.segmentFileName("_0", "", "foo"), IOContext.DEFAULT).close();
++    
++    // ensure inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(1, sis.counter);
++    
++    // add trash per-segment file
++    dir.createOutput(IndexFileNames.segmentFileName("_3", "", "foo"), IOContext.DEFAULT).close();
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(4, sis.counter);
++    
++    // ensure we write _4 segment next
++    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(null));
++    iw.addDocument(new Document());
++    iw.commit();
++    iw.close();
++    sis = new SegmentInfos();
++    sis.read(dir);
++    assertEquals("_4", sis.info(0).info.name);
++    assertEquals(5, sis.counter);
++    
++    dir.close();
++  }
++  
++  public void testGenerationInflation() throws IOException {
++    MockDirectoryWrapper dir = newMockDirectory();
++    
++    // initial commit
++    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(null));
++    iw.addDocument(new Document());
++    iw.commit();
++    iw.close();   
++    
++    // no deletes: start at 1
++    SegmentInfos sis = new SegmentInfos();
++    sis.read(dir);
++    assertEquals(1, sis.info(0).getNextDelGen());
++    
++    // no inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(1, sis.info(0).getNextDelGen());
++    
++    // add trash per-segment deletes file
++    dir.createOutput(IndexFileNames.fileNameFromGeneration("_0", "del", 2), IOContext.DEFAULT).close();
++    
++    // ensure inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(3, sis.info(0).getNextDelGen());
++    
++    dir.close();
++  }
++  
++  public void testTrashyFile() throws IOException {
++    MockDirectoryWrapper dir = newMockDirectory();
++    dir.setCheckIndexOnClose(false); // TODO: maybe handle such trash better elsewhere...
++    
++    // empty commit
++    new IndexWriter(dir, new IndexWriterConfig(null)).close();   
++    
++    SegmentInfos sis = new SegmentInfos();
++    sis.read(dir);
++    assertEquals(1, sis.getGeneration());
++    
++    // add trash file
++    dir.createOutput(IndexFileNames.SEGMENTS + "_", IOContext.DEFAULT).close();
++    
++    // no inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(1, sis.getGeneration());
++
++    dir.close();
++  }
++  
++  public void testTrashyGenFile() throws IOException {
++    MockDirectoryWrapper dir = newMockDirectory();
++    
++    // initial commit
++    IndexWriter iw = new IndexWriter(dir, new IndexWriterConfig(null));
++    iw.addDocument(new Document());
++    iw.commit();
++    iw.close();   
++    
++    // no deletes: start at 1
++    SegmentInfos sis = new SegmentInfos();
++    sis.read(dir);
++    assertEquals(1, sis.info(0).getNextDelGen());
++    
++    // add trash file
++    dir.createOutput("_1_A", IOContext.DEFAULT).close();
++    
++    // no inflation
++    IndexFileDeleter.inflateGens(sis, Arrays.asList(dir.listAll()), InfoStream.getDefault());
++    assertEquals(1, sis.info(0).getNextDelGen());
++
++    dir.close();
++  }
+ }
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
+index b840585..5d3ab90 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -168,7 +168,12 @@ public class TestIndexWriter extends LuceneTestCase {
+ 
+ 
+ 
++    // TODO: we have the logic in MDW to do this check, and its better, because it knows about files it tried
++    // to delete but couldn't: we should replace this!!!!
+     public static void assertNoUnreferencedFiles(Directory dir, String message) throws IOException {
++      if (dir instanceof MockDirectoryWrapper) {
++        assertFalse("test is broken: should disable virus scanner", ((MockDirectoryWrapper)dir).getEnableVirusScanner());
++      }
+       String[] startFiles = dir.listAll();
+       new IndexWriter(dir, new IndexWriterConfig(new MockAnalyzer(random()))).rollback();
+       String[] endFiles = dir.listAll();
+@@ -306,21 +311,31 @@ public class TestIndexWriter extends LuceneTestCase {
+               .setRAMBufferSizeMB(0.000001)
+               .setMergePolicy(newLogMergePolicy(10))
+       );
+-      int lastNumFile = dir.listAll().length;
++      int lastNumSegments = getSegmentCount(dir);
+       for(int j=0;j<9;j++) {
+         Document doc = new Document();
+         doc.add(newField("field", "aaa" + j, storedTextType));
+         writer.addDocument(doc);
+-        int numFile = dir.listAll().length;
+         // Verify that with a tiny RAM buffer we see new
+         // segment after every doc
+-        assertTrue(numFile > lastNumFile);
+-        lastNumFile = numFile;
++        int numSegments = getSegmentCount(dir);
++        assertTrue(numSegments > lastNumSegments);
++        lastNumSegments = numSegments;
+       }
+       writer.close();
+       dir.close();
+     }
+ 
++    /** Returns how many unique segment names are in the directory. */
++    private static int getSegmentCount(Directory dir) throws IOException {
++      Set<String> segments = new HashSet<>();
++      for(String file : dir.listAll()) {
++        segments.add(IndexFileNames.parseSegmentName(file));
++      }
++
++      return segments.size();
++    }
++
+     // Make sure it's OK to change RAM buffer size and
+     // maxBufferedDocs in a write session
+     public void testChangingRAMBuffer() throws IOException {
+@@ -1006,8 +1021,10 @@ public class TestIndexWriter extends LuceneTestCase {
+     final Directory adder;
+     final ByteArrayOutputStream bytesLog = new ByteArrayOutputStream();
+     final PrintStream log = new PrintStream(bytesLog, true, IOUtils.UTF_8);
+-    
+-    IndexerThreadInterrupt() throws IOException {
++    final int id;
++
++    IndexerThreadInterrupt(int id) throws IOException {
++      this.id = id;
+       this.random = new Random(random().nextLong());
+       // make a little directory for addIndexes
+       // LUCENE-2239: won't work with NIOFS/MMAP
+@@ -1149,7 +1166,7 @@ public class TestIndexWriter extends LuceneTestCase {
+           // on!!  This test doesn't repro easily so when
+           // Jenkins hits a fail we need to study where the
+           // interrupts struck!
+-          log.println("TEST: got interrupt");
++          log.println("TEST thread " + id + ": got interrupt");
+           re.printStackTrace(log);
+           Throwable e = re.getCause();
+           assertTrue(e instanceof InterruptedException);
+@@ -1157,7 +1174,7 @@ public class TestIndexWriter extends LuceneTestCase {
+             break;
+           }
+         } catch (Throwable t) {
+-          log.println("FAILED; unexpected exception");
++          log.println("thread " + id + " FAILED; unexpected exception");
+           t.printStackTrace(log);
+           failed = true;
+           break;
+@@ -1165,11 +1182,11 @@ public class TestIndexWriter extends LuceneTestCase {
+       }
+ 
+       if (VERBOSE) {
+-        log.println("TEST: now finish failed=" + failed);
++        log.println("TEST: thread " + id + ": now finish failed=" + failed);
+       }
+       if (!failed) {
+         if (VERBOSE) {
+-          log.println("TEST: now rollback");
++          log.println("TEST: thread " + id + ": now rollback");
+         }
+         // clear interrupt state:
+         Thread.interrupted();
+@@ -1185,7 +1202,7 @@ public class TestIndexWriter extends LuceneTestCase {
+           TestUtil.checkIndex(dir);
+         } catch (Exception e) {
+           failed = true;
+-          log.println("CheckIndex FAILED: unexpected exception");
++          log.println("thread " + id + ": CheckIndex FAILED: unexpected exception");
+           e.printStackTrace(log);
+         }
+         try {
+@@ -1194,25 +1211,27 @@ public class TestIndexWriter extends LuceneTestCase {
+           r.close();
+         } catch (Exception e) {
+           failed = true;
+-          log.println("DirectoryReader.open FAILED: unexpected exception");
++          log.println("thread " + id + ": DirectoryReader.open FAILED: unexpected exception");
+           e.printStackTrace(log);
+         }
+       }
+       try {
+         IOUtils.close(dir);
+       } catch (IOException e) {
+-        throw new RuntimeException(e);
++        failed = true;
++        throw new RuntimeException("thread " + id, e);
+       }
+       try {
+         IOUtils.close(adder);
+       } catch (IOException e) {
+-        throw new RuntimeException(e);
++        failed = true;
++        throw new RuntimeException("thread " + id, e);
+       }
+     }
+   }
+ 
+   public void testThreadInterruptDeadlock() throws Exception {
+-    IndexerThreadInterrupt t = new IndexerThreadInterrupt();
++    IndexerThreadInterrupt t = new IndexerThreadInterrupt(1);
+     t.setDaemon(true);
+     t.start();
+ 
+@@ -1246,11 +1265,11 @@ public class TestIndexWriter extends LuceneTestCase {
+   
+   /** testThreadInterruptDeadlock but with 2 indexer threads */
+   public void testTwoThreadsInterruptDeadlock() throws Exception {
+-    IndexerThreadInterrupt t1 = new IndexerThreadInterrupt();
++    IndexerThreadInterrupt t1 = new IndexerThreadInterrupt(1);
+     t1.setDaemon(true);
+     t1.start();
+     
+-    IndexerThreadInterrupt t2 = new IndexerThreadInterrupt();
++    IndexerThreadInterrupt t2 = new IndexerThreadInterrupt(2);
+     t2.setDaemon(true);
+     t2.start();
+ 
+@@ -1280,8 +1299,13 @@ public class TestIndexWriter extends LuceneTestCase {
+     t2.finish = true;
+     t1.join();
+     t2.join();
+-    assertFalse(t1.failed);
+-    assertFalse(t2.failed);
++    if (t1.failed) {
++      System.out.println("Thread1 failed:\n" + new String(t1.bytesLog.toString("UTF-8")));
++    }
++    if (t2.failed) {
++      System.out.println("Thread2 failed:\n" + new String(t2.bytesLog.toString("UTF-8")));
++    }
++    assertFalse(t1.failed || t2.failed);
+   }
+ 
+ 
+@@ -1379,7 +1403,8 @@ public class TestIndexWriter extends LuceneTestCase {
+ 
+   public void testDeleteUnusedFiles() throws Exception {
+     for(int iter=0;iter<2;iter++) {
+-      Directory dir = newMockDirectory(); // relies on windows semantics
++      MockDirectoryWrapper dir = newMockDirectory(); // relies on windows semantics
++      dir.setEnableVirusScanner(false); // but ensures files are actually deleted
+ 
+       MergePolicy mergePolicy = newLogMergePolicy(true);
+       
+@@ -1468,10 +1493,14 @@ public class TestIndexWriter extends LuceneTestCase {
+     }
+   }
+ 
+-  public void testDeleteUnsedFiles2() throws Exception {
++  public void testDeleteUnusedFiles2() throws Exception {
+     // Validates that iw.deleteUnusedFiles() also deletes unused index commits
+     // in case a deletion policy which holds onto commits is used.
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // otherwise the delete of old commit might not actually succeed temporarily.
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random()))
+                                                 .setIndexDeletionPolicy(new SnapshotDeletionPolicy(new KeepOnlyLastCommitDeletionPolicy())));
+     SnapshotDeletionPolicy sdp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+@@ -1524,6 +1553,9 @@ public class TestIndexWriter extends LuceneTestCase {
+     // indexed, flushed (but not committed) and then IW rolls back, then no
+     // files are left in the Directory.
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random()))
+                                                 .setMaxBufferedDocs(2)
+                                                 .setMergePolicy(newLogMergePolicy())
+@@ -1610,6 +1642,10 @@ public class TestIndexWriter extends LuceneTestCase {
+   public void testNoUnwantedTVFiles() throws Exception {
+ 
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // test uses IW unref'ed check which is unaware of retries
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter indexWriter = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random()))
+                                                      .setRAMBufferSizeMB(0.01)
+                                                      .setMergePolicy(newLogMergePolicy()));
+@@ -1772,7 +1808,8 @@ public class TestIndexWriter extends LuceneTestCase {
+ 
+   public void testDeleteAllNRTLeftoverFiles() throws Exception {
+ 
+-    Directory d = new MockDirectoryWrapper(random(), new RAMDirectory());
++    MockDirectoryWrapper d = new MockDirectoryWrapper(random(), new RAMDirectory());
++    d.setEnableVirusScanner(false); // needs for files to actually be deleted
+     IndexWriter w = new IndexWriter(d, new IndexWriterConfig(new MockAnalyzer(random())));
+     Document doc = new Document();
+     for(int i = 0; i < 20; i++) {
+@@ -1897,6 +1934,10 @@ public class TestIndexWriter extends LuceneTestCase {
+   // LUCENE-3872
+   public void testPrepareCommitThenRollback() throws Exception {
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // indexExists might return true if virus scanner prevents deletions 
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter w = new IndexWriter(dir,
+                                     new IndexWriterConfig(new MockAnalyzer(random())));
+ 
+@@ -2730,6 +2771,9 @@ public class TestIndexWriter extends LuceneTestCase {
+     assumeFalse("this test can't run on Windows", Constants.WINDOWS);
+ 
+     MockDirectoryWrapper dir = newMockDirectory();
++    
++    // don't act like windows either, or the test won't simulate the condition
++    dir.setEnableVirusScanner(false);
+ 
+     // Allow deletion of still open files:
+     dir.setNoDeleteOpenFile(false);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterCommit.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterCommit.java
+index d63e023..735e2e0 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterCommit.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterCommit.java
+@@ -18,6 +18,7 @@ package org.apache.lucene.index;
+  */
+ 
+ import java.io.IOException;
++import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicBoolean;
+@@ -93,6 +94,10 @@ public class TestIndexWriterCommit extends LuceneTestCase {
+    */
+   public void testCommitOnCloseAbort() throws IOException {
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // test uses IW unref'ed check which is unaware of retries
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random()))
+                                                 .setMaxBufferedDocs(10));
+     for (int i = 0; i < 14; i++) {
+@@ -184,6 +189,11 @@ public class TestIndexWriterCommit extends LuceneTestCase {
+     final String contentFormat = TestUtil.getPostingsFormat("content");
+     assumeFalse("This test cannot run with Memory codec", idFormat.equals("Memory") || contentFormat.equals("Memory"));
+     MockDirectoryWrapper dir = newMockDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // the virus scanner can use up too much disk space :)
++      // an alternative is to expose MDW.triedToDelete and discount it
++      dir.setEnableVirusScanner(false);
++    }
+     Analyzer analyzer;
+     if (random().nextBoolean()) {
+       // no payloads
+@@ -269,6 +279,10 @@ public class TestIndexWriterCommit extends LuceneTestCase {
+     if (dir instanceof MockDirectoryWrapper) {
+       ((MockDirectoryWrapper)dir).setPreventDoubleWrite(false);
+     }
++    if (dir instanceof MockDirectoryWrapper) {
++      // test uses IW unref'ed check which is unaware of retries
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(
+         dir,
+         newIndexWriterConfig(new MockAnalyzer(random()))
+@@ -556,8 +570,13 @@ public class TestIndexWriterCommit extends LuceneTestCase {
+   // LUCENE-1274: test writer.prepareCommit()
+   public void testPrepareCommitRollback() throws IOException {
+     Directory dir = newDirectory();
++
++    MockDirectoryWrapper mockDir;
+     if (dir instanceof MockDirectoryWrapper) {
+-      ((MockDirectoryWrapper)dir).setPreventDoubleWrite(false);
++      mockDir = (MockDirectoryWrapper) dir;
++      mockDir.setPreventDoubleWrite(false);
++    } else {
++      mockDir = null;
+     }
+ 
+     IndexWriter writer = new IndexWriter(
+@@ -568,8 +587,9 @@ public class TestIndexWriterCommit extends LuceneTestCase {
+     );
+     writer.commit();
+ 
+-    for (int i = 0; i < 23; i++)
++    for (int i = 0; i < 23; i++) {
+       TestIndexWriter.addDoc(writer);
++    }
+ 
+     DirectoryReader reader = DirectoryReader.open(dir);
+     assertEquals(0, reader.numDocs());
+@@ -579,7 +599,14 @@ public class TestIndexWriterCommit extends LuceneTestCase {
+     IndexReader reader2 = DirectoryReader.open(dir);
+     assertEquals(0, reader2.numDocs());
+ 
++    // We need to let IW delete the partial segments_N that was written in prepareCommit, else we get a false fail below:
++    if (mockDir != null) {
++      mockDir.setEnableVirusScanner(false);
++    }
+     writer.rollback();
++    if (mockDir != null) {
++      mockDir.setEnableVirusScanner(true);
++    }
+ 
+     IndexReader reader3 = DirectoryReader.openIfChanged(reader);
+     assertNull(reader3);
+@@ -588,9 +615,12 @@ public class TestIndexWriterCommit extends LuceneTestCase {
+     reader.close();
+     reader2.close();
+ 
++    // System.out.println("TEST: after rollback: " + Arrays.toString(dir.listAll()));
++
+     writer = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random())));
+-    for (int i = 0; i < 17; i++)
++    for (int i = 0; i < 17; i++) {
+       TestIndexWriter.addDoc(writer);
++    }
+ 
+     reader = DirectoryReader.open(dir);
+     assertEquals(0, reader.numDocs());
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
+index 7ccc6b2..bee156b 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
+@@ -499,6 +499,8 @@ public class TestIndexWriterDelete extends LuceneTestCase {
+     MockDirectoryWrapper startDir = newMockDirectory();
+     // TODO: find the resource leak that only occurs sometimes here.
+     startDir.setNoDeleteOpenFile(false);
++    // test uses IW unref'ed helper which is unaware of retries
++    startDir.setEnableVirusScanner(false);
+     IndexWriter writer = new IndexWriter(startDir, newIndexWriterConfig(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false)));
+     for (int i = 0; i < 157; i++) {
+       Document d = new Document();
+@@ -524,6 +526,8 @@ public class TestIndexWriterDelete extends LuceneTestCase {
+       MockDirectoryWrapper dir = new MockDirectoryWrapper(random(), new RAMDirectory(startDir, newIOContext(random())));
+       dir.setPreventDoubleWrite(false);
+       dir.setAllowRandomFileNotFoundException(false);
++      // test uses IW unref'ed helper which is unaware of retries
++      dir.setEnableVirusScanner(false);
+       IndexWriter modifier = new IndexWriter(dir,
+                                              newIndexWriterConfig(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false))
+                                              .setMaxBufferedDocs(1000)
+@@ -737,7 +741,7 @@ public class TestIndexWriterDelete extends LuceneTestCase {
+                 System.out.println("TEST: mock failure: now fail");
+                 new Throwable().printStackTrace(System.out);
+               }
+-              throw new IOException("fail after applyDeletes");
++              throw new RuntimeException("fail after applyDeletes");
+             }
+           }
+           if (!failed) {
+@@ -841,7 +845,7 @@ public class TestIndexWriterDelete extends LuceneTestCase {
+         System.out.println("TEST: now commit for failure");
+       }
+       modifier.commit();
+-    } catch (IOException ioe) {
++    } catch (RuntimeException ioe) {
+       // expected
+       failed = true;
+     }
+@@ -892,6 +896,8 @@ public class TestIndexWriterDelete extends LuceneTestCase {
+     String[] text = { "Amsterdam", "Venice" };
+ 
+     MockDirectoryWrapper dir = newMockDirectory();
++    // test uses IW unref'ed helper which is unaware of retries
++    dir.setEnableVirusScanner(false);
+     IndexWriter modifier = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false)));
+     modifier.commit();
+     dir.failOn(failure.reset());
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java
+index 1b3848f..c923f1c 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterExceptions.java
+@@ -939,6 +939,7 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
+     for (FailOnlyInCommit failure : failures) {
+       MockDirectoryWrapper dir = newMockDirectory();
+       dir.setFailOnCreateOutput(false);
++      dir.setEnableVirusScanner(false); // we check for specific list of files
+       IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random())));
+       Document doc = new Document();
+       doc.add(newTextField("field", "a field", Field.Store.YES));
+@@ -1160,6 +1161,10 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
+   public void testSimulatedCorruptIndex1() throws IOException {
+       BaseDirectoryWrapper dir = newDirectory();
+       dir.setCheckIndexOnClose(false); // we are corrupting it!
++      if (dir instanceof MockDirectoryWrapper) {
++        // we want to ensure our corruption always succeeds!
++        ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++      }
+ 
+       IndexWriter writer = null;
+ 
+@@ -1208,6 +1213,10 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
+   public void testSimulatedCorruptIndex2() throws IOException {
+     BaseDirectoryWrapper dir = newDirectory();
+     dir.setCheckIndexOnClose(false); // we are corrupting it!
++    if (dir instanceof MockDirectoryWrapper) {
++      // we want to ensure our corruption always succeeds!
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = null;
+ 
+     writer  = new IndexWriter(
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOnDiskFull.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOnDiskFull.java
+index 7f084be..5cd69bd 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOnDiskFull.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOnDiskFull.java
+@@ -62,6 +62,7 @@ public class TestIndexWriterOnDiskFull extends LuceneTestCase {
+           System.out.println("TEST: cycle: diskFree=" + diskFree);
+         }
+         MockDirectoryWrapper dir = new MockDirectoryWrapper(random(), new RAMDirectory());
++        dir.setEnableVirusScanner(false); // currently uses the IW unreferenced files method, unaware of retries
+         dir.setMaxSizeInBytes(diskFree);
+         IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(new MockAnalyzer(random())));
+         MergeScheduler ms = writer.getConfig().getMergeScheduler();
+@@ -538,6 +539,7 @@ public class TestIndexWriterOnDiskFull extends LuceneTestCase {
+                                                 .setMaxBufferedDocs(2)
+                                                 .setMergeScheduler(new ConcurrentMergeScheduler())
+                                                 .setCommitOnClose(false));
++    writer.commit(); // empty commit, to not create confusing situation with first commit
+     dir.setMaxSizeInBytes(Math.max(1, dir.getRecomputedActualSizeInBytes()));
+     final Document doc = new Document();
+     FieldType customType = new FieldType(TextField.TYPE_STORED);
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOutOfMemory.java b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOutOfMemory.java
+index 52cc8ac..f40de17 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOutOfMemory.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterOutOfMemory.java
+@@ -97,6 +97,7 @@ public class TestIndexWriterOutOfMemory extends LuceneTestCase {
+         int numDocs = atLeast(2000);
+       
+         IndexWriter iw = new IndexWriter(dir, conf);
++        iw.commit(); // ensure there is always a commit
+ 
+         final Random r = new Random(random().nextLong());
+         dir.failOn(new Failure() {
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestNumericDocValuesUpdates.java b/lucene/core/src/test/org/apache/lucene/index/TestNumericDocValuesUpdates.java
+index 0a05aae..dcb765c 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestNumericDocValuesUpdates.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestNumericDocValuesUpdates.java
+@@ -26,6 +26,7 @@ import org.apache.lucene.document.SortedDocValuesField;
+ import org.apache.lucene.document.SortedSetDocValuesField;
+ import org.apache.lucene.document.StringField;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.store.NRTCachingDirectory;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+@@ -1162,6 +1163,10 @@ public class TestNumericDocValuesUpdates extends LuceneTestCase {
+   @Test
+   public void testDeleteUnusedUpdatesFiles() throws Exception {
+     Directory dir = newDirectory();
++    // test explicitly needs files to always be actually deleted
++    if (dir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()));
+     IndexWriter writer = new IndexWriter(dir, conf);
+     
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestOmitPositions.java b/lucene/core/src/test/org/apache/lucene/index/TestOmitPositions.java
+index da17033..d5cf1b3 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestOmitPositions.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestOmitPositions.java
+@@ -26,6 +26,7 @@ import org.apache.lucene.document.TextField;
+ import org.apache.lucene.index.FieldInfo.IndexOptions;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.TestUtil;
+@@ -189,6 +190,10 @@ public class TestOmitPositions extends LuceneTestCase {
+   // Verifies no *.prx exists when all fields omit term positions:
+   public void testNoPrxFile() throws Throwable {
+     Directory ram = newDirectory();
++    if (ram instanceof MockDirectoryWrapper) {
++      // we verify some files get deleted
++      ((MockDirectoryWrapper)ram).setEnableVirusScanner(false);
++    }
+     Analyzer analyzer = new MockAnalyzer(random());
+     IndexWriter writer = new IndexWriter(ram, newIndexWriterConfig(analyzer)
+                                                 .setMaxBufferedDocs(3)
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestOmitTf.java b/lucene/core/src/test/org/apache/lucene/index/TestOmitTf.java
+index 6786cda..eb4a7c7 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestOmitTf.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestOmitTf.java
+@@ -38,6 +38,7 @@ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.TermStatistics;
+ import org.apache.lucene.search.similarities.TFIDFSimilarity;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.LuceneTestCase;
+ 
+@@ -219,6 +220,10 @@ public class TestOmitTf extends LuceneTestCase {
+   // Verifies no *.prx exists when all fields omit term freq:
+   public void testNoPrxFile() throws Throwable {
+     Directory ram = newDirectory();
++    if (ram instanceof MockDirectoryWrapper) {
++      // we verify some files get deleted
++      ((MockDirectoryWrapper)ram).setEnableVirusScanner(false);
++    }
+     Analyzer analyzer = new MockAnalyzer(random());
+     IndexWriter writer = new IndexWriter(ram, newIndexWriterConfig(analyzer)
+                                                 .setMaxBufferedDocs(3)
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java b/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java
+index 82183ae..c94b66a 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestPersistentSnapshotDeletionPolicy.java
+@@ -50,6 +50,7 @@ public class TestPersistentSnapshotDeletionPolicy extends TestSnapshotDeletionPo
+   public void testExistingSnapshots() throws Exception {
+     int numSnapshots = 3;
+     MockDirectoryWrapper dir = newMockDirectory();
++    dir.setEnableVirusScanner(false); // test relies on files actually being deleted
+     IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy(dir)));
+     PersistentSnapshotDeletionPolicy psdp = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     assertNull(psdp.getLastSaveFile());
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java b/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java
+index ca4a4fd..73849d5 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestRollingUpdates.java
+@@ -39,6 +39,11 @@ public class TestRollingUpdates extends LuceneTestCase {
+   public void testRollingUpdates() throws Exception {
+     Random random = new Random(random().nextLong());
+     final BaseDirectoryWrapper dir = newDirectory();
++    // test checks for no unref'ed files with the IW helper method, which isn't aware of "tried to delete files"
++    if (dir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
++    
+     final LineFileDocs docs = new LineFileDocs(random, true);
+ 
+     //provider.register(new MemoryCodec());
+diff --git a/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java b/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java
+index 6f83645..dbfd7d9 100644
+--- a/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java
++++ b/lucene/core/src/test/org/apache/lucene/index/TestSnapshotDeletionPolicy.java
+@@ -29,6 +29,7 @@ import org.apache.lucene.document.FieldType;
+ import org.apache.lucene.document.TextField;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.junit.Test;
+@@ -101,6 +102,10 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+   }
+ 
+   private void runTest(Random random, Directory dir) throws Exception {
++    // we use the IW unref'ed files check which is unaware of retries:
++    if (dir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     // Run for ~1 seconds
+     final long stopTime = System.currentTimeMillis() + 1000;
+ 
+@@ -251,6 +256,10 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+     
+     // Create 3 snapshots: snapshot0, snapshot1, snapshot2
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // we verify some files get deleted
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
+     SnapshotDeletionPolicy sdp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     prepareIndexAndSnapshots(sdp, writer, numSnapshots);
+@@ -275,6 +284,10 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+   @Test
+   public void testMultiThreadedSnapshotting() throws Exception {
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // test relies on files actually being deleted
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     final IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
+     final SnapshotDeletionPolicy sdp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+ 
+@@ -346,6 +359,10 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+   @Test
+   public void testReleaseSnapshot() throws Exception {
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // we rely upon existence of files
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
+     SnapshotDeletionPolicy sdp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     prepareIndexAndSnapshots(sdp, writer, 1);
+@@ -395,6 +412,10 @@ public class TestSnapshotDeletionPolicy extends LuceneTestCase {
+     // Tests the behavior of SDP when commits that are given at ctor are missing
+     // on onInit().
+     Directory dir = newDirectory();
++    if (dir instanceof MockDirectoryWrapper) {
++      // we rely upon existence of files
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriter writer = new IndexWriter(dir, getConfig(random(), getDeletionPolicy()));
+     SnapshotDeletionPolicy sdp = (SnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
+     writer.addDocument(new Document());
+diff --git a/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java b/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java
+index 7197b86..d96b735 100644
+--- a/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java
++++ b/lucene/core/src/test/org/apache/lucene/store/TestDirectory.java
+@@ -30,11 +30,17 @@ public class TestDirectory extends BaseDirectoryTestCase {
+ 
+   @Override
+   protected Directory getDirectory(File path) throws IOException {
++    final Directory dir;
+     if (random().nextBoolean()) {
+-      return newDirectory();
++      dir = newDirectory();
+     } else {
+-      return newFSDirectory(path);
++      dir = newFSDirectory(path);
+     }
++    if (dir instanceof MockDirectoryWrapper) {
++      // test manipulates directory directly
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
++    return dir;
+   }
+ 
+   // we wrap the directory in slow stuff, so only run nightly
+diff --git a/lucene/core/src/test/org/apache/lucene/store/TestRateLimitedDirectoryWrapper.java b/lucene/core/src/test/org/apache/lucene/store/TestRateLimitedDirectoryWrapper.java
+index 238fac6..f01d976 100644
+--- a/lucene/core/src/test/org/apache/lucene/store/TestRateLimitedDirectoryWrapper.java
++++ b/lucene/core/src/test/org/apache/lucene/store/TestRateLimitedDirectoryWrapper.java
+@@ -23,7 +23,12 @@ public class TestRateLimitedDirectoryWrapper extends BaseDirectoryTestCase {
+ 
+   @Override
+   protected Directory getDirectory(File path) {
+-    RateLimitedDirectoryWrapper dir = new RateLimitedDirectoryWrapper(newFSDirectory(path));
++    Directory in = newFSDirectory(path);
++    if (in instanceof MockDirectoryWrapper) {
++      // test manipulates directory directly
++      ((MockDirectoryWrapper)in).setEnableVirusScanner(false);
++    }
++    RateLimitedDirectoryWrapper dir = new RateLimitedDirectoryWrapper(in);
+     RateLimiter limiter = new RateLimiter.SimpleRateLimiter(.1 + 3*random().nextDouble());
+     dir.setRateLimiter(limiter, IOContext.Context.MERGE);
+     return dir;
+diff --git a/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java b/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java
+index 219cf47..f5a80fd 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java
++++ b/lucene/core/src/test/org/apache/lucene/util/fst/TestFSTs.java
+@@ -95,6 +95,7 @@ public class TestFSTs extends LuceneTestCase {
+     super.setUp();
+     dir = newMockDirectory();
+     dir.setPreventDoubleWrite(false);
++    dir.setEnableVirusScanner(false);
+   }
+ 
+   @Override
+diff --git a/lucene/misc/src/test/org/apache/lucene/util/fst/TestFSTsMisc.java b/lucene/misc/src/test/org/apache/lucene/util/fst/TestFSTsMisc.java
+index 970d2ed..9ffa011 100644
+--- a/lucene/misc/src/test/org/apache/lucene/util/fst/TestFSTsMisc.java
++++ b/lucene/misc/src/test/org/apache/lucene/util/fst/TestFSTsMisc.java
+@@ -46,6 +46,7 @@ public class TestFSTsMisc extends LuceneTestCase {
+     super.setUp();
+     dir = newMockDirectory();
+     dir.setPreventDoubleWrite(false);
++    dir.setEnableVirusScanner(false);
+   }
+ 
+   @Override
+diff --git a/lucene/replicator/src/java/org/apache/lucene/replicator/IndexReplicationHandler.java b/lucene/replicator/src/java/org/apache/lucene/replicator/IndexReplicationHandler.java
+index 34bbf47..bbbfbe4 100644
+--- a/lucene/replicator/src/java/org/apache/lucene/replicator/IndexReplicationHandler.java
++++ b/lucene/replicator/src/java/org/apache/lucene/replicator/IndexReplicationHandler.java
+@@ -35,6 +35,7 @@ import org.apache.lucene.index.SegmentInfos;
+ import org.apache.lucene.replicator.ReplicationClient.ReplicationHandler;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
++import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.InfoStream;
+ 
+ /**
+@@ -122,12 +123,9 @@ public class IndexReplicationHandler implements ReplicationHandler {
+    */
+   public static void cleanupFilesOnFailure(Directory dir, List<String> files) {
+     for (String file : files) {
+-      try {
+-        dir.deleteFile(file);
+-      } catch (Throwable t) {
+-        // suppress any exception because if we're here, it means copy
+-        // failed, and we must cleanup after ourselves.
+-      }
++      // suppress any exception because if we're here, it means copy
++      // failed, and we must cleanup after ourselves.
++      IOUtils.deleteFilesIgnoringExceptions(dir, file);
+     }
+   }
+   
+@@ -155,11 +153,8 @@ public class IndexReplicationHandler implements ReplicationHandler {
+         for (String file : dir.listAll()) {
+           if (!commitFiles.contains(file)
+               && (matcher.reset(file).matches() || file.startsWith(IndexFileNames.SEGMENTS))) {
+-            try {
+-              dir.deleteFile(file);
+-            } catch (Throwable t) {
+-              // suppress, it's just a best effort
+-            }
++            // suppress exceptions, it's just a best effort
++            IOUtils.deleteFilesIgnoringExceptions(dir, file);
+           }
+         }
+       }
+@@ -194,11 +189,7 @@ public class IndexReplicationHandler implements ReplicationHandler {
+     if (segmentsFile != null) {
+       SegmentInfos.writeSegmentsGen(dir, SegmentInfos.generationFromSegmentsFileName(segmentsFile));
+     } else {
+-      try {
+-        dir.deleteFile(IndexFileNames.SEGMENTS_GEN);
+-      } catch (Throwable t) {
+-        // suppress any errors while deleting this file.
+-      }
++      IOUtils.deleteFilesIgnoringExceptions(dir, IndexFileNames.SEGMENTS_GEN);
+     }
+   }
+ 
+diff --git a/lucene/replicator/src/test/org/apache/lucene/replicator/IndexAndTaxonomyRevisionTest.java b/lucene/replicator/src/test/org/apache/lucene/replicator/IndexAndTaxonomyRevisionTest.java
+index d4f96b6..378a3928 100644
+--- a/lucene/replicator/src/test/org/apache/lucene/replicator/IndexAndTaxonomyRevisionTest.java
++++ b/lucene/replicator/src/test/org/apache/lucene/replicator/IndexAndTaxonomyRevisionTest.java
+@@ -35,6 +35,7 @@ import org.apache.lucene.replicator.IndexAndTaxonomyRevision.SnapshotDirectoryTa
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.IOUtils;
+ import org.junit.Test;
+ 
+@@ -76,6 +77,10 @@ public class IndexAndTaxonomyRevisionTest extends ReplicatorTestCase {
+     
+     Directory taxoDir = newDirectory();
+     SnapshotDirectoryTaxonomyWriter taxoWriter = new SnapshotDirectoryTaxonomyWriter(taxoDir);
++    // we look to see that certain files are deleted:
++    if (indexDir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)indexDir).setEnableVirusScanner(false);
++    }
+     try {
+       indexWriter.addDocument(newDocument(taxoWriter));
+       indexWriter.commit();
+@@ -96,6 +101,10 @@ public class IndexAndTaxonomyRevisionTest extends ReplicatorTestCase {
+       indexWriter.close();
+     } finally {
+       IOUtils.close(indexWriter, taxoWriter, taxoDir, indexDir);
++      if (indexDir instanceof MockDirectoryWrapper) {
++        // set back to on for other tests
++        ((MockDirectoryWrapper)indexDir).setEnableVirusScanner(true);
++      }
+     }
+   }
+   
+diff --git a/lucene/replicator/src/test/org/apache/lucene/replicator/IndexRevisionTest.java b/lucene/replicator/src/test/org/apache/lucene/replicator/IndexRevisionTest.java
+index 0e012e7..c0c4d04 100644
+--- a/lucene/replicator/src/test/org/apache/lucene/replicator/IndexRevisionTest.java
++++ b/lucene/replicator/src/test/org/apache/lucene/replicator/IndexRevisionTest.java
+@@ -30,6 +30,7 @@ import org.apache.lucene.index.SnapshotDeletionPolicy;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IOContext;
+ import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.IOUtils;
+ import org.junit.Test;
+ 
+@@ -72,6 +73,10 @@ public class IndexRevisionTest extends ReplicatorTestCase {
+   @Test
+   public void testRevisionRelease() throws Exception {
+     Directory dir = newDirectory();
++    // we look to see that certain files are deleted:
++    if (dir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)dir).setEnableVirusScanner(false);
++    }
+     IndexWriterConfig conf = new IndexWriterConfig(null);
+     conf.setIndexDeletionPolicy(new SnapshotDeletionPolicy(conf.getIndexDeletionPolicy()));
+     IndexWriter writer = new IndexWriter(dir, conf);
+@@ -89,9 +94,8 @@ public class IndexRevisionTest extends ReplicatorTestCase {
+       assertNotNull(new IndexRevision(writer));
+       rev1.release(); // this release should trigger the delete of segments_1
+       assertFalse(slowFileExists(dir, IndexFileNames.SEGMENTS + "_1"));
+-      writer.close();
+     } finally {
+-      IOUtils.close(dir);
++      IOUtils.close(writer, dir);
+     }
+   }
+   
+diff --git a/lucene/replicator/src/test/org/apache/lucene/replicator/LocalReplicatorTest.java b/lucene/replicator/src/test/org/apache/lucene/replicator/LocalReplicatorTest.java
+index 36b1066..3c9a8d1 100644
+--- a/lucene/replicator/src/test/org/apache/lucene/replicator/LocalReplicatorTest.java
++++ b/lucene/replicator/src/test/org/apache/lucene/replicator/LocalReplicatorTest.java
+@@ -32,6 +32,7 @@ import org.apache.lucene.index.IndexWriterConfig;
+ import org.apache.lucene.index.SnapshotDeletionPolicy;
+ import org.apache.lucene.store.AlreadyClosedException;
+ import org.apache.lucene.store.Directory;
++import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.IOUtils;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -118,35 +119,57 @@ public class LocalReplicatorTest extends ReplicatorTestCase {
+   
+   @Test
+   public void testPublishSameRevision() throws IOException {
+-    Revision rev = createRevision(1);
+-    replicator.publish(rev);
+-    SessionToken res = replicator.checkForUpdate(null);
+-    assertNotNull(res);
+-    assertEquals(rev.getVersion(), res.version);
+-    replicator.release(res.id);
+-    replicator.publish(new IndexRevision(sourceWriter));
+-    res = replicator.checkForUpdate(res.version);
+-    assertNull(res);
+-    
+-    // now make sure that publishing same revision doesn't leave revisions
+-    // "locked", i.e. that replicator releases revisions even when they are not
+-    // kept
+-    replicator.publish(createRevision(2));
+-    assertEquals(1, DirectoryReader.listCommits(sourceDir).size());
++    // we look to see that certain files are deleted:
++    if (sourceDir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)sourceDir).setEnableVirusScanner(false);
++    }
++    try {
++      Revision rev = createRevision(1);
++      replicator.publish(rev);
++      SessionToken res = replicator.checkForUpdate(null);
++      assertNotNull(res);
++      assertEquals(rev.getVersion(), res.version);
++      replicator.release(res.id);
++      replicator.publish(new IndexRevision(sourceWriter));
++      res = replicator.checkForUpdate(res.version);
++      assertNull(res);
++      
++      // now make sure that publishing same revision doesn't leave revisions
++      // "locked", i.e. that replicator releases revisions even when they are not
++      // kept
++      replicator.publish(createRevision(2));
++      assertEquals(1, DirectoryReader.listCommits(sourceDir).size());
++    } finally {
++      if (sourceDir instanceof MockDirectoryWrapper) {
++        // set back to on for other tests
++        ((MockDirectoryWrapper)sourceDir).setEnableVirusScanner(true);
++      }
++    }
+   }
+   
+   @Test
+   public void testPublishOlderRev() throws IOException {
+-    replicator.publish(createRevision(1));
+-    Revision old = new IndexRevision(sourceWriter);
+-    replicator.publish(createRevision(2));
++    // we look to see that certain files are deleted:
++    if (sourceDir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)sourceDir).setEnableVirusScanner(false);
++    }
+     try {
+-      replicator.publish(old);
+-      fail("should have failed to publish an older revision");
+-    } catch (IllegalArgumentException e) {
+-      // expected
++      replicator.publish(createRevision(1));
++      Revision old = new IndexRevision(sourceWriter);
++      replicator.publish(createRevision(2));
++      try {
++        replicator.publish(old);
++        fail("should have failed to publish an older revision");
++      } catch (IllegalArgumentException e) {
++        // expected
++      }
++      assertEquals(1, DirectoryReader.listCommits(sourceDir).size());
++    } finally {
++      if (sourceDir instanceof MockDirectoryWrapper) {
++        // set back to on for other tests
++        ((MockDirectoryWrapper)sourceDir).setEnableVirusScanner(true);
++      }
+     }
+-    assertEquals(1, DirectoryReader.listCommits(sourceDir).size());
+   }
+   
+   @Test
+@@ -187,12 +210,24 @@ public class LocalReplicatorTest extends ReplicatorTestCase {
+   
+   @Test
+   public void testRevisionRelease() throws Exception {
+-    replicator.publish(createRevision(1));
+-    assertTrue(slowFileExists(sourceDir, IndexFileNames.SEGMENTS + "_1"));
+-    replicator.publish(createRevision(2));
+-    // now the files of revision 1 can be deleted
+-    assertTrue(slowFileExists(sourceDir, IndexFileNames.SEGMENTS + "_2"));
+-    assertFalse("segments_1 should not be found in index directory after revision is released", slowFileExists(sourceDir, IndexFileNames.SEGMENTS + "_1"));
++    // we look to see that certain files are deleted:
++    if (sourceDir instanceof MockDirectoryWrapper) {
++      ((MockDirectoryWrapper)sourceDir).setEnableVirusScanner(false);
++    }
++    
++    try {
++      replicator.publish(createRevision(1));
++      assertTrue(slowFileExists(sourceDir, IndexFileNames.SEGMENTS + "_1"));
++      replicator.publish(createRevision(2));
++      // now the files of revision 1 can be deleted
++      assertTrue(slowFileExists(sourceDir, IndexFileNames.SEGMENTS + "_2"));
++      assertFalse("segments_1 should not be found in index directory after revision is released", slowFileExists(sourceDir, IndexFileNames.SEGMENTS + "_1"));
++    } finally {
++      if (sourceDir instanceof MockDirectoryWrapper) {
++        // set back to on for other tests
++        ((MockDirectoryWrapper)sourceDir).setEnableVirusScanner(true);
++      }
++    }
+   }
+   
+ }
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/store/MockDirectoryWrapper.java b/lucene/test-framework/src/java/org/apache/lucene/store/MockDirectoryWrapper.java
+index 8942967..fb208b3 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/store/MockDirectoryWrapper.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/store/MockDirectoryWrapper.java
+@@ -75,6 +75,7 @@ public class MockDirectoryWrapper extends BaseDirectoryWrapper {
+   boolean trackDiskUsage = false;
+   boolean wrapLockFactory = true;
+   boolean useSlowOpenClosers = true;
++  boolean enableVirusScanner = true;
+   boolean allowRandomFileNotFoundException = true;
+   boolean allowReadingFilesStillOpenForWrite = false;
+   private Set<String> unSyncedFiles;
+@@ -101,11 +102,16 @@ public class MockDirectoryWrapper extends BaseDirectoryWrapper {
+   // Only tracked if noDeleteOpenFile is true: if an attempt
+   // is made to delete an open file, we enroll it here.
+   private Set<String> openFilesDeleted;
++  
++  // only tracked if virus scanner is enabled:
++  // set of files it prevented deletion for
++  private Set<String> triedToDelete;
+ 
+   private synchronized void init() {
+     if (openFiles == null) {
+       openFiles = new HashMap<>();
+       openFilesDeleted = new HashSet<>();
++      triedToDelete = new HashSet<>();
+     }
+ 
+     if (createdFiles == null)
+@@ -154,6 +160,18 @@ public class MockDirectoryWrapper extends BaseDirectoryWrapper {
+   public void setAllowReadingFilesStillOpenForWrite(boolean value) {
+     allowReadingFilesStillOpenForWrite = value;
+   }
++  
++  /** Returns true if the virus scanner is enabled */
++  public boolean getEnableVirusScanner() {
++    return enableVirusScanner;
++  }
++  
++  /** If set to true (the default), deleteFile sometimes
++   *  fails because a virus scanner is open.
++   */
++  public void setEnableVirusScanner(boolean value) {
++    this.enableVirusScanner = value;
++  }
+ 
+   /**
+    * Enum for controlling hard disk throttling.
+@@ -465,6 +483,14 @@ public class MockDirectoryWrapper extends BaseDirectoryWrapper {
+         openFilesDeleted.remove(name);
+       }
+     }
++    if (!forced && enableVirusScanner && (randomState.nextInt(4) == 0)) {
++      triedToDelete.add(name);
++      if (LuceneTestCase.VERBOSE) {
++        System.out.println("MDW: now refuse to delete file: " + name);
++      }
++      throw new IOException("cannot delete file: " + name + ", a virus scanner has it open");
++    }
++    triedToDelete.remove(name);
+     in.deleteFile(name);
+   }
+ 
+@@ -654,7 +680,10 @@ public class MockDirectoryWrapper extends BaseDirectoryWrapper {
+   public synchronized void close() throws IOException {
+     // files that we tried to delete, but couldn't because readers were open.
+     // all that matters is that we tried! (they will eventually go away)
++    //   still open when we tried to delete
+     Set<String> pendingDeletions = new HashSet<>(openFilesDeleted);
++    //   virus scanner when we tried to delete
++    pendingDeletions.addAll(triedToDelete);
+     maybeYield();
+     if (openFiles == null) {
+       openFiles = new HashMap<>();
+diff --git a/solr/test-framework/src/java/org/apache/solr/core/MockDirectoryFactory.java b/solr/test-framework/src/java/org/apache/solr/core/MockDirectoryFactory.java
+index 2d06589..b78b98c 100644
+--- a/solr/test-framework/src/java/org/apache/solr/core/MockDirectoryFactory.java
++++ b/solr/test-framework/src/java/org/apache/solr/core/MockDirectoryFactory.java
+@@ -63,6 +63,9 @@ public class MockDirectoryFactory extends EphemeralDirectoryFactory {
+       // already been created.
+       mockDirWrapper.setPreventDoubleWrite(false);
+       
++      // snappuller & co don't seem ready for this:
++      mockDirWrapper.setEnableVirusScanner(false);
++      
+       if (allowReadingFilesStillOpenForWrite) {
+         mockDirWrapper.setAllowReadingFilesStillOpenForWrite(true);
+       }
+diff --git a/solr/test-framework/src/java/org/apache/solr/core/MockFSDirectoryFactory.java b/solr/test-framework/src/java/org/apache/solr/core/MockFSDirectoryFactory.java
+index 9c302355..7dea27f 100644
+--- a/solr/test-framework/src/java/org/apache/solr/core/MockFSDirectoryFactory.java
++++ b/solr/test-framework/src/java/org/apache/solr/core/MockFSDirectoryFactory.java
+@@ -49,6 +49,7 @@ public class MockFSDirectoryFactory extends StandardDirectoryFactory {
+     if (cdir instanceof MockDirectoryWrapper) {
+       ((MockDirectoryWrapper)cdir).setAssertNoUnrefencedFilesOnClose(false);
+       ((MockDirectoryWrapper)cdir).setPreventDoubleWrite(false);
++      ((MockDirectoryWrapper)cdir).setEnableVirusScanner(false);
+     }
+     return dir;
+   }
+

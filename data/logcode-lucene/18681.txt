@@ -1,0 +1,242 @@
+GitDiffStart: 4e88c6cb936073b65dcfb522af8d44bcebd9402b | Tue Dec 8 22:14:32 2009 +0000
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 89381c5..347dc4d 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -45,6 +45,9 @@ Bug fixes
+   
+ New features
+ 
++* LUCENE-2128: Parallelized fetching document frequencies during weight
++  creation. (Israel Tsadok, Simon Willnauer via Uwe Schindler) 
++
+ * LUCENE-2069: Added Unicode 4 support to CharArraySet. Due to the switch
+   to Java 5, supplementary characters are now lowercased correctly if the
+   set is created as case insensitive.
+diff --git a/src/java/org/apache/lucene/search/MultiSearcher.java b/src/java/org/apache/lucene/search/MultiSearcher.java
+index 9dba22b..c11da81 100644
+--- a/src/java/org/apache/lucene/search/MultiSearcher.java
++++ b/src/java/org/apache/lucene/search/MultiSearcher.java
+@@ -311,32 +311,42 @@ public class MultiSearcher extends Searcher {
+     rewrittenQuery.extractTerms(terms);
+ 
+     // step3
+-    final Term[] allTermsArray = new Term[terms.size()];
+-    terms.toArray(allTermsArray);
+-    int[] aggregatedDfs = new int[terms.size()];
+-    for (int i = 0; i < searchables.length; i++) {
+-      int[] dfs = searchables[i].docFreqs(allTermsArray);
++    final Map<Term,Integer> dfMap = createDocFrequencyMap(terms);
++
++    // step4
++    final int numDocs = maxDoc();
++    final CachedDfSource cacheSim = new CachedDfSource(dfMap, numDocs, getSimilarity());
++
++    return rewrittenQuery.weight(cacheSim);
++  }
++  /**
++   * Collects the document frequency for the given terms form all searchables
++   * @param terms term set used to collect the document frequency form all
++   *        searchables 
++   * @return a map with a term as the key and the terms aggregated document
++   *         frequency as a value  
++   * @throws IOException if a searchable throws an {@link IOException}
++   */
++   Map<Term, Integer> createDocFrequencyMap(final Set<Term> terms) throws IOException  {
++    final Term[] allTermsArray = terms.toArray(new Term[terms.size()]);
++    final int[] aggregatedDfs = new int[allTermsArray.length];
++    for (Searchable searchable : searchables) {
++      final int[] dfs = searchable.docFreqs(allTermsArray); 
+       for(int j=0; j<aggregatedDfs.length; j++){
+         aggregatedDfs[j] += dfs[j];
+       }
+     }
+-
+     final HashMap<Term,Integer> dfMap = new HashMap<Term,Integer>();
+     for(int i=0; i<allTermsArray.length; i++) {
+       dfMap.put(allTermsArray[i], Integer.valueOf(aggregatedDfs[i]));
+     }
+-
+-    // step4
+-    final int numDocs = maxDoc();
+-    final CachedDfSource cacheSim = new CachedDfSource(dfMap, numDocs, getSimilarity());
+-
+-    return rewrittenQuery.weight(cacheSim);
++    return dfMap;
+   }
+-
++  
+   /**
+    * A thread subclass for searching a single searchable 
+    */
+-  static class MultiSearcherCallableNoSort implements Callable<TopDocs> {
++  static final class MultiSearcherCallableNoSort implements Callable<TopDocs> {
+ 
+     private final Lock lock;
+     private final Searchable searchable;
+@@ -381,7 +391,7 @@ public class MultiSearcher extends Searcher {
+   /**
+    * A thread subclass for searching a single searchable 
+    */
+-  static class MultiSearcherCallableWithSort implements Callable<TopFieldDocs> {
++  static final class MultiSearcherCallableWithSort implements Callable<TopFieldDocs> {
+ 
+     private final Lock lock;
+     private final Searchable searchable;
+diff --git a/src/java/org/apache/lucene/search/ParallelMultiSearcher.java b/src/java/org/apache/lucene/search/ParallelMultiSearcher.java
+index ae6ad46..e2e644e 100644
+--- a/src/java/org/apache/lucene/search/ParallelMultiSearcher.java
++++ b/src/java/org/apache/lucene/search/ParallelMultiSearcher.java
+@@ -18,21 +18,22 @@ package org.apache.lucene.search;
+  */
+ 
+ import java.io.IOException;
+-import java.util.List;
+-import java.util.Arrays;
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.Callable;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.util.NamedThreadFactory;
+-import org.apache.lucene.util.PriorityQueue;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ 
+ /** Implements parallel search over a set of <code>Searchables</code>.
+@@ -175,6 +176,25 @@ public class ParallelMultiSearcher extends MultiSearcher {
+    }
+   }
+   
++  @Override
++  HashMap<Term, Integer> createDocFrequencyMap(Set<Term> terms) throws IOException {
++    final Term[] allTermsArray = terms.toArray(new Term[terms.size()]);
++    final int[] aggregatedDocFreqs = new int[terms.size()];
++    final ArrayList<Future<int[]>> searchThreads = new ArrayList<Future<int[]>>(searchables.length);
++    for (Searchable searchable : searchables) {
++      final Future<int[]> future = executor.submit(
++          new DocumentFrequencyCallable(searchable, allTermsArray));
++      searchThreads.add(future);
++    }
++    foreach(new AggregateDocFrequency(aggregatedDocFreqs), searchThreads);
++
++    final HashMap<Term,Integer> dfMap = new HashMap<Term,Integer>();
++    for(int i=0; i<allTermsArray.length; i++) {
++      dfMap.put(allTermsArray[i], Integer.valueOf(aggregatedDocFreqs[i]));
++    }
++    return dfMap;
++  }
++  
+   /*
+    * apply the function to each element of the list. This method encapsulates the logic how 
+    * to wait for concurrently executed searchables.  
+@@ -184,9 +204,10 @@ public class ParallelMultiSearcher extends MultiSearcher {
+       try{
+         func.apply(future.get());
+       } catch (ExecutionException e) {
+-        if (e.getCause() instanceof IOException)
++        final Throwable throwable = e.getCause();
++        if (throwable instanceof IOException)
+           throw (IOException) e.getCause();
+-        throw new RuntimeException(e.getCause());
++        throw new RuntimeException(throwable);
+       } catch (InterruptedException ie) {
+         throw new ThreadInterruptedException(ie);
+       }
+@@ -216,6 +237,7 @@ public class ParallelMultiSearcher extends MultiSearcher {
+       maxScore = Math.max(maxScore, t.getMaxScore());
+     }
+   }
++  
+   /**
+    * Accumulates the document frequency for a term.
+    */
+@@ -226,5 +248,38 @@ public class ParallelMultiSearcher extends MultiSearcher {
+       docFreq += t.intValue();
+     }
+   }
+-
++  
++  /**
++   * Aggregates the document frequencies from multiple searchers 
++   */
++  private static final class AggregateDocFrequency implements Function<int[]>{
++    final int[] aggregatedDocFreqs;
++    
++    public AggregateDocFrequency(int[] aggregatedDocFreqs){
++      this.aggregatedDocFreqs = aggregatedDocFreqs;
++    }
++    
++    public void apply(final int[] docFreqs) {
++      for(int i=0; i<aggregatedDocFreqs.length; i++){
++        aggregatedDocFreqs[i] += docFreqs[i];
++      }
++    }
++  }
++  
++  /**
++   * A {@link Callable} to retrieve the document frequencies for a Term array  
++   */
++  private static final class DocumentFrequencyCallable implements Callable<int[]> {
++    private final Searchable searchable;
++    private final Term[] terms;
++    
++    public DocumentFrequencyCallable(Searchable searchable, Term[] terms) {
++      this.searchable = searchable;
++      this.terms = terms;
++    }
++    
++    public int[] call() throws Exception {
++      return searchable.docFreqs(terms);
++    }
++  }
+ }
+diff --git a/src/test/org/apache/lucene/search/TestMultiSearcher.java b/src/test/org/apache/lucene/search/TestMultiSearcher.java
+index 687fc62..157db0d 100644
+--- a/src/test/org/apache/lucene/search/TestMultiSearcher.java
++++ b/src/test/org/apache/lucene/search/TestMultiSearcher.java
+@@ -35,6 +35,7 @@ import org.apache.lucene.util.Version;
+ import java.io.IOException;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.Map;
+ import java.util.Set;
+ 
+ /**
+@@ -411,4 +412,25 @@ public class TestMultiSearcher extends LuceneTestCase
+       MultiSearcher multiSearcher = getMultiSearcherInstance(new Searcher[]{searcher1, searcher2});
+       assertEquals(15, multiSearcher.docFreq(new Term("contents","x")));
+     }
++    
++    public void testCreateDocFrequencyMap() throws IOException{
++      RAMDirectory dir1 = new RAMDirectory();
++      RAMDirectory dir2 = new RAMDirectory();
++      Term template = new Term("contents") ;
++      String[] contents  = {"a", "b", "c"};
++      HashSet<Term> termsSet = new HashSet<Term>();
++      for (int i = 0; i < contents.length; i++) {
++        initIndex(dir1, i+10, i==0, contents[i]); 
++        initIndex(dir2, i+5, i==0, contents[i]);
++        termsSet.add(template.createTerm(contents[i]));
++      }
++      IndexSearcher searcher1 = new IndexSearcher(dir1, true);
++      IndexSearcher searcher2 = new IndexSearcher(dir2, true);
++      MultiSearcher multiSearcher = getMultiSearcherInstance(new Searcher[]{searcher1, searcher2});
++      Map<Term,Integer> docFrequencyMap = multiSearcher.createDocFrequencyMap(termsSet);
++      assertEquals(3, docFrequencyMap.size());
++      for (int i = 0; i < contents.length; i++) {
++        assertEquals(Integer.valueOf((i*2) +15), docFrequencyMap.get(template.createTerm(contents[i])));
++      }
++    }
+ }
+

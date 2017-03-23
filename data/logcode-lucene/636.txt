@@ -1,0 +1,2060 @@
+GitDiffStart: 60975d2dfa0bf855220db6d9755b7e24c14a59bb | Fri Jul 29 10:23:54 2016 +0200
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index a685839..67e2683 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -161,6 +161,8 @@ Optimizations
+ * LUCENE-7311: Cached term queries do not seek the terms dictionary anymore.
+   (Adrien Grand)
+ 
++* LUCENE-7396: Faster flush of points. (Adrien Grand, Mike McCandless)
++
+ Other
+ 
+ * LUCENE-4787: Fixed some highlighting javadocs. (Michael Dodsworth via Adrien
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/MutablePointsReader.java b/lucene/core/src/java/org/apache/lucene/codecs/MutablePointsReader.java
+new file mode 100644
+index 0000000..b6c328b
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/codecs/MutablePointsReader.java
+@@ -0,0 +1,39 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.codecs;
++
++/** {@link PointsReader} whose order of points can be changed.
++ *  This class is useful for codecs to optimize flush.
++ *  @lucene.internal */
++public abstract class MutablePointsReader extends PointsReader {
++
++  /** Sole constructor. */
++  protected MutablePointsReader() {}
++
++  /** Fill {@code packedValue} with the packed bytes of the i-th value. */
++  public abstract void getValue(int i, byte[] packedValue);
++
++  /** Get the k-th byte of the i-th value. */
++  public abstract byte getByteAt(int i, int k);
++
++  /** Return the doc ID of the i-th value. */
++  public abstract int getDocID(int i);
++
++  /** Swap the i-th and j-th values. */
++  public abstract void swap(int i, int j);
++
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/codecs/lucene60/Lucene60PointsWriter.java b/lucene/core/src/java/org/apache/lucene/codecs/lucene60/Lucene60PointsWriter.java
+index 3acfac3..5fedf64 100644
+--- a/lucene/core/src/java/org/apache/lucene/codecs/lucene60/Lucene60PointsWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/codecs/lucene60/Lucene60PointsWriter.java
+@@ -25,6 +25,7 @@ import java.util.List;
+ import java.util.Map;
+ 
+ import org.apache.lucene.codecs.CodecUtil;
++import org.apache.lucene.codecs.MutablePointsReader;
+ import org.apache.lucene.codecs.PointsReader;
+ import org.apache.lucene.codecs.PointsWriter;
+ import org.apache.lucene.index.FieldInfo;
+@@ -98,6 +99,14 @@ public class Lucene60PointsWriter extends PointsWriter implements Closeable {
+                                           values.size(fieldInfo.name),
+                                           singleValuePerDoc)) {
+ 
++      if (values instanceof MutablePointsReader) {
++        final long fp = writer.writeField(dataOut, fieldInfo.name, (MutablePointsReader) values);
++        if (fp != -1) {
++          indexFPs.put(fieldInfo.name, fp);
++        }
++        return;
++      }
++
+       values.intersect(fieldInfo.name, new IntersectVisitor() {
+           @Override
+           public void visit(int docID) {
+diff --git a/lucene/core/src/java/org/apache/lucene/index/PointValuesWriter.java b/lucene/core/src/java/org/apache/lucene/index/PointValuesWriter.java
+index 511635c..b4decb6 100644
+--- a/lucene/core/src/java/org/apache/lucene/index/PointValuesWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/index/PointValuesWriter.java
+@@ -18,6 +18,7 @@ package org.apache.lucene.index;
+ 
+ import java.io.IOException;
+ 
++import org.apache.lucene.codecs.MutablePointsReader;
+ import org.apache.lucene.codecs.PointsReader;
+ import org.apache.lucene.codecs.PointsWriter;
+ import org.apache.lucene.util.ArrayUtil;
+@@ -35,7 +36,7 @@ class PointValuesWriter {
+   private int numPoints;
+   private int numDocs;
+   private int lastDocID = -1;
+-  private final byte[] packedValue;
++  private final int packedBytesLength;
+   private final LiveIndexWriterConfig indexWriterConfig;
+ 
+   public PointValuesWriter(DocumentsWriterPerThread docWriter, FieldInfo fieldInfo) {
+@@ -44,7 +45,7 @@ class PointValuesWriter {
+     this.bytes = new ByteBlockPool(docWriter.byteBlockAllocator);
+     docIDs = new int[16];
+     iwBytesUsed.addAndGet(16 * Integer.BYTES);
+-    packedValue = new byte[fieldInfo.getPointDimensionCount() * fieldInfo.getPointNumBytes()];
++    packedBytesLength = fieldInfo.getPointDimensionCount() * fieldInfo.getPointNumBytes();
+     indexWriterConfig = docWriter.indexWriterConfig;
+   }
+ 
+@@ -70,64 +71,102 @@ class PointValuesWriter {
+   }
+ 
+   public void flush(SegmentWriteState state, PointsWriter writer) throws IOException {
+-
+-    writer.writeField(fieldInfo,
+-                      new PointsReader() {
+-                        @Override
+-                        public void intersect(String fieldName, IntersectVisitor visitor) throws IOException {
+-                          if (fieldName.equals(fieldInfo.name) == false) {
+-                            throw new IllegalArgumentException("fieldName must be the same");
+-                          }
+-                          for(int i=0;i<numPoints;i++) {
+-                            bytes.readBytes(packedValue.length * i, packedValue, 0, packedValue.length);
+-                            visitor.visit(docIDs[i], packedValue);
+-                          }
+-                        }
+-
+-                        @Override
+-                        public void checkIntegrity() {
+-                          throw new UnsupportedOperationException();
+-                        }
+-
+-                        @Override
+-                        public long ramBytesUsed() {
+-                          return 0L;
+-                        }
+-
+-                        @Override
+-                        public void close() {
+-                        }
+-
+-                        @Override
+-                        public byte[] getMinPackedValue(String fieldName) {
+-                          throw new UnsupportedOperationException();
+-                        }
+-
+-                        @Override
+-                        public byte[] getMaxPackedValue(String fieldName) {
+-                          throw new UnsupportedOperationException();
+-                        }
+-
+-                        @Override
+-                        public int getNumDimensions(String fieldName) {
+-                          throw new UnsupportedOperationException();
+-                        }
+-
+-                        @Override
+-                        public int getBytesPerDimension(String fieldName) {
+-                          throw new UnsupportedOperationException();
+-                        }
+-
+-                        @Override
+-                        public long size(String fieldName) {
+-                          return numPoints;
+-                        }
+-
+-                        @Override
+-                        public int getDocCount(String fieldName) {
+-                          return numDocs;
+-                        }
+-                      },
+-                      Math.max(indexWriterConfig.getRAMBufferSizeMB()/8.0, BKDWriter.DEFAULT_MAX_MB_SORT_IN_HEAP));
++    PointsReader reader = new MutablePointsReader() {
++
++      final int[] ords = new int[numPoints];
++      {
++        for (int i = 0; i < numPoints; ++i) {
++          ords[i] = i;
++        }
++      }
++
++      @Override
++      public void intersect(String fieldName, IntersectVisitor visitor) throws IOException {
++        if (fieldName.equals(fieldInfo.name) == false) {
++          throw new IllegalArgumentException("fieldName must be the same");
++        }
++        final byte[] packedValue = new byte[packedBytesLength];
++        for(int i=0;i<numPoints;i++) {
++          getValue(i, packedValue);
++          visitor.visit(getDocID(i), packedValue);
++        }
++      }
++
++      @Override
++      public void checkIntegrity() {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public long ramBytesUsed() {
++        return 0L;
++      }
++
++      @Override
++      public void close() {
++      }
++
++      @Override
++      public byte[] getMinPackedValue(String fieldName) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public byte[] getMaxPackedValue(String fieldName) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public int getNumDimensions(String fieldName) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public int getBytesPerDimension(String fieldName) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public long size(String fieldName) {
++        if (fieldName.equals(fieldInfo.name) == false) {
++          throw new IllegalArgumentException("fieldName must be the same");
++        }
++        return numPoints;
++      }
++
++      @Override
++      public int getDocCount(String fieldName) {
++        if (fieldName.equals(fieldInfo.name) == false) {
++          throw new IllegalArgumentException("fieldName must be the same");
++        }
++        return numDocs;
++      }
++
++      @Override
++      public void swap(int i, int j) {
++        int tmp = ords[i];
++        ords[i] = ords[j];
++        ords[j] = tmp;
++      }
++
++      @Override
++      public int getDocID(int i) {
++        return docIDs[ords[i]];
++      }
++
++      @Override
++      public void getValue(int i, byte[] packedValue) {
++        final long offset = (long) packedBytesLength * ords[i];
++        bytes.readBytes(offset, packedValue, 0, packedBytesLength);
++      }
++
++      @Override
++      public byte getByteAt(int i, int k) {
++        final long offset = (long) packedBytesLength * ords[i] + k;
++        return bytes.readByte(offset);
++      }
++    };
++
++    writer.writeField(fieldInfo, reader, Math.max(indexWriterConfig.getRAMBufferSizeMB()/8.0, BKDWriter.DEFAULT_MAX_MB_SORT_IN_HEAP));
+   }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/ArrayUtil.java b/lucene/core/src/java/org/apache/lucene/util/ArrayUtil.java
+index 0e10450..3bc65ef 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/ArrayUtil.java
++++ b/lucene/core/src/java/org/apache/lucene/util/ArrayUtil.java
+@@ -459,69 +459,26 @@ public final class ArrayUtil {
+    *  greater than or equal to it.
+    *  This runs in linear time on average and in {@code n log(n)} time in the
+    *  worst case.*/
+-  public static <T> void select(T[] arr, int from, int to, int k, Comparator<T> comparator) {
+-    if (k < from) {
+-      throw new IllegalArgumentException("k must be >= from");
+-    }
+-    if (k >= to) {
+-      throw new IllegalArgumentException("k must be < to");
+-    }
+-    final int maxDepth = 2 * MathUtil.log(to - from, 2);
+-    quickSelect(arr, from, to, k, comparator, maxDepth);
+-  }
+-
+-  private static <T> void quickSelect(T[] arr, int from, int to, int k, Comparator<T> comparator, int maxDepth) {
+-    assert from <= k;
+-    assert k < to;
+-    if (to - from == 1) {
+-      return;
+-    }
+-    if (--maxDepth < 0) {
+-      Arrays.sort(arr, from, to, comparator);
+-      return;
+-    }
+-
+-    final int mid = (from + to) >>> 1;
+-    // heuristic: we use the median of the values at from, to-1 and mid as a pivot
+-    if (comparator.compare(arr[from], arr[to - 1]) > 0) {
+-      swap(arr, from, to - 1);
+-    }
+-    if (comparator.compare(arr[to - 1], arr[mid]) > 0) {
+-      swap(arr, to - 1, mid);
+-      if (comparator.compare(arr[from], arr[to - 1]) > 0) {
+-        swap(arr, from, to - 1);
+-      }
+-    }
++  public static <T> void select(T[] arr, int from, int to, int k, Comparator<? super T> comparator) {
++    new IntroSelector() {
+ 
+-    T pivot = arr[to - 1];
++      T pivot;
+ 
+-    int left = from + 1;
+-    int right = to - 2;
+-
+-    for (;;) {
+-      while (comparator.compare(pivot, arr[left]) > 0) {
+-        ++left;
++      @Override
++      protected void swap(int i, int j) {
++        ArrayUtil.swap(arr, i, j);
+       }
+ 
+-      while (left < right && comparator.compare(pivot, arr[right]) <= 0) {
+-        --right;
++      @Override
++      protected void setPivot(int i) {
++        pivot = arr[i];
+       }
+ 
+-      if (left < right) {
+-        swap(arr, left, right);
+-        --right;
+-      } else {
+-        break;
++      @Override
++      protected int comparePivot(int j) {
++        return comparator.compare(pivot, arr[j]);
+       }
+-    }
+-    swap(arr, left, to - 1);
+-
+-    if (left == k) {
+-      return;
+-    } else if (left < k) {
+-      quickSelect(arr, left + 1, to, k, comparator, maxDepth);
+-    } else {
+-      quickSelect(arr, from, left, k, comparator, maxDepth);
+-    }
++    }.select(from, to, k);
+   }
++
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java b/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java
+index 6bb12bd..e202d63 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java
++++ b/lucene/core/src/java/org/apache/lucene/util/ByteBlockPool.java
+@@ -378,5 +378,13 @@ public final class ByteBlockPool {
+       }
+     } while (true);
+   }
++
++  /** Read a single byte at the given {@code offset}. */
++  public byte readByte(long offset) {
++    int bufferIndex = (int) (offset >> BYTE_BLOCK_SHIFT);
++    int pos = (int) (offset & BYTE_BLOCK_MASK);
++    byte[] buffer = buffers[bufferIndex];
++    return buffer[pos];
++  }
+ }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/IntroSelector.java b/lucene/core/src/java/org/apache/lucene/util/IntroSelector.java
+new file mode 100644
+index 0000000..7898535
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/IntroSelector.java
+@@ -0,0 +1,126 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++import java.util.Comparator;
++
++/** Implementation of the quick select algorithm.
++ *  <p>It uses the median of the first, middle and last values as a pivot and
++ *  falls back to a heap sort when the number of recursion levels exceeds
++ *  {@code 2 lg(n)}, as a consequence it runs in linear time on average and in
++ *  {@code n log(n)} time in the worst case.</p>
++ *  @lucene.internal */
++public abstract class IntroSelector extends Selector {
++
++  @Override
++  public final void select(int from, int to, int k) {
++    checkArgs(from, to, k);
++    final int maxDepth = 2 * MathUtil.log(to - from, 2);
++    quickSelect(from, to, k, maxDepth);
++  }
++
++  // heap sort
++  void slowSelect(int from, int to, int k) {
++    new Sorter() {
++
++      @Override
++      protected void swap(int i, int j) {
++        IntroSelector.this.swap(i, j);
++      }
++
++      @Override
++      protected int compare(int i, int j) {
++        return IntroSelector.this.compare(i, j);
++      }
++
++      public void sort(int from, int to) {
++        heapSort(from, to);
++      }
++    }.sort(from, to);
++  }
++
++  private void quickSelect(int from, int to, int k, int maxDepth) {
++    assert from <= k;
++    assert k < to;
++    if (to - from == 1) {
++      return;
++    }
++    if (--maxDepth < 0) {
++      slowSelect(from, to, k);
++      return;
++    }
++
++    final int mid = (from + to) >>> 1;
++    // heuristic: we use the median of the values at from, to-1 and mid as a pivot
++    if (compare(from, to - 1) > 0) {
++      swap(from, to - 1);
++    }
++    if (compare(to - 1, mid) > 0) {
++      swap(to - 1, mid);
++      if (compare(from, to - 1) > 0) {
++        swap(from, to - 1);
++      }
++    }
++
++    setPivot(to - 1);
++
++    int left = from + 1;
++    int right = to - 2;
++
++    for (;;) {
++      while (comparePivot(left) > 0) {
++        ++left;
++      }
++
++      while (left < right && comparePivot(right) <= 0) {
++        --right;
++      }
++
++      if (left < right) {
++        swap(left, right);
++        --right;
++      } else {
++        break;
++      }
++    }
++    swap(left, to - 1);
++
++    if (left == k) {
++      return;
++    } else if (left < k) {
++      quickSelect(left + 1, to, k, maxDepth);
++    } else {
++      quickSelect(from, left, k, maxDepth);
++    }
++  }
++
++  /** Compare entries found in slots <code>i</code> and <code>j</code>.
++   *  The contract for the returned value is the same as
++   *  {@link Comparator#compare(Object, Object)}. */
++  protected int compare(int i, int j) {
++    setPivot(i);
++    return comparePivot(j);
++  }
++
++  /** Save the value at slot <code>i</code> so that it can later be used as a
++   * pivot, see {@link #comparePivot(int)}. */
++  protected abstract void setPivot(int i);
++
++  /** Compare the pivot with the slot at <code>j</code>, similarly to
++   *  {@link #compare(int, int) compare(i, j)}. */
++  protected abstract int comparePivot(int j);
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/IntroSorter.java b/lucene/core/src/java/org/apache/lucene/util/IntroSorter.java
+index 26f7e37..83d118d 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/IntroSorter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/IntroSorter.java
+@@ -16,7 +16,6 @@
+  */
+ package org.apache.lucene.util;
+ 
+-
+ /**
+  * {@link Sorter} implementation based on a variant of the quicksort algorithm
+  * called <a href="http://en.wikipedia.org/wiki/Introsort">introsort</a>: when
+@@ -91,4 +90,10 @@ public abstract class IntroSorter extends Sorter {
+   /** Compare the pivot with the slot at <code>j</code>, similarly to
+    *  {@link #compare(int, int) compare(i, j)}. */
+   protected abstract int comparePivot(int j);
++
++  @Override
++  protected int compare(int i, int j) {
++    setPivot(i);
++    return comparePivot(j);
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/util/RadixSelector.java b/lucene/core/src/java/org/apache/lucene/util/RadixSelector.java
+new file mode 100644
+index 0000000..543204a
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/RadixSelector.java
+@@ -0,0 +1,202 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++import java.util.Arrays;
++
++/** Radix selector.
++ *  <p>This implementation works similarly to a MSB radix sort except that it
++ *  only recurses into the sub partition that contains the desired value.
++ *  @lucene.internal */
++public abstract class RadixSelector extends Selector {
++
++  // after that many levels of recursion we fall back to introselect anyway
++  // this is used as a protection against the fact that radix sort performs
++  // worse when there are long common prefixes (probably because of cache
++  // locality)
++  private static final int LEVEL_THRESHOLD = 8;
++  // size of histograms: 256 + 1 to indicate that the string is finished
++  private static final int HISTOGRAM_SIZE = 257;
++  // buckets below this size will be sorted with introselect
++  private static final int LENGTH_THRESHOLD = 100;
++
++  // we store one histogram per recursion level
++  private final int[] histogram = new int[HISTOGRAM_SIZE];
++
++  private final int maxLength;
++
++  /**
++   * Sole constructor.
++   * @param maxLength the maximum length of keys, pass {@link Integer#MAX_VALUE} if unknown.
++   */
++  protected RadixSelector(int maxLength) {
++    this.maxLength = maxLength;
++  }
++
++  /** Return the k-th byte of the entry at index {@code i}, or {@code -1} if
++   * its length is less than or equal to {@code k}. This may only be called
++   * with a value of {@code i} between {@code 0} included and
++   * {@code maxLength} excluded. */
++  protected abstract int byteAt(int i, int k);
++
++  /** Get a fall-back selector which may assume that the first {@code d} bytes
++   *  of all compared strings are equal. This fallback selector is used when
++   *  the range becomes narrow or when the maximum level of recursion has
++   *  been exceeded. */
++  protected Selector getFallbackSelector(int d) {
++    return new IntroSelector() {
++      @Override
++      protected void swap(int i, int j) {
++        RadixSelector.this.swap(i, j);
++      }
++
++      @Override
++      protected int compare(int i, int j) {
++        for (int o = d; o < maxLength; ++o) {
++          final int b1 = byteAt(i, o);
++          final int b2 = byteAt(j, o);
++          if (b1 != b2) {
++            return b1 - b2;
++          } else if (b1 == -1) {
++            break;
++          }
++        }
++        return 0;
++      }
++
++      @Override
++      protected void setPivot(int i) {
++        pivot.setLength(0);
++        for (int o = d; o < maxLength; ++o) {
++          final int b = byteAt(i, o);
++          if (b == -1) {
++            break;
++          }
++          pivot.append((byte) b);
++        }
++      }
++
++      @Override
++      protected int comparePivot(int j) {
++        for (int o = 0; o < pivot.length(); ++o) {
++          final int b1 = pivot.byteAt(o) & 0xff;
++          final int b2 = byteAt(j, d + o);
++          if (b1 != b2) {
++            return b1 - b2;
++          }
++        }
++        if (d + pivot.length() == maxLength) {
++          return 0;
++        }
++        return -1 - byteAt(j, d + pivot.length());
++      }
++
++      private final BytesRefBuilder pivot = new BytesRefBuilder();
++    };
++  }
++
++  @Override
++  public void select(int from, int to, int k) {
++    checkArgs(from, to, k);
++    select(from, to, k, 0);
++  }
++
++  private void select(int from, int to, int k, int d) {
++    if (to - from <= LENGTH_THRESHOLD || d >= LEVEL_THRESHOLD) {
++      getFallbackSelector(d).select(from, to, k);
++    } else {
++      radixSelect(from, to, k, d);
++    }
++  }
++
++  private void radixSelect(int from, int to, int k, int d) {
++    final int[] histogram = this.histogram;
++    Arrays.fill(histogram, 0);
++
++    buildHistogram(from, to, d, histogram);
++
++    int bucketFrom = from;
++    for (int bucket = 0; bucket < HISTOGRAM_SIZE; ++bucket) {
++      final int bucketTo = bucketFrom + histogram[bucket];
++
++      if (bucketTo > k) {
++        partition(from, to, bucket, bucketFrom, bucketTo, d);
++
++        if (bucket != 0 && d + 1 < maxLength) {
++          // all elements in bucket 0 are equal so we only need to recurse if bucket != 0
++          select(bucketFrom, bucketTo, k, d + 1);
++        }
++        return;
++      }
++      bucketFrom = bucketTo;
++    }
++    throw new AssertionError("Unreachable code");
++  }
++
++  /** Return a number for the k-th character between 0 and {@link #HISTOGRAM_SIZE}. */
++  private int getBucket(int i, int k) {
++    return byteAt(i, k) + 1;
++  }
++
++  /** Build a histogram of the number of values per {@link #getBucket(int, int) bucket}. */
++  private int[] buildHistogram(int from, int to, int k, int[] histogram) {
++    for (int i = from; i < to; ++i) {
++      histogram[getBucket(i, k)]++;
++    }
++    return histogram;
++  }
++
++  /** Reorder elements so that all of them that fall into {@code bucket} are
++   *  between offsets {@code bucketFrom} and {@code bucketTo}. */
++  private void partition(int from, int to, int bucket, int bucketFrom, int bucketTo, int d) {
++    int left = from;
++    int right = to - 1;
++
++    int slot = bucketFrom;
++
++    for (;;) {
++      int leftBucket = getBucket(left, d);
++      int rightBucket = getBucket(right, d);
++
++      while (leftBucket <= bucket && left < bucketFrom) {
++        if (leftBucket == bucket) {
++          swap(left, slot++);
++        } else {
++          ++left;
++        }
++        leftBucket = getBucket(left, d);
++      }
++
++      while (rightBucket >= bucket && right >= bucketTo) {
++        if (rightBucket == bucket) {
++          swap(right, slot++);
++        } else {
++          --right;
++        }
++        rightBucket = getBucket(right, d);
++      }
++
++      if (left < bucketFrom && right >= bucketTo) {
++        swap(left++, right--);
++      } else {
++        assert left == bucketFrom;
++        assert right == bucketTo - 1;
++        break;
++      }
++    }
++  }
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/Selector.java b/lucene/core/src/java/org/apache/lucene/util/Selector.java
+new file mode 100644
+index 0000000..8c17ce4
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/Selector.java
+@@ -0,0 +1,41 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++/** An implementation of a selection algorithm, ie. computing the k-th greatest
++ *  value from a collection. */
++public abstract class Selector {
++
++  /** Reorder elements so that the element at position {@code k} is the same
++   *  as if all elements were sorted and all other elements are partitioned
++   *  around it: {@code [from, k)} only contains elements that are less than
++   *  or equal to {@code k} and {@code (k, to)} only contains elements that
++   *  are greater than or equal to {@code k}. */
++  public abstract void select(int from, int to, int k);
++
++  void checkArgs(int from, int to, int k) {
++    if (k < from) {
++      throw new IllegalArgumentException("k must be >= from");
++    }
++    if (k >= to) {
++      throw new IllegalArgumentException("k must be < to");
++    }
++  }
++
++  /** Swap values at slots <code>i</code> and <code>j</code>. */
++  protected abstract void swap(int i, int j);
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
+index 97651e4..d0d7dca 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
++++ b/lucene/core/src/java/org/apache/lucene/util/bkd/BKDWriter.java
+@@ -25,6 +25,7 @@ import java.util.List;
+ import java.util.function.IntFunction;
+ 
+ import org.apache.lucene.codecs.CodecUtil;
++import org.apache.lucene.codecs.MutablePointsReader;
+ import org.apache.lucene.index.MergeState;
+ import org.apache.lucene.index.PointValues.IntersectVisitor;
+ import org.apache.lucene.index.PointValues.Relation;
+@@ -67,7 +68,7 @@ import org.apache.lucene.util.StringHelper;
+  *  <p>
+  *  See <a href="https://www.cs.duke.edu/~pankaj/publications/papers/bkd-sstd.pdf">this paper</a> for details.
+  *
+- *  <p>This consumes heap during writing: it allocates a <code>LongBitSet(numPoints)</code>, 
++ *  <p>This consumes heap during writing: it allocates a <code>LongBitSet(numPoints)</code>,
+  *  and then uses up to the specified {@code maxMBSortInHeap} heap space for writing.
+  *
+  *  <p>
+@@ -140,10 +141,10 @@ public class BKDWriter implements Closeable {
+   /** True if every document has at most one value.  We specialize this case by not bothering to store the ord since it's redundant with docID.  */
+   protected final boolean singleValuePerDoc;
+ 
+-  /** How much heap OfflineSorter is allowed to use */ 
++  /** How much heap OfflineSorter is allowed to use */
+   protected final OfflineSorter.BufferSize offlineSorterBufferMB;
+ 
+-  /** How much heap OfflineSorter is allowed to use */ 
++  /** How much heap OfflineSorter is allowed to use */
+   protected final int offlineSorterMaxTempFiles;
+ 
+   private final int maxDoc;
+@@ -381,7 +382,7 @@ public class BKDWriter implements Closeable {
+         } else {
+           mappedDocID = docMap.get(oldDocID);
+         }
+-        
++
+         if (mappedDocID != -1) {
+           // Not deleted!
+           docID = mappedDocID;
+@@ -416,15 +417,25 @@ public class BKDWriter implements Closeable {
+     }
+   }
+ 
+-  /** More efficient bulk-add for incoming {@link BKDReader}s.  This does a merge sort of the already
+-   *  sorted values and currently only works when numDims==1.  This returns -1 if all documents containing
+-   *  dimensional values were deleted. */
+-  public long merge(IndexOutput out, List<MergeState.DocMap> docMaps, List<BKDReader> readers) throws IOException {
+-    if (numDims != 1) {
+-      throw new UnsupportedOperationException("numDims must be 1 but got " + numDims);
++  /** Write a field from a {@link MutablePointsReader}. This way of writing
++   *  points is faster than regular writes with {@link BKDWriter#add} since
++   *  there is opportunity for reordering points before writing them to
++   *  disk. This method does not use transient disk in order to reorder points.
++   */
++  public long writeField(IndexOutput out, String fieldName, MutablePointsReader reader) throws IOException {
++    if (numDims == 1) {
++      return writeField1Dim(out, fieldName, reader);
++    } else {
++      return writeFieldNDims(out, fieldName, reader);
+     }
++  }
++
++
++  /* In the 2+D case, we recursively pick the split dimension, compute the
++   * median value and partition other values around it. */
++  private long writeFieldNDims(IndexOutput out, String fieldName, MutablePointsReader reader) throws IOException {
+     if (pointCount != 0) {
+-      throw new IllegalStateException("cannot mix add and merge");
++      throw new IllegalStateException("cannot mix add and writeField");
+     }
+ 
+     // Catch user silliness:
+@@ -435,6 +446,81 @@ public class BKDWriter implements Closeable {
+     // Mark that we already finished:
+     heapPointWriter = null;
+ 
++    long countPerLeaf = pointCount = reader.size(fieldName);
++    long innerNodeCount = 1;
++
++    while (countPerLeaf > maxPointsInLeafNode) {
++      countPerLeaf = (countPerLeaf+1)/2;
++      innerNodeCount *= 2;
++    }
++
++    int numLeaves = Math.toIntExact(innerNodeCount);
++
++    checkMaxLeafNodeCount(numLeaves);
++
++    final byte[] splitPackedValues = new byte[numLeaves * (bytesPerDim + 1)];
++    final long[] leafBlockFPs = new long[numLeaves];
++
++    // compute the min/max for this slice
++    Arrays.fill(minPackedValue, (byte) 0xff);
++    Arrays.fill(maxPackedValue, (byte) 0);
++    for (int i = 0; i < Math.toIntExact(pointCount); ++i) {
++      reader.getValue(i, scratch1);
++      for(int dim=0;dim<numDims;dim++) {
++        int offset = dim*bytesPerDim;
++        if (StringHelper.compare(bytesPerDim, scratch1, offset, minPackedValue, offset) < 0) {
++          System.arraycopy(scratch1, offset, minPackedValue, offset, bytesPerDim);
++        }
++        if (StringHelper.compare(bytesPerDim, scratch1, offset, maxPackedValue, offset) > 0) {
++          System.arraycopy(scratch1, offset, maxPackedValue, offset, bytesPerDim);
++        }
++      }
++
++      docsSeen.set(reader.getDocID(i));
++    }
++
++    build(1, numLeaves, reader, 0, Math.toIntExact(pointCount), out,
++        minPackedValue, maxPackedValue, splitPackedValues, leafBlockFPs,
++        new int[maxPointsInLeafNode]);
++
++    long indexFP = out.getFilePointer();
++    writeIndex(out, leafBlockFPs, splitPackedValues);
++    return indexFP;
++  }
++
++
++  /* In the 1D case, we can simply sort points in ascending order and use the
++   * same writing logic as we use at merge time. */
++  private long writeField1Dim(IndexOutput out, String fieldName, MutablePointsReader reader) throws IOException {
++    MutablePointsReaderUtils.sort(maxDoc, packedBytesLength, reader, 0, Math.toIntExact(reader.size(fieldName)));
++
++    final OneDimensionBKDWriter oneDimWriter = new OneDimensionBKDWriter(out);
++
++    reader.intersect(fieldName, new IntersectVisitor() {
++
++      @Override
++      public void visit(int docID, byte[] packedValue) throws IOException {
++        oneDimWriter.add(packedValue, docID);
++      }
++
++      @Override
++      public void visit(int docID) throws IOException {
++        throw new IllegalStateException();
++      }
++
++      @Override
++      public Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
++        return Relation.CELL_CROSSES_QUERY;
++      }
++    });
++
++    return oneDimWriter.finish();
++  }
++
++  /** More efficient bulk-add for incoming {@link BKDReader}s.  This does a merge sort of the already
++   *  sorted values and currently only works when numDims==1.  This returns -1 if all documents containing
++   *  dimensional values were deleted. */
++  public long merge(IndexOutput out, List<MergeState.DocMap> docMaps, List<BKDReader> readers) throws IOException {
+     assert docMaps == null || readers.size() == docMaps.size();
+ 
+     BKDMergeQueue queue = new BKDMergeQueue(bytesPerDim, readers.size());
+@@ -453,126 +539,166 @@ public class BKDWriter implements Closeable {
+       }
+     }
+ 
+-    if (queue.size() == 0) {
+-      return -1;
++    OneDimensionBKDWriter oneDimWriter = new OneDimensionBKDWriter(out);
++
++    while (queue.size() != 0) {
++      MergeReader reader = queue.top();
++      // System.out.println("iter reader=" + reader);
++
++      // NOTE: doesn't work with subclasses (e.g. SimpleText!)
++      oneDimWriter.add(reader.state.scratchPackedValue, reader.docID);
++
++      if (reader.next()) {
++        queue.updateTop();
++      } else {
++        // This segment was exhausted
++        queue.pop();
++      }
+     }
+ 
+-    int leafCount = 0;
+-    List<Long> leafBlockFPs = new ArrayList<>();
+-    List<byte[]> leafBlockStartValues = new ArrayList<>();
++    return oneDimWriter.finish();
++  }
++
++  private class OneDimensionBKDWriter {
++
++    final IndexOutput out;
++    final int pointsPerLeafBlock = (int) (0.75 * maxPointsInLeafNode);
++    final List<Long> leafBlockFPs = new ArrayList<>();
++    final List<byte[]> leafBlockStartValues = new ArrayList<>();
++    final byte[] leafValues = new byte[pointsPerLeafBlock * packedBytesLength];
++    final int[] leafDocs = new int[pointsPerLeafBlock];
++    long valueCount;
++    int leafCount;
++
++    OneDimensionBKDWriter(IndexOutput out) {
++      if (numDims != 1) {
++        throw new UnsupportedOperationException("numDims must be 1 but got " + numDims);
++      }
++      if (pointCount != 0) {
++        throw new IllegalStateException("cannot mix add and merge");
++      }
++
++      // Catch user silliness:
++      if (heapPointWriter == null && tempInput == null) {
++        throw new IllegalStateException("already finished");
++      }
+ 
+-    // Target halfway between min and max allowed for the leaf:
+-    int pointsPerLeafBlock = (int) (0.75 * maxPointsInLeafNode);
+-    //System.out.println("POINTS PER: " + pointsPerLeafBlock);
++      // Mark that we already finished:
++      heapPointWriter = null;
+ 
+-    byte[] lastPackedValue = new byte[bytesPerDim];
+-    byte[] firstPackedValue = new byte[bytesPerDim];
+-    long valueCount = 0;
++      this.out = out;
+ 
+-    // Buffer up each leaf block's docs and values
+-    int[] leafBlockDocIDs = new int[maxPointsInLeafNode];
+-    byte[][] leafBlockPackedValues = new byte[maxPointsInLeafNode][];
+-    for(int i=0;i<maxPointsInLeafNode;i++) {
+-      leafBlockPackedValues[i] = new byte[packedBytesLength];
++      lastPackedValue = new byte[packedBytesLength];
+     }
+-    Arrays.fill(commonPrefixLengths, bytesPerDim);
+ 
+-    while (queue.size() != 0) {
+-      MergeReader reader = queue.top();
+-      // System.out.println("iter reader=" + reader);
++    // for asserts
++    final byte[] lastPackedValue;
++    int lastDocID;
+ 
+-      // NOTE: doesn't work with subclasses (e.g. SimpleText!)
+-      int docID = reader.docID;
+-      leafBlockDocIDs[leafCount] = docID;
+-      System.arraycopy(reader.state.scratchPackedValue, 0, leafBlockPackedValues[leafCount], 0, packedBytesLength);
+-      docsSeen.set(docID);
++    void add(byte[] packedValue, int docID) throws IOException {
++      assert valueInOrder(valueCount + leafCount,
++          0, lastPackedValue, packedValue, 0, docID, lastDocID);
+ 
+-      if (valueCount == 0) {
+-        System.arraycopy(reader.state.scratchPackedValue, 0, minPackedValue, 0, packedBytesLength);
+-      }
+-      System.arraycopy(reader.state.scratchPackedValue, 0, maxPackedValue, 0, packedBytesLength);
++      System.arraycopy(packedValue, 0, leafValues, leafCount * packedBytesLength, packedBytesLength);
++      leafDocs[leafCount] = docID;
++      docsSeen.set(docID);
++      leafCount++;
+ 
+-      assert numDims > 1 || valueInOrder(valueCount, lastPackedValue, reader.state.scratchPackedValue, 0);
+-      valueCount++;
+-      if (pointCount > totalPointCount) {
++      if (valueCount > totalPointCount) {
+         throw new IllegalStateException("totalPointCount=" + totalPointCount + " was passed when we were created, but we just hit " + pointCount + " values");
+       }
+ 
+-      if (leafCount == 0) {
+-        if (leafBlockFPs.size() > 0) {
+-          // Save the first (minimum) value in each leaf block except the first, to build the split value index in the end:
+-          leafBlockStartValues.add(Arrays.copyOf(reader.state.scratchPackedValue, bytesPerDim));
+-        }
+-        Arrays.fill(commonPrefixLengths, bytesPerDim);
+-        System.arraycopy(reader.state.scratchPackedValue, 0, firstPackedValue, 0, bytesPerDim);
+-      } else {
+-        // Find per-dim common prefix:
+-        for(int dim=0;dim<numDims;dim++) {
+-          int offset = dim * bytesPerDim;
+-          for(int j=0;j<commonPrefixLengths[dim];j++) {
+-            if (firstPackedValue[offset+j] != reader.state.scratchPackedValue[offset+j]) {
+-              commonPrefixLengths[dim] = j;
+-              break;
+-            }
+-          }
+-        }
++      if (leafCount == pointsPerLeafBlock) {
++        // We write a block once we hit exactly the max count ... this is different from
++        // when we flush a new segment, where we write between max/2 and max per leaf block,
++        // so merged segments will behave differently from newly flushed segments:
++        writeLeafBlock();
++        leafCount = 0;
+       }
+ 
+-      leafCount++;
++      assert (lastDocID = docID) >= 0; // only assign when asserts are enabled
++    }
+ 
+-      if (reader.next()) {
+-        queue.updateTop();
+-      } else {
+-        // This segment was exhausted
+-        queue.pop();
++    public long finish() throws IOException {
++      if (leafCount > 0) {
++        writeLeafBlock();
++        leafCount = 0;
+       }
+ 
+-      // We write a block once we hit exactly the max count ... this is different from
+-      // when we flush a new segment, where we write between max/2 and max per leaf block,
+-      // so merged segments will behave differently from newly flushed segments:
+-      if (leafCount == pointsPerLeafBlock || queue.size() == 0) {
+-        leafBlockFPs.add(out.getFilePointer());
+-        checkMaxLeafNodeCount(leafBlockFPs.size());
++      if (valueCount == 0) {
++        return -1;
++      }
+ 
+-        writeLeafBlockDocs(out, leafBlockDocIDs, 0, leafCount);
+-        writeCommonPrefixes(out, commonPrefixLengths, firstPackedValue);
++      pointCount = valueCount;
+ 
+-        final IntFunction<BytesRef> packedValues = new IntFunction<BytesRef>() {
+-          final BytesRef scratch = new BytesRef();
++      long indexFP = out.getFilePointer();
+ 
+-          {
+-            scratch.length = packedBytesLength;
+-            scratch.offset = 0;
+-          }
++      int numInnerNodes = leafBlockStartValues.size();
+ 
+-          @Override
+-          public BytesRef apply(int i) {
+-            scratch.bytes = leafBlockPackedValues[i];
+-            return scratch;
+-          }
+-        };
+-        writeLeafBlockPackedValues(out, commonPrefixLengths, leafCount, 0, packedValues);
++      //System.out.println("BKDW: now rotate numInnerNodes=" + numInnerNodes + " leafBlockStarts=" + leafBlockStartValues.size());
+ 
+-        leafCount = 0;
++      byte[] index = new byte[(1+numInnerNodes) * (1+bytesPerDim)];
++      rotateToTree(1, 0, numInnerNodes, index, leafBlockStartValues);
++      long[] arr = new long[leafBlockFPs.size()];
++      for(int i=0;i<leafBlockFPs.size();i++) {
++        arr[i] = leafBlockFPs.get(i);
+       }
++      writeIndex(out, arr, index);
++      return indexFP;
+     }
+ 
+-    pointCount = valueCount;
++    private void writeLeafBlock() throws IOException {
++      assert leafCount != 0;
++      if (valueCount == 0) {
++        System.arraycopy(leafValues, 0, minPackedValue, 0, packedBytesLength);
++      }
++      System.arraycopy(leafValues, (leafCount - 1) * packedBytesLength, maxPackedValue, 0, packedBytesLength);
++
++      valueCount += leafCount;
+ 
+-    long indexFP = out.getFilePointer();
++      if (leafBlockFPs.size() > 0) {
++        // Save the first (minimum) value in each leaf block except the first, to build the split value index in the end:
++        leafBlockStartValues.add(Arrays.copyOf(leafValues, packedBytesLength));
++      }
++      leafBlockFPs.add(out.getFilePointer());
++      checkMaxLeafNodeCount(leafBlockFPs.size());
++
++      Arrays.fill(commonPrefixLengths, bytesPerDim);
++      // Find per-dim common prefix:
++      for(int dim=0;dim<numDims;dim++) {
++        int offset1 = dim * bytesPerDim;
++        int offset2 = (leafCount - 1) * packedBytesLength + offset1;
++        for(int j=0;j<commonPrefixLengths[dim];j++) {
++          if (leafValues[offset1+j] != leafValues[offset2+j]) {
++            commonPrefixLengths[dim] = j;
++            break;
++          }
++        }
++      }
++
++      writeLeafBlockDocs(out, leafDocs, 0, leafCount);
++      writeCommonPrefixes(out, commonPrefixLengths, leafValues);
+ 
+-    int numInnerNodes = leafBlockStartValues.size();
++      final IntFunction<BytesRef> packedValues = new IntFunction<BytesRef>() {
++        final BytesRef scratch = new BytesRef();
+ 
+-    //System.out.println("BKDW: now rotate numInnerNodes=" + numInnerNodes + " leafBlockStarts=" + leafBlockStartValues.size());
++        {
++          scratch.length = packedBytesLength;
++          scratch.bytes = leafValues;
++        }
+ 
+-    byte[] index = new byte[(1+numInnerNodes) * (1+bytesPerDim)];
+-    rotateToTree(1, 0, numInnerNodes, index, leafBlockStartValues);
+-    long[] arr = new long[leafBlockFPs.size()];
+-    for(int i=0;i<leafBlockFPs.size();i++) {
+-      arr[i] = leafBlockFPs.get(i);
++        @Override
++        public BytesRef apply(int i) {
++          scratch.offset = packedBytesLength * i;
++          return scratch;
++        }
++      };
++      assert valuesInOrderAndBounds(leafCount, 0, Arrays.copyOf(leafValues, packedBytesLength),
++          Arrays.copyOfRange(leafValues, (leafCount - 1) * packedBytesLength, leafCount * packedBytesLength),
++          packedValues, leafDocs, 0);
++      writeLeafBlockPackedValues(out, commonPrefixLengths, leafCount, 0, packedValues);
+     }
+-    writeIndex(out, arr, index);
+-    return indexFP;
++
+   }
+ 
+   // TODO: there must be a simpler way?
+@@ -937,7 +1063,7 @@ public class BKDWriter implements Closeable {
+       int compressedByteOffset = sortedDim * bytesPerDim + commonPrefixLengths[sortedDim];
+       commonPrefixLengths[sortedDim]++;
+       for (int i = 0; i < count; ) {
+-        // do run-length compression on the byte at compressedByteOffset 
++        // do run-length compression on the byte at compressedByteOffset
+         int runLen = runLen(packedValues, i, Math.min(i + 0xff, count), compressedByteOffset);
+         assert runLen <= 0xff;
+         BytesRef first = packedValues.apply(i);
+@@ -1016,7 +1142,7 @@ public class BKDWriter implements Closeable {
+     }
+   }
+ 
+-  /** Called on exception, to check whether the checksum is also corrupt in this source, and add that 
++  /** Called on exception, to check whether the checksum is also corrupt in this source, and add that
+    *  information (checksum matched or didn't) as a suppressed exception. */
+   private void verifyChecksum(Throwable priorException, PointWriter writer) throws IOException {
+     // TODO: we could improve this, to always validate checksum as we recurse, if we shared left and
+@@ -1110,6 +1236,136 @@ public class BKDWriter implements Closeable {
+     }
+   }
+ 
++  /* Recursively reorders the provided reader and writes the bkd-tree on the fly. */
++  private void build(int nodeID, int leafNodeOffset,
++      MutablePointsReader reader, int from, int to,
++      IndexOutput out,
++      byte[] minPackedValue, byte[] maxPackedValue,
++      byte[] splitPackedValues,
++      long[] leafBlockFPs,
++      int[] spareDocIds) throws IOException {
++
++    if (nodeID >= leafNodeOffset) {
++      // leaf node
++      final int count = to - from;
++      assert count <= maxPointsInLeafNode;
++
++      // Compute common prefixes
++      Arrays.fill(commonPrefixLengths, bytesPerDim);
++      reader.getValue(from, scratch1);
++      for (int i = from + 1; i < to; ++i) {
++        reader.getValue(i, scratch2);
++        for (int dim=0;dim<numDims;dim++) {
++          final int offset = dim * bytesPerDim;
++          for(int j=0;j<commonPrefixLengths[dim];j++) {
++            if (scratch1[offset+j] != scratch2[offset+j]) {
++              commonPrefixLengths[dim] = j;
++              break;
++            }
++          }
++        }
++      }
++
++      // Find the dimension that has the least number of unique bytes at commonPrefixLengths[dim]
++      FixedBitSet[] usedBytes = new FixedBitSet[numDims];
++      for (int dim = 0; dim < numDims; ++dim) {
++        if (commonPrefixLengths[dim] < bytesPerDim) {
++          usedBytes[dim] = new FixedBitSet(256);
++        }
++      }
++      for (int i = from + 1; i < to; ++i) {
++        for (int dim=0;dim<numDims;dim++) {
++          if (usedBytes[dim] != null) {
++            byte b = reader.getByteAt(i, dim * bytesPerDim + commonPrefixLengths[dim]);
++            usedBytes[dim].set(Byte.toUnsignedInt(b));
++          }
++        }
++      }
++      int sortedDim = 0;
++      int sortedDimCardinality = Integer.MAX_VALUE;
++      for (int dim = 0; dim < numDims; ++dim) {
++        if (usedBytes[dim] != null) {
++          final int cardinality = usedBytes[dim].cardinality();
++          if (cardinality < sortedDimCardinality) {
++            sortedDim = dim;
++            sortedDimCardinality = cardinality;
++          }
++        }
++      }
++
++      // sort by sortedDim
++      MutablePointsReaderUtils.sortByDim(sortedDim, bytesPerDim, commonPrefixLengths,
++          reader, from, to, scratch1, scratch2);
++
++      // Save the block file pointer:
++      leafBlockFPs[nodeID - leafNodeOffset] = out.getFilePointer();
++
++      // Write doc IDs
++      int[] docIDs = spareDocIds;
++      for (int i = from; i < to; ++i) {
++        docIDs[i - from] = reader.getDocID(i);
++      }
++      writeLeafBlockDocs(out, docIDs, 0, count);
++
++      // Write the common prefixes:
++      reader.getValue(from, scratch1);
++      writeCommonPrefixes(out, commonPrefixLengths, scratch1);
++
++      // Write the full values:
++      IntFunction<BytesRef> packedValues = new IntFunction<BytesRef>() {
++        final BytesRef scratch = new BytesRef(packedBytesLength);
++
++        {
++          scratch.offset = 0;
++          scratch.length = packedBytesLength;
++        }
++
++        @Override
++        public BytesRef apply(int i) {
++          reader.getValue(from + i, scratch.bytes);
++          return scratch;
++        }
++      };
++      assert valuesInOrderAndBounds(count, sortedDim, minPackedValue, maxPackedValue, packedValues,
++          docIDs, 0);
++      writeLeafBlockPackedValues(out, commonPrefixLengths, count, sortedDim, packedValues);
++
++    } else {
++      // inner node
++
++      // compute the split dimension and partition around it
++      final int splitDim = split(minPackedValue, maxPackedValue);
++      final int mid = (from + to + 1) >>> 1;
++
++      int commonPrefixLen = bytesPerDim;
++      for (int i = 0; i < bytesPerDim; ++i) {
++        if (minPackedValue[splitDim * bytesPerDim + i] != maxPackedValue[splitDim * bytesPerDim + i]) {
++          commonPrefixLen = i;
++          break;
++        }
++      }
++      MutablePointsReaderUtils.partition(maxDoc, splitDim, bytesPerDim, commonPrefixLen,
++          reader, from, to, mid, scratch1, scratch2);
++
++      // set the split value
++      final int address = nodeID * (1+bytesPerDim);
++      splitPackedValues[address] = (byte) splitDim;
++      reader.getValue(mid, scratch1);
++      System.arraycopy(scratch1, splitDim * bytesPerDim, splitPackedValues, address + 1, bytesPerDim);
++
++      byte[] minSplitPackedValue = Arrays.copyOf(minPackedValue, packedBytesLength);
++      byte[] maxSplitPackedValue = Arrays.copyOf(maxPackedValue, packedBytesLength);
++      System.arraycopy(scratch1, splitDim * bytesPerDim, minSplitPackedValue, splitDim * bytesPerDim, bytesPerDim);
++      System.arraycopy(scratch1, splitDim * bytesPerDim, maxSplitPackedValue, splitDim * bytesPerDim, bytesPerDim);
++
++      // recurse
++      build(nodeID * 2, leafNodeOffset, reader, from, mid, out,
++          minPackedValue, maxSplitPackedValue, splitPackedValues, leafBlockFPs, spareDocIds);
++      build(nodeID * 2 + 1, leafNodeOffset, reader, mid, to, out,
++          minSplitPackedValue, maxPackedValue, splitPackedValues, leafBlockFPs, spareDocIds);
++    }
++  }
++
+   /** The array (sized numDims) of PathSlice describe the cell we have currently recursed to. */
+   private void build(int nodeID, int leafNodeOffset,
+                      PathSlice[] slices,
+@@ -1217,7 +1473,8 @@ public class BKDWriter implements Closeable {
+           return scratch;
+         }
+       };
+-      assert valuesInOrderAndBounds(count, minPackedValue, maxPackedValue, packedValues);
++      assert valuesInOrderAndBounds(count, sortedDim, minPackedValue, maxPackedValue, packedValues,
++          heapSource.docIDs, Math.toIntExact(source.start));
+       writeLeafBlockPackedValues(out, commonPrefixLengths, count, sortedDim, packedValues);
+ 
+     } else {
+@@ -1321,12 +1578,16 @@ public class BKDWriter implements Closeable {
+   }
+ 
+   // only called from assert
+-  private boolean valuesInOrderAndBounds(int count, byte[] minPackedValue, byte[] maxPackedValue, IntFunction<BytesRef> values) throws IOException {
+-    byte[] lastPackedValue = new byte[bytesPerDim];
++  private boolean valuesInOrderAndBounds(int count, int sortedDim, byte[] minPackedValue, byte[] maxPackedValue,
++      IntFunction<BytesRef> values, int[] docs, int docsOffset) throws IOException {
++    byte[] lastPackedValue = new byte[packedBytesLength];
++    int lastDoc = -1;
+     for (int i=0;i<count;i++) {
+       BytesRef packedValue = values.apply(i);
+       assert packedValue.length == packedBytesLength;
+-      assert numDims != 1 || valueInOrder(i, lastPackedValue, packedValue.bytes, packedValue.offset);
++      assert valueInOrder(i, sortedDim, lastPackedValue, packedValue.bytes, packedValue.offset,
++          docs[docsOffset + i], lastDoc);
++      lastDoc = docs[docsOffset + i];
+ 
+       // Make sure this value does in fact fall within this leaf cell:
+       assert valueInBounds(packedValue, minPackedValue, maxPackedValue);
+@@ -1335,11 +1596,19 @@ public class BKDWriter implements Closeable {
+   }
+ 
+   // only called from assert
+-  private boolean valueInOrder(long ord, byte[] lastPackedValue, byte[] packedValue, int packedValueOffset) {
+-    if (ord > 0 && StringHelper.compare(bytesPerDim, lastPackedValue, 0, packedValue, packedValueOffset) > 0) {
+-      throw new AssertionError("values out of order: last value=" + new BytesRef(lastPackedValue) + " current value=" + new BytesRef(packedValue, packedValueOffset, packedBytesLength) + " ord=" + ord);
++  private boolean valueInOrder(long ord, int sortedDim, byte[] lastPackedValue, byte[] packedValue, int packedValueOffset,
++      int doc, int lastDoc) {
++    int dimOffset = sortedDim * bytesPerDim;
++    if (ord > 0) {
++      int cmp = StringHelper.compare(bytesPerDim, lastPackedValue, dimOffset, packedValue, packedValueOffset + dimOffset);
++      if (cmp > 0) {
++        throw new AssertionError("values out of order: last value=" + new BytesRef(lastPackedValue) + " current value=" + new BytesRef(packedValue, packedValueOffset, packedBytesLength) + " ord=" + ord);
++      }
++      if (cmp == 0 && doc < lastDoc) {
++        throw new AssertionError("docs out of order: last doc=" + lastDoc + " current doc=" + doc + " ord=" + ord);
++      }
+     }
+-    System.arraycopy(packedValue, packedValueOffset, lastPackedValue, 0, bytesPerDim);
++    System.arraycopy(packedValue, packedValueOffset, lastPackedValue, 0, packedBytesLength);
+     return true;
+   }
+ 
+diff --git a/lucene/core/src/java/org/apache/lucene/util/bkd/MutablePointsReaderUtils.java b/lucene/core/src/java/org/apache/lucene/util/bkd/MutablePointsReaderUtils.java
+new file mode 100644
+index 0000000..d499e2b
+--- /dev/null
++++ b/lucene/core/src/java/org/apache/lucene/util/bkd/MutablePointsReaderUtils.java
+@@ -0,0 +1,185 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util.bkd;
++
++import org.apache.lucene.codecs.MutablePointsReader;
++import org.apache.lucene.util.IntroSelector;
++import org.apache.lucene.util.IntroSorter;
++import org.apache.lucene.util.MSBRadixSorter;
++import org.apache.lucene.util.RadixSelector;
++import org.apache.lucene.util.Selector;
++import org.apache.lucene.util.StringHelper;
++import org.apache.lucene.util.packed.PackedInts;
++
++final class MutablePointsReaderUtils {
++
++  MutablePointsReaderUtils() {}
++
++  /** Sort the given {@link MutablePointsReader} based on its packed value then doc ID. */
++  static void sort(int maxDoc, int packedBytesLength,
++      MutablePointsReader reader, int from, int to) {
++    final int bitsPerDocId = PackedInts.bitsRequired(maxDoc - 1);
++    new MSBRadixSorter(packedBytesLength + (bitsPerDocId + 7) / 8) {
++
++      @Override
++      protected void swap(int i, int j) {
++        reader.swap(i, j);
++      }
++
++      @Override
++      protected int byteAt(int i, int k) {
++        if (k < packedBytesLength) {
++          return Byte.toUnsignedInt(reader.getByteAt(i, k));
++        } else {
++          final int shift = bitsPerDocId - ((k - packedBytesLength + 1) << 3);
++          return (reader.getDocID(i) >>> Math.max(0, shift)) & 0xff;
++        }
++      }
++
++      @Override
++      protected org.apache.lucene.util.Sorter getFallbackSorter(int k) {
++        return new IntroSorter() {
++
++          final byte[] pivot = new byte[packedBytesLength];
++          final byte[] scratch = new byte[packedBytesLength];
++          int pivotDoc;
++
++          @Override
++          protected void swap(int i, int j) {
++            reader.swap(i, j);
++          }
++
++          @Override
++          protected void setPivot(int i) {
++            reader.getValue(i, pivot);
++            pivotDoc = reader.getDocID(i);
++          }
++
++          @Override
++          protected int comparePivot(int j) {
++            if (k < packedBytesLength) {
++              reader.getValue(j, scratch);
++              int cmp = StringHelper.compare(packedBytesLength - k, pivot, k, scratch, k);
++              if (cmp != 0) {
++                return cmp;
++              }
++            }
++            return pivotDoc - reader.getDocID(j);
++          }
++        };
++      }
++
++    }.sort(from, to);
++  }
++
++  /** Sort points on the given dimension. */
++  static void sortByDim(int sortedDim, int bytesPerDim, int[] commonPrefixLengths,
++      MutablePointsReader reader, int from, int to,
++      byte[] scratch1, byte[] scratch2) {
++
++    // No need for a fancy radix sort here, this is called on the leaves only so
++    // there are not many values to sort
++    final int offset = sortedDim * bytesPerDim + commonPrefixLengths[sortedDim];
++    final int numBytesToCompare = bytesPerDim - commonPrefixLengths[sortedDim];
++    new IntroSorter() {
++
++      final byte[] pivot = scratch1;
++      int pivotDoc = -1;
++
++      @Override
++      protected void swap(int i, int j) {
++        reader.swap(i, j);
++      }
++
++      @Override
++      protected void setPivot(int i) {
++        reader.getValue(i, pivot);
++        pivotDoc = reader.getDocID(i);
++      }
++
++      @Override
++      protected int comparePivot(int j) {
++        reader.getValue(j, scratch2);
++        int cmp = StringHelper.compare(numBytesToCompare, pivot, offset, scratch2, offset);
++        if (cmp == 0) {
++          cmp = pivotDoc - reader.getDocID(j);
++        }
++        return cmp;
++      }
++    }.sort(from, to);
++  }
++
++  /** Partition points around {@code mid}. All values on the left must be less
++   *  than or equal to it and all values on the right must be greater than or
++   *  equal to it. */
++  static void partition(int maxDoc, int splitDim, int bytesPerDim, int commonPrefixLen,
++      MutablePointsReader reader, int from, int to, int mid,
++      byte[] scratch1, byte[] scratch2) {
++    final int offset = splitDim * bytesPerDim + commonPrefixLen;
++    final int cmpBytes = bytesPerDim - commonPrefixLen;
++    final int bitsPerDocId = PackedInts.bitsRequired(maxDoc - 1);
++    new RadixSelector(cmpBytes + (bitsPerDocId + 7) / 8) {
++
++      @Override
++      protected Selector getFallbackSelector(int k) {
++        return new IntroSelector() {
++
++          final byte[] pivot = scratch1;
++          int pivotDoc;
++
++          @Override
++          protected void swap(int i, int j) {
++            reader.swap(i, j);
++          }
++
++          @Override
++          protected void setPivot(int i) {
++            reader.getValue(i, pivot);
++            pivotDoc = reader.getDocID(i);
++          }
++
++          @Override
++          protected int comparePivot(int j) {
++            if (k < cmpBytes) {
++              reader.getValue(j, scratch2);
++              int cmp = StringHelper.compare(cmpBytes - k, pivot, offset + k, scratch2, offset + k);
++              if (cmp != 0) {
++                return cmp;
++              }
++            }
++            return pivotDoc - reader.getDocID(j);
++          }
++        };
++      }
++
++      @Override
++      protected void swap(int i, int j) {
++        reader.swap(i, j);
++      }
++
++      @Override
++      protected int byteAt(int i, int k) {
++        if (k < cmpBytes) {
++          return Byte.toUnsignedInt(reader.getByteAt(i, offset + k));
++        } else {
++          final int shift = bitsPerDocId - ((k - cmpBytes + 1) << 3);
++          return (reader.getDocID(i) >>> Math.max(0, shift)) & 0xff;
++        }
++      }
++    }.select(from, to, mid);
++  }
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestByteBlockPool.java b/lucene/core/src/test/org/apache/lucene/util/TestByteBlockPool.java
+index b425b76..388a789 100644
+--- a/lucene/core/src/test/org/apache/lucene/util/TestByteBlockPool.java
++++ b/lucene/core/src/test/org/apache/lucene/util/TestByteBlockPool.java
+@@ -45,7 +45,13 @@ public class TestByteBlockPool extends LuceneTestCase {
+       for (BytesRef expected : list) {
+         ref.grow(expected.length);
+         ref.setLength(expected.length);
+-        pool.readBytes(position, ref.bytes(), 0, ref.length());
++        if (random().nextBoolean()) {
++          pool.readBytes(position, ref.bytes(), 0, ref.length());
++        } else {
++          for (int i = 0; i < ref.length(); ++i) {
++            ref.setByteAt(i, pool.readByte(position + i));
++          }
++        }
+         assertEquals(expected, ref.get());
+         position += ref.length();
+       }
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestIntroSelector.java b/lucene/core/src/test/org/apache/lucene/util/TestIntroSelector.java
+new file mode 100644
+index 0000000..468b2f7
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/TestIntroSelector.java
+@@ -0,0 +1,86 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++import java.util.Arrays;
++
++public class TestIntroSelector extends LuceneTestCase {
++
++  public void testSelect() {
++    for (int iter = 0; iter < 100; ++iter) {
++      doTestSelect(false);
++    }
++  }
++
++  public void testSlowSelect() {
++    for (int iter = 0; iter < 100; ++iter) {
++      doTestSelect(true);
++    }
++  }
++
++  private void doTestSelect(boolean slow) {
++    final int from = random().nextInt(5);
++    final int to = from + TestUtil.nextInt(random(), 1, 10000);
++    final int max = random().nextBoolean() ? random().nextInt(100) : random().nextInt(100000);
++    Integer[] arr = new Integer[from + to + random().nextInt(5)];
++    for (int i = 0; i < arr.length; ++i) {
++      arr[i] = TestUtil.nextInt(random(), 0, max);
++    }
++    final int k = TestUtil.nextInt(random(), from, to - 1);
++
++    Integer[] expected = arr.clone();
++    Arrays.sort(expected, from, to);
++
++    Integer[] actual = arr.clone();
++    IntroSelector selector = new IntroSelector() {
++
++      Integer pivot;
++
++      @Override
++      protected void swap(int i, int j) {
++        ArrayUtil.swap(actual, i, j);
++      }
++
++      @Override
++      protected void setPivot(int i) {
++        pivot = actual[i];
++      }
++
++      @Override
++      protected int comparePivot(int j) {
++        return pivot.compareTo(actual[j]);
++      }
++    };
++    if (slow) {
++      selector.slowSelect(from, to, k);
++    } else {
++      selector.select(from, to, k);
++    }
++
++    assertEquals(expected[k], actual[k]);
++    for (int i = 0; i < actual.length; ++i) {
++      if (i < from || i >= to) {
++        assertSame(arr[i], actual[i]);
++      } else if (i <= k) {
++        assertTrue(actual[i].intValue() <= actual[k].intValue());
++      } else {
++        assertTrue(actual[i].intValue() >= actual[k].intValue());
++      }
++    }
++  }
++
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/util/TestRadixSelector.java b/lucene/core/src/test/org/apache/lucene/util/TestRadixSelector.java
+new file mode 100644
+index 0000000..e0d6bf9
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/TestRadixSelector.java
+@@ -0,0 +1,77 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util;
++
++import java.util.Arrays;
++
++public class TestRadixSelector extends LuceneTestCase {
++
++  public void testSelect() {
++    for (int iter = 0; iter < 100; ++iter) {
++      doTestSelect();
++    }
++  }
++
++  private void doTestSelect() {
++    final int from = random().nextInt(5);
++    final int to = from + TestUtil.nextInt(random(), 1, 10000);
++    final int maxLen = TestUtil.nextInt(random(), 1, 12);
++    BytesRef[] arr = new BytesRef[from + to + random().nextInt(5)];
++    for (int i = 0; i < arr.length; ++i) {
++      byte[] bytes = new byte[TestUtil.nextInt(random(), 0, maxLen)];
++      random().nextBytes(bytes);
++      arr[i] = new BytesRef(bytes);
++    }
++    final int k = TestUtil.nextInt(random(), from, to - 1);
++
++    BytesRef[] expected = arr.clone();
++    Arrays.sort(expected, from, to);
++
++    BytesRef[] actual = arr.clone();
++    RadixSelector selector = new RadixSelector(random().nextBoolean() ? maxLen : Integer.MAX_VALUE) {
++
++      @Override
++      protected void swap(int i, int j) {
++        ArrayUtil.swap(actual, i, j);
++      }
++
++      @Override
++      protected int byteAt(int i, int k) {
++        BytesRef b = actual[i];
++        if (k >= b.length) {
++          return -1;
++        } else {
++          return Byte.toUnsignedInt(b.bytes[b.offset + k]);
++        }
++      }
++
++    };
++    selector.select(from, to, k);
++
++    assertEquals(expected[k], actual[k]);
++    for (int i = 0; i < actual.length; ++i) {
++      if (i < from || i >= to) {
++        assertSame(arr[i], actual[i]);
++      } else if (i <= k) {
++        assertTrue(actual[i].compareTo(actual[k]) <= 0);
++      } else {
++        assertTrue(actual[i].compareTo(actual[k]) >= 0);
++      }
++    }
++  }
++
++}
+diff --git a/lucene/core/src/test/org/apache/lucene/util/bkd/TestMutablePointsReaderUtils.java b/lucene/core/src/test/org/apache/lucene/util/bkd/TestMutablePointsReaderUtils.java
+new file mode 100644
+index 0000000..f1140d4
+--- /dev/null
++++ b/lucene/core/src/test/org/apache/lucene/util/bkd/TestMutablePointsReaderUtils.java
+@@ -0,0 +1,251 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.util.bkd;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Comparator;
++
++import org.apache.lucene.codecs.MutablePointsReader;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util.StringHelper;
++import org.apache.lucene.util.TestUtil;
++
++public class TestMutablePointsReaderUtils extends LuceneTestCase {
++
++  public void testSort() {
++    for (int iter = 0; iter < 5; ++iter) {
++      doTestSort();
++    }
++  }
++
++  private void doTestSort() {
++    final int bytesPerDim = TestUtil.nextInt(random(), 1, 16);
++    final int maxDoc = TestUtil.nextInt(random(), 1, 1 << random().nextInt(30));
++    Point[] points = createRandomPoints(1, bytesPerDim, maxDoc);
++    DummyPointsReader reader = new DummyPointsReader(points);
++    MutablePointsReaderUtils.sort(maxDoc, bytesPerDim, reader, 0, points.length);
++    Arrays.sort(points, new Comparator<Point>() {
++      @Override
++      public int compare(Point o1, Point o2) {
++        int cmp = StringHelper.compare(bytesPerDim, o1.packedValue, 0, o2.packedValue, 0);
++        if (cmp == 0) {
++          cmp = Integer.compare(o1.doc, o2.doc);
++        }
++        return cmp;
++      }
++    });
++    assertNotSame(points, reader.points);
++    assertArrayEquals(points, reader.points);
++  }
++
++  public void testSortByDim() {
++    for (int iter = 0; iter < 5; ++iter) {
++      doTestSortByDim();
++    }
++  }
++
++  private void doTestSortByDim() {
++    final int numDims = TestUtil.nextInt(random(), 1, 8);
++    final int bytesPerDim = TestUtil.nextInt(random(), 1, 16);
++    final int maxDoc = TestUtil.nextInt(random(), 1, 1 << random().nextInt(30));
++    Point[] points = createRandomPoints(numDims, bytesPerDim, maxDoc);
++    int[] commonPrefixLengths = new int[numDims];
++    for (int i = 0; i < commonPrefixLengths.length; ++i) {
++      commonPrefixLengths[i] = TestUtil.nextInt(random(), 0, bytesPerDim);
++    }
++    for (int i = 1; i < points.length; ++i) {
++      for (int dim = 0; dim < numDims; ++dim) {
++        int offset = dim * bytesPerDim;
++        System.arraycopy(points[0].packedValue, offset, points[i].packedValue, offset, commonPrefixLengths[dim]);
++      }
++    }
++    DummyPointsReader reader = new DummyPointsReader(points);
++    final int sortedDim = random().nextInt(numDims);
++    MutablePointsReaderUtils.sortByDim(sortedDim, bytesPerDim, commonPrefixLengths, reader, 0, points.length,
++        new byte[numDims * bytesPerDim], new byte[numDims * bytesPerDim]);
++    for (int i = 1; i < points.length; ++i) {
++      final int offset = sortedDim * bytesPerDim;
++      int cmp = StringHelper.compare(bytesPerDim, reader.points[i-1].packedValue, offset, reader.points[i].packedValue, offset);
++      if (cmp == 0) {
++        cmp = reader.points[i - 1].doc - reader.points[i].doc;
++      }
++      assertTrue(cmp <= 0);
++    }
++  }
++
++  public void testPartition() {
++    for (int iter = 0; iter < 5; ++iter) {
++      doTestPartition();
++    }
++  }
++
++  private void doTestPartition() {
++    final int numDims = TestUtil.nextInt(random(), 1, 8);
++    final int bytesPerDim = TestUtil.nextInt(random(), 1, 16);
++    final int maxDoc = TestUtil.nextInt(random(), 1, 1 << random().nextInt(30));
++    Point[] points = createRandomPoints(numDims, bytesPerDim, maxDoc);
++    int commonPrefixLength = TestUtil.nextInt(random(), 0, bytesPerDim);
++    final int splitDim =  random().nextInt(numDims);
++    for (int i = 1; i < points.length; ++i) {
++      int offset = splitDim * bytesPerDim;
++      System.arraycopy(points[0].packedValue, offset, points[i].packedValue, offset, commonPrefixLength);
++    }
++    DummyPointsReader reader = new DummyPointsReader(points);
++    final int pivot = TestUtil.nextInt(random(), 0, points.length - 1);
++    MutablePointsReaderUtils.partition(maxDoc, splitDim, bytesPerDim, commonPrefixLength, reader, 0, points.length, pivot,
++        new byte[numDims * bytesPerDim], new byte[numDims * bytesPerDim]);
++    int offset = splitDim * bytesPerDim;
++    for (int i = 0; i < points.length; ++i) {
++      int cmp = StringHelper.compare(bytesPerDim, reader.points[i].packedValue, offset, reader.points[pivot].packedValue, offset);
++      if (cmp == 0) {
++        cmp = reader.points[i].doc - reader.points[pivot].doc;
++      }
++      if (i < pivot) {
++        assertTrue(cmp <= 0);
++      } else if (i > pivot) {
++        assertTrue(cmp >= 0);
++      } else {
++        assertEquals(0, cmp);
++      }
++    }
++  }
++
++  private static Point[] createRandomPoints(int numDims, int bytesPerDim, int maxDoc) {
++    final int packedBytesLength = numDims * bytesPerDim;
++    final int numPoints = TestUtil.nextInt(random(), 1, 100000);
++    Point[] points = new Point[numPoints];
++    for (int i = 0; i < numPoints; ++i) {
++       byte[] value = new byte[packedBytesLength];
++       random().nextBytes(value);
++       points[i] = new Point(value, random().nextInt(maxDoc));
++    }
++    return points;
++  }
++
++  private static class Point {
++    final byte[] packedValue;
++    final int doc;
++
++    Point(byte[] packedValue, int doc) {
++      this.packedValue = packedValue;
++      this.doc = doc;
++    }
++
++    @Override
++    public boolean equals(Object obj) {
++      if (obj == null || obj instanceof Point == false) {
++        return false;
++      }
++      Point that = (Point) obj;
++      return Arrays.equals(packedValue, that.packedValue) && doc == that.doc;
++    }
++
++    @Override
++    public int hashCode() {
++      return 31 * Arrays.hashCode(packedValue) + doc;
++    }
++
++    @Override
++    public String toString() {
++      return "value=" + new BytesRef(packedValue) + " doc=" + doc;
++    }
++  }
++
++  private static class DummyPointsReader extends MutablePointsReader {
++
++    private final Point[] points;
++
++    DummyPointsReader(Point[] points) {
++      this.points = points.clone();
++    }
++
++    @Override
++    public void close() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public long ramBytesUsed() {
++      return 0;
++    }
++
++    @Override
++    public void getValue(int i, byte[] packedValue) {
++      System.arraycopy(points[i].packedValue, 0, packedValue, 0, points[i].packedValue.length);
++    }
++
++    @Override
++    public byte getByteAt(int i, int k) {
++      return points[i].packedValue[k];
++    }
++
++    @Override
++    public int getDocID(int i) {
++      return points[i].doc;
++    }
++
++    @Override
++    public void swap(int i, int j) {
++      ArrayUtil.swap(points, i, j);
++    }
++
++    @Override
++    public void checkIntegrity() throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public void intersect(String fieldName, IntersectVisitor visitor) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public byte[] getMinPackedValue(String fieldName) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public byte[] getMaxPackedValue(String fieldName) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int getNumDimensions(String fieldName) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int getBytesPerDimension(String fieldName) throws IOException {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public long size(String fieldName) {
++      throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int getDocCount(String fieldName) {
++      throw new UnsupportedOperationException();
++    }
++
++  }
++
++}
+

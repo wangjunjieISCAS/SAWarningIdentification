@@ -1,0 +1,236 @@
+GitDiffStart: 87c8a344a57eb31bccbf9998f1a80025e29d11ed | Fri Jun 6 08:55:34 2014 +0000
+diff --git a/lucene/CHANGES.txt b/lucene/CHANGES.txt
+index 5e51573..6679f3d 100644
+--- a/lucene/CHANGES.txt
++++ b/lucene/CHANGES.txt
+@@ -259,6 +259,12 @@ Optimizations
+ 
+ Bug fixes
+ 
++* LUCENE-5738: Ensure NativeFSLock prevents opening the file channel for the
++  lock if the lock is already obtained by the JVM. Trying to obtain an already
++  obtained lock in the same JVM can unlock the file might allow other processes
++  to lock the file even without explicitly unlocking the FileLock. This behavior
++  is operating system dependent. (Simon Willnauer) 
++
+ * LUCENE-5673: MMapDirectory: Work around a "bug" in the JDK that throws
+   a confusing OutOfMemoryError wrapped inside IOException if the FileChannel
+   mapping failed because of lack of virtual address space. The IOException is
+diff --git a/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java b/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java
+index db89477..bba49c0 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java
++++ b/lucene/core/src/java/org/apache/lucene/store/LockStressTest.java
+@@ -72,19 +72,7 @@ public class LockStressTest {
+     final int sleepTimeMS = Integer.parseInt(args[arg++]);
+     final int count = Integer.parseInt(args[arg++]);
+ 
+-    LockFactory lockFactory;
+-    try {
+-      lockFactory = Class.forName(lockFactoryClassName).asSubclass(LockFactory.class).newInstance();          
+-    } catch (IllegalAccessException | InstantiationException | ClassCastException | ClassNotFoundException e) {
+-      throw new IOException("Cannot instantiate lock factory " + lockFactoryClassName);
+-    }
+-
+-    File lockDir = new File(lockDirName);
+-
+-    if (lockFactory instanceof FSLockFactory) {
+-      ((FSLockFactory) lockFactory).setLockDir(lockDir);
+-    }
+-
++    final LockFactory lockFactory = getNewLockFactory(lockFactoryClassName, lockDirName);
+     final InetSocketAddress addr = new InetSocketAddress(verifierHost, verifierPort);
+     System.out.println("Connecting to server " + addr +
+         " and registering as client " + myID + "...");
+@@ -96,10 +84,8 @@ public class LockStressTest {
+       
+       out.write(myID);
+       out.flush();
+-  
+-      lockFactory.setLockPrefix("test");
+-      final LockFactory verifyLF = new VerifyingLockFactory(lockFactory, in, out);
+-      final Lock l = verifyLF.makeLock("test.lock");
++      LockFactory verifyLF = new VerifyingLockFactory(lockFactory, in, out);
++      Lock l = verifyLF.makeLock("test.lock");
+       final Random rnd = new Random();
+       
+       // wait for starting gun
+@@ -109,13 +95,20 @@ public class LockStressTest {
+       
+       for (int i = 0; i < count; i++) {
+         boolean obtained = false;
+-  
+         try {
+           obtained = l.obtain(rnd.nextInt(100) + 10);
+-        } catch (LockObtainFailedException e) {
+-        }
++        } catch (LockObtainFailedException e) {}
+         
+         if (obtained) {
++          if (rnd.nextInt(10) == 0) {
++            if (rnd.nextBoolean()) {
++              verifyLF = new VerifyingLockFactory(getNewLockFactory(lockFactoryClassName, lockDirName), in, out);
++            }
++            final Lock secondLock = verifyLF.makeLock("test.lock");
++            if (secondLock.obtain()) {
++              throw new IOException("Double Obtain");
++            }
++          }
+           Thread.sleep(sleepTimeMS);
+           l.close();
+         }
+@@ -130,4 +123,22 @@ public class LockStressTest {
+     
+     System.out.println("Finished " + count + " tries.");
+   }
++
++
++  private static LockFactory getNewLockFactory(String lockFactoryClassName, String lockDirName) throws IOException {
++    LockFactory lockFactory;
++    try {
++      lockFactory = Class.forName(lockFactoryClassName).asSubclass(LockFactory.class).newInstance();
++    } catch (IllegalAccessException | InstantiationException | ClassCastException | ClassNotFoundException e) {
++      throw new IOException("Cannot instantiate lock factory " + lockFactoryClassName);
++    }
++
++    File lockDir = new File(lockDirName);
++
++    if (lockFactory instanceof FSLockFactory) {
++      ((FSLockFactory) lockFactory).setLockDir(lockDir);
++    }
++    lockFactory.setLockPrefix("test");
++    return lockFactory;
++  }
+ }
+diff --git a/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java b/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java
+index b5503a5..b772aca 100644
+--- a/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java
++++ b/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java
+@@ -23,6 +23,9 @@ import java.nio.channels.OverlappingFileLockException;
+ import java.nio.file.StandardOpenOption;
+ import java.io.File;
+ import java.io.IOException;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
+ 
+ import org.apache.lucene.util.IOUtils;
+ 
+@@ -117,12 +120,15 @@ class NativeFSLock extends Lock {
+   private FileLock lock;
+   private File path;
+   private File lockDir;
++  private static final Set<String> LOCK_HELD = Collections.synchronizedSet(new HashSet<String>());
++
+ 
+   public NativeFSLock(File lockDir, String lockFileName) {
+     this.lockDir = lockDir;
+     path = new File(lockDir, lockFileName);
+   }
+ 
++
+   @Override
+   public synchronized boolean obtain() throws IOException {
+ 
+@@ -141,50 +147,73 @@ class NativeFSLock extends Lock {
+       throw new IOException("Found regular file where directory expected: " + 
+           lockDir.getAbsolutePath());
+     }
+-    
+-    channel = FileChannel.open(path.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+-    boolean success = false;
+-    try {
+-      lock = channel.tryLock();
+-      success = lock != null;
+-    } catch (IOException | OverlappingFileLockException e) {
+-      // At least on OS X, we will sometimes get an
+-      // intermittent "Permission Denied" IOException,
+-      // which seems to simply mean "you failed to get
+-      // the lock".  But other IOExceptions could be
+-      // "permanent" (eg, locking is not supported via
+-      // the filesystem).  So, we record the failure
+-      // reason here; the timeout obtain (usually the
+-      // one calling us) will use this as "root cause"
+-      // if it fails to get the lock.
+-      failureReason = e;
+-    } finally {
+-      if (!success) {
++    final String canonicalPath = path.getCanonicalPath();
++    // Make sure nobody else in-process has this lock held
++    // already, and, mark it held if not:
++    // This is a pretty crazy workaround for some documented
++    // but yet awkward JVM behavior:
++    //
++    //   On some systems, closing a channel releases all locks held by the Java virtual machine on the underlying file
++    //   regardless of whether the locks were acquired via that channel or via another channel open on the same file.
++    //   It is strongly recommended that, within a program, a unique channel be used to acquire all locks on any given
++    //   file.
++    //
++    // This essentially means if we close "A" channel for a given file all locks might be released... the odd part
++    // is that we can't re-obtain the lock in the same JVM but from a different process if that happens. Nevertheless
++    // this is super trappy. See LUCENE-5738
++    boolean obtained = false;
++    if (LOCK_HELD.add(canonicalPath)) {
++      try {
++        channel = FileChannel.open(path.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+         try {
+-          IOUtils.closeWhileHandlingException(channel);
+-        } finally {
++          lock = channel.tryLock();
++          obtained = lock != null;
++        } catch (IOException | OverlappingFileLockException e) {
++          // At least on OS X, we will sometimes get an
++          // intermittent "Permission Denied" IOException,
++          // which seems to simply mean "you failed to get
++          // the lock".  But other IOExceptions could be
++          // "permanent" (eg, locking is not supported via
++          // the filesystem).  So, we record the failure
++          // reason here; the timeout obtain (usually the
++          // one calling us) will use this as "root cause"
++          // if it fails to get the lock.
++          failureReason = e;
++        }
++      } finally {
++        if (obtained == false) { // not successful - clear up and move out
++          clearLockHeld(path);
++          final FileChannel toClose = channel;
+           channel = null;
++          IOUtils.closeWhileHandlingException(toClose);
+         }
+       }
+     }
+-    return lock != null;
++    return obtained;
+   }
+ 
+   @Override
+   public synchronized void close() throws IOException {
+     try {
+       if (lock != null) {
+-        lock.release();
+-        lock = null;
++        try {
++          lock.release();
++          lock = null;
++        } finally {
++          clearLockHeld(path);
++        }
+       }
+     } finally {
+-      if (channel != null) {
+-        channel.close();
+-        channel = null;
+-      }
++      IOUtils.close(channel);
++      channel = null;
+     }
+   }
+ 
++  private static final void clearLockHeld(File path) throws IOException {
++    boolean remove = LOCK_HELD.remove(path.getCanonicalPath());
++    assert remove : "Lock was cleared but never marked as held";
++  }
++
+   @Override
+   public synchronized boolean isLocked() {
+     // The test for is isLocked is not directly possible with native file locks:
+
