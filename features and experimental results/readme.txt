@@ -20,7 +20,7 @@ Type 2: feature values
 
 totalFeatures.csv: contain the values of all the features for the project revision, which is the summarization of the following files. The experiment is conducted based on this file. 
 
-The following files contains the values in each category (note that, the category are not correspondings to the paper, but corresponding to the source code).
+The following files contains the values in each category (note that, the category do not correspond to the paper, but correspond to the source code).
 For example, codeChurn.csv: contain the features extracted using featureExtractionRefined/CodeChurnExtraction.java
 codeHistory.csv 
 fileCharacteris.csv 
