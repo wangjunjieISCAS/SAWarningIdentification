@@ -1,6 +1,6 @@
 # SAWarningIdentification
 
-This project is the source code and experimental data of the paper "A Systematic Experimental Evaluation of Features for Static Analysis Warning Identification" in ESEM2017.
+This project is the source code and experimental data of the paper Is There A "Golden" Feature Set for Static Warning Identification? -An Experimental Evaluation in ESEM2018.
 
 The details of folders:
 
